@@ -1,0 +1,191 @@
+# Contributing to STM (SoundTouch Manager)
+
+Thanks for considering a contribution. STM is a small project that
+keeps a discontinued piece of consumer audio hardware alive, and
+every model we get tested by a real user makes it more useful.
+
+## Ways to help
+
+- **Test on your speaker model.** ST10 is the reference target.
+  Reports are a contribution, even just "ST20 works, presets
+  survive standby cycle". Open a [Discussion][discussions] under
+  Hardware, or attach to an existing thread.
+- **File a bug.** Use Issues for things that are reproducibly
+  broken. Use [Discussions][discussions] for questions, ideas,
+  setup help, or "is this expected?".
+- **Improve documentation.** README, `docs/`, FAQ on the website,
+  or the German translation of any of those.
+- **Send a code change.** See below.
+
+[discussions]: https://github.com/jcbenitezhe/SoundTouchManager/discussions
+
+## Before opening a code PR
+
+1. Open a Discussion or Issue first if the change is non-trivial
+   (more than a typo, more than a one-file fix). It saves both
+   sides time and avoids parallel work.
+2. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
+   component map, tech stack, port table, and the sequence
+   diagrams showing discovery, playback, marge emulation, install,
+   and OTA. It is the shortest path to understanding how the
+   pieces interact.
+3. Read [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md) if you are
+   touching anything under `internal/autopair/`,
+   `internal/tlsgen/`, `usb-stick/setup-tls.sh`, or
+   `usb-stick/iptables-setup.sh`.
+
+## Local development
+
+Requirements: Go 1.25+, Node 20+, [Wails CLI v2][wails], `make`.
+Linux is the smoothest target; macOS and Windows work but have
+extra Wails toolchain dependencies.
+
+[wails]: https://wails.io/docs/gettingstarted/installation
+
+```bash
+git clone https://github.com/jcbenitezhe/SoundTouchManager.git
+cd SoundTouchManager
+
+# Sanity check. Both modules build natively on Linux, macOS, and Windows
+# (Linux-only syscalls sit behind build tags). The speaker binary is still
+# a cross-compile: GOOS=linux GOARCH=arm GOARM=5, or just `make build-arm`.
+# GOARM=5 (softfloat) is intentional: some early SoundTouch CPUs lack working
+# VFP and a hardware-float agent SIGILLs at startup (issue #302).
+go build ./...
+go test ./...
+
+# Stick agent for the speaker hardware
+make build-arm
+
+# Desktop app, dev mode with hot reload AND the embedded helpers built
+# (raw `wails dev` runs with empty embed stubs: no stick formatting, no OTA)
+make wails-dev
+```
+
+The website is plain static HTML in `site/` (English, plus Spanish in
+`site/es/`), published to GitHub Pages by `.github/workflows/pages.yml`.
+Open the files directly in a browser to preview them.
+
+The `desktop-app/agentbin/stmanager-armv7l` and
+`sticksetup/embedded/winformat.exe` files are empty stubs in the
+repo. CI overwrites them with the real binaries during release.
+On a developer machine `agentbin.Available()` returns `false`, and
+the desktop app falls back to a configured external path.
+
+## Code style and conventions
+
+- **Language.** All code, comments, identifiers, commit messages,
+  and PR descriptions are in English. User-facing UI strings live
+  in i18n bundles. Every new key must be added to **all** bundles in
+  `desktop-app/frontend/src/i18n/bundles/` (13 locales today): English and
+  German written by hand, the other locales translated with the same care.
+  A key that exists only in `en.json` silently falls back to English for
+  everyone else, which is the gap had to close repeatedly.
+- **Go.** `gofmt` clean, `go vet ./...` clean, `golangci-lint`
+  clean. Tests in `_test.go` next to the code they cover. Logging
+  via `log/slog`.
+- **Frontend.** Whatever Wails generated. Small project, no extra
+  framework opinions. If you add or change a Wails-bound Go method,
+  run `wails generate module` in `desktop-app/` and commit the
+  `wailsjs/` changes, otherwise the frontend CI build breaks.
+- **Commits.** Conventional Commits, imperative mood, present tense,
+  one logical change per commit. Reference the Issue or Discussion if
+  there is one: `fix(agent): preset reconcile loop on standby`.
+
+  Format: `type(scope): summary`. Common types: `feat`, `fix`, `perf`,
+  `refactor`, `docs`, `test`, `build`, `ci`, `chore`. Scope is the area
+  touched (`agent`, `desktop`, `frontend`, `i18n`, `boxws`, ...). A
+  breaking change adds `!` before the colon: `feat(api)!: ...`.
+
+  **Commit subjects become the release notes.** The release pipeline
+  (`cmd/relnotes`) turns the `feat` / `fix` / `perf` / breaking commits
+  since the last tag into the user-facing "What's changed" list, and the
+  summary after the colon is shown to end users almost verbatim. So:
+
+  - Write the summary as a clear, user-facing statement of the change or
+    benefit, not internal jargon. Good: `fix(frontend): blank station
+    logos now show a generated tile`. Bad: `fix: tweak fallback chain`.
+  - Do not put the version in the subject (`v0.6.17 ...`); the tag
+    already carries it.
+  - Use a non-user-facing type (`chore`, `ci`, `build`, `test`,
+    `refactor`, `docs`, `style`) for work that should NOT appear in the
+    notes; those are dropped from the changelog automatically.
+  - If one squashed commit ships several user-visible changes, name the
+    extras as `Release-Note: type(scope): summary` trailers in the
+    commit body; each trailer is parsed like a subject and lands in the
+    notes.
+
+  See [`docs/RELEASE-NOTES.md`](docs/RELEASE-NOTES.md) for the full
+  pipeline.
+- **No emoji** in code, commits, or PR descriptions unless the
+  change is specifically about UI emoji.
+
+## Adding a streaming service or account integration
+
+Learned from real submissions; read this before writing a Spotify-sized
+feature so the work lands rather than stalls.
+
+- **A third-party streaming engine is a sidecar, not embedded code.** STM
+  drives Spotify through go-librespot as a separate process over a localhost
+  HTTP API and merely aggregates it: the agent stays MIT, and the engine is
+  built, attested, and licensed on its own. A new service that needs a
+  reimplemented client (SiriusXM, Amazon, YouTube, ...) belongs in its own
+  repository the same way, with STM talking to it over a small local API, not
+  as thousands of lines of networking and crypto pasted into this tree. That
+  keeps the upkeep of a moving third-party API, and its legal exposure, where
+  the code lives. Propose the API shape in a Discussion first.
+- **Terms of service.** If a service's terms forbid non-official clients, say
+  so in the proposal and explain how comparable open-source projects handle
+  it. The maintainer has to weigh that before anything ships, so surface it
+  early rather than burying it in a finished PR.
+- **Credentials never touch disk in plaintext.** A saved password or token
+  goes into the OS credential store (DPAPI on Windows, Keychain on macOS,
+  libsecret / Secret Service on Linux), not a JSON file, not even at `0600`.
+- **LAN-facing listeners bind an address, not `0.0.0.0`.** Anything a speaker
+  pulls from binds the machine's own LAN IP with a guard so only the speaker
+  reaches it. An open `0.0.0.0` audio or control endpoint is an
+  unauthenticated hole in the user's network.
+
+## PR checklist
+
+Tick these in your PR description:
+
+- [ ] `go vet ./...` and `go test ./...` pass locally, and
+      `make build-arm` cross-compiles cleanly.
+- [ ] If the change touches the stick agent, I have either tested
+      on real hardware or noted in the PR that I have not.
+- [ ] No personal data, real LAN IPs, MAC addresses, or device
+      serial numbers were added.
+- [ ] If a new dependency was added, it is on a current, supported
+      version.
+- [ ] New UI strings are in **all** `i18n/bundles/` locales (English
+      and German by hand), not only `en.json`.
+- [ ] Any saved credential goes to the OS credential store, not a
+      plaintext file, and no new listener binds `0.0.0.0`.
+
+## Licensing
+
+STM is MIT licensed. By submitting a contribution, you agree to
+license it under the same terms. The full text is in
+[`LICENSE`](LICENSE).
+
+## Conduct
+
+This project follows the [Contributor Covenant](CODE_OF_CONDUCT.md).
+Be civil, disagree on the technical merits, assume good intent.
+Report incidents to the address listed in
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).
+
+## Maintainers
+
+See [`.github/CODEOWNERS`](.github/CODEOWNERS) for the current
+owners of each part of the tree.
+
+## Support the project
+
+If you cannot contribute code but want to help anyway, a donation
+keeps the lights on.
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/jcbenitezhe?label=Sponsor%20on%20GitHub&logo=GitHub&color=ea4aaa)](https://github.com/sponsors/jcbenitezhe)
+
+More payment options (Ko-fi, PayPal) are listed on the [website](https://jcbenitezhe.github.io/SoundTouchManager/#support).

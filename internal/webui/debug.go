@@ -1,0 +1,688 @@
+// Debug state and probe endpoints plus stick/SSH status helpers.
+
+package webui
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/jcbenitezhe/SoundTouchManager/anonymise"
+	"sync"
+	"time"
+
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxapi"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/hosts"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/netutil"
+)
+
+// sysBlockRoot, mediaRoot and nvRoot are the sysfs block-device root, the mount
+// root, and the writable NAND root. They are vars (not consts) so the
+// stick-detection test can point them at a temp tree; in production they are the
+// real paths.
+var (
+	sysBlockRoot = "/sys/block"
+	mediaRoot    = "/media"
+	nvRoot       = "/mnt/nv"
+)
+
+// sshPersistentEnabled reports whether root SSH is configured to stay open across
+// reboots on this box, independent of any inserted stick. Two persistent NAND
+// markers count: STM's own opt-in (/mnt/nv/stmanager/enable-ssh, honored by
+// run.sh) and a maintainer-placed /mnt/nv/remote_services. Both live on NAND and
+// survive a reboot, so when SSH is open because of one of them the "pull the
+// stick and reboot to close it" advice is wrong — the box is deliberately left
+// open. Transient stick-driven SSH (the /media/sda1 or /tmp
+// remote_services marker) leaves neither file, so it still reads as "still
+// inserted".
+func sshPersistentEnabled() bool {
+	for _, p := range []string{
+		filepath.Join(nvRoot, "stmanager", "enable-ssh"),
+		filepath.Join(nvRoot, "remote_services"),
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// diskIsRemovableUSB reports whether the named block disk (e.g. "sda") is a
+// REMOVABLE USB device, i.e. a USB stick, rather than the speaker's built-in
+// storage. A disk qualifies when /sys/block/<disk>/removable reads "1", or when
+// its sysfs device path sits on the USB bus. This is the fix: several
+// speakers (deqw's ST10 + both ST20s, no stick inserted) enumerate an INTERNAL
+// disk as sda, so the old "any sd* block device exists" check raised the
+// "remove the USB stick" banner permanently with nothing to remove.
+func diskIsRemovableUSB(disk string) bool {
+	base := filepath.Join(sysBlockRoot, disk)
+	if _, err := os.Stat(base); err != nil {
+		return false // no such disk
+	}
+	if b, err := os.ReadFile(filepath.Join(base, "removable")); err == nil &&
+		strings.TrimSpace(string(b)) == "1" {
+		return true
+	}
+	// Fallback: a USB stick's /sys/block/<disk> resolves through the USB bus, while
+	// internal eMMC/SD/SATA does not. Some sticks report removable=0, so also
+	// accept a USB device path.
+	if real, err := filepath.EvalSymlinks(base); err == nil && strings.Contains(real, "/usb") {
+		return true
+	}
+	return false
+}
+
+// stickReallyMounted reports whether a real STM USB stick is in the speaker right
+// now, and returns its version.txt when readable. It requires POSITIVE proof: a
+// readable STM marker on a mounted /media/<disk>1 filesystem. A bare removable /
+// USB block device is NOT enough.
+//
+// deqw's ST10 + both ST20s (no stick inserted) expose an internal disk as
+// a removable/USB sda that is never mounted (the diagnostic showed no /media/sda1
+// and no sd* mount at all), so diskIsRemovableUSB("sda") returned true and the
+// old "removable USB present" check kept the "remove the USB stick" banner up
+// forever with nothing to remove. Reading an STM marker off the mount instead
+// keys on the one thing only a real, inserted STM stick produces.
+func stickReallyMounted() (bool, string) {
+	mnt := stickMountDir()
+	if mnt == "" {
+		return false, ""
+	}
+	// version.txt is the authoritative marker and carries the stick version.
+	if b, err := os.ReadFile(filepath.Join(mnt, "version.txt")); err == nil {
+		return true, strings.TrimSpace(string(b))
+	}
+	return true, ""
+}
+
+// stickMountDir returns the mount directory of a real, inserted STM stick, or
+// "" when none is present. Same positive-proof contract as stickReallyMounted
+// a readable STM marker on a mounted /media/<disk>1, never a bare
+// removable/USB block device.
+func stickMountDir() string {
+	for _, disk := range []string{"sda", "sdb"} {
+		if !diskIsRemovableUSB(disk) {
+			continue
+		}
+		mnt := filepath.Join(mediaRoot, disk+"1")
+		// Sticks that predate version.txt count via the STM stick layout itself.
+		// All markers only exist on a real, inserted stick, so the phantom
+		// sda with no mount stays false.
+		for _, marker := range []string{"version.txt", "install.sh", "run.sh", "stmanager-armv7l"} {
+			if _, err := os.Stat(filepath.Join(mnt, marker)); err == nil {
+				return mnt
+			}
+		}
+	}
+	return ""
+}
+
+// handleStickStatus reports whether the USB stick is actually in the box right
+// now, plus the stick version when readable. It must NOT use a bare
+// os.Stat("/media/sda1")+IsDir: the box leaves the empty mountpoint directory
+// behind after `umount` (run.sh cleanup), so IsDir kept reporting mounted:true
+// forever after the stick was pulled, which made the "remove the USB stick and
+// restart" banner stick around permanently even with the stick already out
+// stickReallyMounted requires real evidence instead.
+func (s *Server) handleStickStatus(w http.ResponseWriter, _ *http.Request) {
+	mounted, version := stickReallyMounted()
+	out := map[string]any{"mounted": mounted}
+	if mounted && version != "" {
+		out["version"] = version
+	}
+	// SSH status — check whether port 22 is currently listening. If so
+	// someone on the LAN can access the box, the app shows a warning banner.
+	// We try a TCP connect to localhost with a 200 ms timeout.
+	if conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:22", 200*time.Millisecond); dialErr == nil {
+		_ = conn.Close()
+		out["sshOpen"] = true
+		// Distinguish transient stick-driven SSH (closes on the next stickless
+		// reboot) from a persistent NAND opt-in (survives reboots). The app uses
+		// this to stop telling remote_services users to "pull the stick and
+		// reboot" when no stick is involved and a reboot would not close SSH.
+		if sshPersistentEnabled() {
+			out["sshPersistent"] = true
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleDebugState returns important box state files as JSON so we can
+// debug from outside without SSH when the stick is installed.
+//
+// Used only for interactive diagnosis — the app itself does not call
+// this regularly. Limit per file: 8 KB so the response stays compact.
+func (s *Server) handleDebugState(w http.ResponseWriter, r *http.Request) {
+	if !isLocalLAN(r.RemoteAddr) {
+		http.Error(w, "debug only from LAN", http.StatusForbidden)
+		return
+	}
+	const maxRead = 8 * 1024
+	readTail := func(path string) string {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "ERR: " + err.Error()
+		}
+		if len(b) > maxRead {
+			return "...(truncated)\n" + string(b[len(b)-maxRead:])
+		}
+		return string(b)
+	}
+	listDir := func(path string) []string {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return []string{"ERR: " + err.Error()}
+		}
+		out := make([]string, 0, len(entries))
+		for _, e := range entries {
+			fi, _ := e.Info()
+			size := int64(0)
+			if fi != nil {
+				size = fi.Size()
+			}
+			out = append(out, fmt.Sprintf("%s  %d  %s", e.Type().String(), size, e.Name()))
+		}
+		return out
+	}
+
+	// The NAND-mirrored agent log is the only log that survives a reboot on a
+	// box without SSH and without a previous.log (taigan writes none). Every
+	// mid-upload reboot investigation needs exactly the minutes BEFORE
+	// the current boot, so give this one a larger tail than the 8 KB default.
+	readTailN := func(path string, max int) string {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "ERR: " + err.Error()
+		}
+		if len(b) > max {
+			return "...(truncated)\n" + string(b[len(b)-max:])
+		}
+		return string(b)
+	}
+
+	// The three firmware reads, started together. Sequentially they are three
+	// five-second timeouts stacked on the ONE code path whose client gives up
+	// after twenty (logexport.go's captureBoxSnapshot), and the box they have
+	// to describe is the box that answers slowly or not at all - so a silent
+	// speaker would have spent fifteen of those twenty seconds here and cost
+	// the bundle its whole debugState. In parallel the worst case is five.
+	boseSetup, boseNet, boseConfig := s.boseFirmwareDebug()
+
+	state := map[string]any{
+		"agent_log_tail": redactNetworkNamesInLog(readTail("/tmp/stmanager-agent.log")),
+		"agent_log_nand": redactNetworkNamesInLog(readTailN("/mnt/nv/stmanager/agent.log", 32*1024)),
+		// The CURRENT boot's agent log from its very first line, not a blind
+		// tail. agent_log_nand above is the last 32 KB of a file that spans
+		// several boots, and on a chatty box that window no longer reaches back
+		// to the boot that failed: in the bundles the failing boot's first
+		// lines were already gone at export time, so the one question a
+		// post-install investigation asks ("what did the agent do in its first
+		// two minutes") could not be answered at all.
+		"agent_log_boot": redactNetworkNamesInLog(readFromLastBootMarker("/mnt/nv/stmanager/agent.log", 48*1024)),
+		"previous_log":   redactNetworkNamesInLog(readTail("/mnt/nv/stmanager/previous.log")),
+		"setup_log":      redactNetworkNamesInLog(readTail("/mnt/nv/stmanager/setup.log")),
+		// The PREVIOUS boot's run.sh log. setup_log is the current boot only,
+		// and after an install the boot that actually failed is already the
+		// previous one by the time anybody exports a bundle. The file exists on
+		// every box (9376 bytes in the nv_listing) and was never read.
+		"setup_log_prev": redactNetworkNamesInLog(readTail("/mnt/nv/stmanager/setup.log.prev")),
+		"boot_log":       redactNetworkNamesInLog(readTail("/mnt/nv/stmanager/boot.log")),
+		// wpaConfPath, not a second literal. This read pointed at
+		// /mnt/nv/wpa_supplicant.conf while the code that WRITES the file uses
+		// /etc/wpa_supplicant.conf, so every bundle ever collected carried
+		// "no such file or directory" here and nobody noticed. The one question
+		// it exists to answer, how many networks a speaker is configured for,
+		// was therefore never answerable from a bundle (found 2026-08-05 while
+		// testing exactly that theory against nine speakers).
+		//
+		// REDACTED AT THE SOURCE. That file holds the user's Wi-Fi password in
+		// psk="...", and this endpoint answers an unauthenticated GET on the
+		// LAN and is the body of every diagnostic bundle mailed in or attached
+		// to an issue. Fixing the path above turned a read that had always
+		// failed into a live disclosure, so the secret is removed here rather
+		// than downstream: the desktop app scrubs bundles too, but a value with
+		// a space in it (a perfectly ordinary passphrase) survived its pattern,
+		// and nothing scrubs a plain curl against this port at all.
+		"wpa_supplicant": redactWPASecrets(readTail(wpaConfPath)),
+		// What the speaker is REALLY configured for. The file above only shows
+		// what was persisted, and on at least one chassis that is the untouched
+		// vendor template while the speaker is on Wi-Fi via a network added at
+		// runtime. See wlanlist.go.
+		// Network NAMES are redacted here, not downstream. This body is what the
+		// phone remote's "Save diagnostic file" button downloads verbatim, and
+		// that file gets mailed in and attached to public issues; the desktop
+		// app's field-keyed scrub never sees it.
+		"wlan_configured": listConfiguredWLANs(context.Background(), wpaConfPath).redacted(),
+		// Which network the user CHOSE for this speaker, and what the last
+		// power-on concluded about whether it actually came up on it. Redacted
+		// at the source for the same reason as the file above: the record holds
+		// the passphrase, and this endpoint answers an unauthenticated LAN GET.
+		// The tag is enough to tell it apart from the networks in
+		// wlan_configured, which is the only question a bundle has to answer.
+		"wlan_target":   wlanTargetDebug(),
+		"region_txt":    readTail("/mnt/nv/stmanager/region.txt"),
+		"name_txt":      readTail("/mnt/nv/stmanager/name.txt"),
+		"stick_listing": listDir("/media/sda1"),
+		"media_listing": listDir("/media"),
+		"nv_listing":    listDir("/mnt/nv/stmanager"),
+		// The /mnt/nv ROOT, not just STM's own subdir: a stock or STM-only box
+		// carries only Bose's persistent state and stmanager/ here, so anything
+		// else (e.g. an aftertouch/ dir) is a leftover from another mod that can
+		// clash with STM's Wi-Fi/marge path. Surfacing it lets a bundle spot such
+		// remnants without SSH (do NOT blanket-wipe /mnt/nv: it holds the box's
+		// own Wi-Fi/AirPlay/account persistence).
+		"nv_root_listing": listDir("/mnt/nv"),
+		// The speaker's OWN log directory, by name and size. It is not STM's and
+		// STM does not read it, but it shares the same 32 MB volume and it can
+		// run away: one speaker arrived with it at 37 MB on a volume of 31.6,
+		// with no room left for the Spotify engine, while four identical
+		// speakers beside it had it empty (2026-08-23). The bundle could show
+		// the SIZE and nothing else, so "are these the firmware's own logs or
+		// something another mod left behind" could not be answered at all, and
+		// the owner could not be told where his storage had gone. The names
+		// answer both.
+		"boselog_listing": listDir("/mnt/nv/BoseLog"),
+		// The hosts picture, three views. hosts_live is what the box's
+		// resolver actually reads (the bind-mounted /etc/hosts). hosts_original
+		// is run.sh's verbatim boot copy of the persistent file, which is where
+		// a rival mod's redirect block (OpenCloudTouch's "# OCT-START" block on
+		// the reporter's migrated ST10) stays visible: the persistent file
+		// lives on the read-only rootfs and is deliberately never cleaned, only
+		// neutralized in the live copy. hosts_filtered is what the agent's
+		// hosts filter dropped this boot. Together a bundle proves both the
+		// leftover and its neutralization without SSH, where before all three
+		// were invisible and the box silently hammered the dead rival server
+		// (BoseApp and STSCertified in SYN_SENT).
+		"hosts_live":     readTail(hostsLivePath),
+		"hosts_original": readTail(hostsOriginalPath),
+		"hosts_filtered": hosts.ForeignFiltered(),
+		"proc_mounts":    readTail("/proc/mounts"),
+		// The three Bose cloud URLs, the file they come from, and whether STM's
+		// /etc/hosts redirect can catch them. The redirect only covers
+		// the STOCK hostnames, so a leftover value from a rival mod makes the
+		// speaker unreachable for STM while every other field in the bundle
+		// looks healthy: the reporter's ST30 had margeServerUrl on an
+		// OpenCloudTouch host and its presets answered 1036 for three days.
+		// Establishing that took a hand-read of /info, because nothing here
+		// carried it.
+		"sdk_cloud_urls": s.sdkCloudURLDebug(),
+		// What OTHER tools have done to this speaker, one list, each row
+		// saying whether STM can take it back. In the bundle on purpose: the
+		// ST Remote Pro hijack of 2026-09-26 touched no file at all, so a
+		// bundle taken after the next reboot showed nothing, and the only
+		// lasting record was the agent log. This section plus the greppable
+		// "foreign influence:" lines in that log are what let a later sweep
+		// search across users instead of guessing.
+		"foreign_influence": collectForeignInfluence(),
+		// Writable-volume usage: df for /mnt/nv + / and the per-entry sizes that
+		// answer "is this box genuinely tighter or carrying foreign firmware
+		// leftovers" without needing SSH (#ST30 OTA no-space, 2026-06-24).
+		"disk_usage": nandInventory(),
+		// The firmware's own view of its setup and its network, read once here
+		// and nowhere else. Every one of these is a plain GET against
+		// the speaker's :8090 at bundle time: no polling, no standing timer.
+		//
+		// bose_setup separates a real out-of-box setup (SETUP_AP_OOB plus a
+		// systemstate like SETUP_LANG_NOT_SET) from the merely STUCK source
+		// (SETUP_INACTIVE while now_playing still says source=SETUP). Those are
+		// different bugs with different fixes and no bundle could tell them
+		// apart.
+		"bose_setup": boseSetup,
+		// bose_network_info carries the number of profiles the firmware has on
+		// file, the one figure behind "the speaker has two saved networks and
+		// tried the dead one first". Names, addresses and MACs are left out on
+		// purpose; the tag is enough to tell two networks apart.
+		"bose_network_info": boseNet,
+		// bose_config_status is the firmware's OWN verdict on whether it thinks
+		// it is provisioned (SOUNDTOUCH_CONFIGURED / NOT_CONFIGURED /
+		// CONFIGURING). STM calls this endpoint nowhere else.
+		"bose_config_status": boseConfig,
+		// How often the firmware raised setup on this agent run, and how often
+		// STM cleared it (boxsetup.go). In memory, so a reboot resets it, which
+		// is correct: the question is what happened since the box came up.
+		"box_setup_episodes": s.boxSetupDebug(),
+	}
+	// Preset store summary: one compact line per slot so a diagnostic bundle
+	// shows dead presets (empty/invalid stream URL) directly. Before this the
+	// store's content was invisible in bundles and a preset that saved wrong
+	// could only be diagnosed by asking the user to fetch presets.json.
+	// Stream URLs are included in full. They are masked on the way out with
+	// everything else unless the caller asked for raw; see writeDebugState.
+	if s.presets != nil {
+		all := s.presets.All()
+		lines := make([]string, 0, len(all))
+		for _, p := range all {
+			lines = append(lines, fmt.Sprintf("slot %d: type=%s name=%q codec=%q stream=%q uri=%q items=%d",
+				p.Slot, p.Type, p.Name, p.Codec, p.StreamURL, p.URI, len(p.Items)))
+		}
+		state["presets"] = lines
+	}
+	// Forensic sections registered by main.go (marge request trail, clock
+	// verdict, ...). Called fresh per request; a panicking provider must not
+	// take the whole debug endpoint down mid-investigation.
+	debugSectionsMu.Lock()
+	fns := make(map[string]func() any, len(debugSections))
+	for k, fn := range debugSections {
+		fns[k] = fn
+	}
+	debugSectionsMu.Unlock()
+	for k, fn := range fns {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					state[k] = fmt.Sprintf("ERR: provider panicked: %v", r)
+				}
+			}()
+			state[k] = fn()
+		}()
+	}
+	s.writeDebugState(w, state, r.URL.Query().Get("raw") == "1")
+}
+
+// writeDebugState writes the debug state, MASKED unless the caller explicitly
+// asked for it raw.
+//
+// Masked is the default because of what happened when it was not. This payload
+// carries the speaker's own logs, its peer list, its hosts file and its zone,
+// so it is full of addresses, hardware addresses and speaker names. The only
+// consumer used to be the desktop app, which scrubs everything it writes into a
+// bundle, so the endpoint handed out the raw text and said so in a comment. Then
+// the phone remote grew a diagnostic button that fetches this and saves the
+// answer directly, for reporters who have no PC. Nobody re-read the comment.
+// Of the 36 files attached to public issues that way, 32 carried their owner's
+// real LAN addresses and MAC addresses (found 2026-09-15).
+//
+// So the raw form is now something a caller asks for by name, and a caller that
+// forgets gets the safe answer. The desktop app asks, because it anonymises
+// what it exports itself and its failure report deliberately keeps the
+// addresses: they are shown to the user about their own equipment.
+// writeDebugState writes the debug state, MASKED unless the caller explicitly
+// asked for it raw.
+//
+// Masked is the default because of what happened when it was not. This payload
+// carries the speaker's own logs, its peer list, its hosts file and its zone,
+// so it is full of addresses, hardware addresses and speaker names. The only
+// consumer used to be the desktop app, which scrubs everything it writes into a
+// bundle, so the endpoint handed out the raw text and said so in a comment.
+// Then the phone remote grew a diagnostic button that fetches this and saves
+// the answer directly, for reporters who have no PC. Nobody re-read the
+// comment. Of the 36 files attached to public issues that way, 32 carried
+// their owner's real LAN addresses and MAC addresses (found 2026-09-15).
+//
+// So the raw form is now something a caller asks for by name, and a caller that
+// forgets gets the safe answer. The desktop app asks, because it anonymises
+// what it exports itself and its failure report deliberately keeps the
+// addresses: they are shown to the user about their own equipment.
+//
+// The masking WALKS THE TREE and scrubs each string value. It must never run
+// over the encoded JSON instead: the SSID pattern ends in [^\s]*, and minified
+// JSON has no whitespace, so a single "ssid" key swallowed the rest of the
+// document and the answer stopped being JSON at all. That is not a hypothetical,
+// it is what the first version of this function did to all four speakers it was
+// pointed at.
+func (s *Server) writeDebugState(w http.ResponseWriter, state map[string]any, raw bool) {
+	if raw {
+		writeJSON(w, http.StatusOK, state)
+		return
+	}
+	// Round-trip through JSON BEFORE walking, and this is the whole trick.
+	//
+	// The sections registered by main.go return live Go values: structs and
+	// slices of structs, not map[string]any. The walker switches on string,
+	// []any and map[string]any, so a struct falls through its default branch
+	// untouched and everything inside it ships in the clear. Measured on six
+	// speakers after the first version of this shipped: mdns_host kept an
+	// interface address and three hardware addresses, net_reachability kept the
+	// LAN address and the gateway, dns_status kept the nameserver. Everything
+	// that had already been through JSON was masked correctly, which is exactly
+	// why an offline check over a fetched payload showed nothing wrong.
+	//
+	// Marshalling first turns every struct into the generic shape the walker
+	// understands. Note this is NOT the same as scrubbing the encoded text: the
+	// document is decoded again before anything is replaced, so the SSID
+	// pattern can never run across a JSON delimiter.
+	b, err := json.Marshal(state)
+	if err != nil {
+		s.logger.Warn("debug state: could not encode for masking", "err", err)
+		http.Error(w, "debug state could not be anonymised", http.StatusInternalServerError)
+		return
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		s.logger.Warn("debug state: could not decode for masking", "err", err)
+		http.Error(w, "debug state could not be anonymised", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, anonymise.DebugState(generic))
+}
+
+// agentBootMarker is the first line the agent writes on every start
+// (cmd/agent/main.go). Finding the LAST one splits a multi-boot log file at
+// the boot that is running now.
+const agentBootMarker = "stmanager starting"
+
+// readFromLastBootMarker returns the agent log from the current boot's first
+// line, capped at max bytes. Falls back to the whole file's head when the
+// marker is not in it at all (a log that has already rotated past it).
+//
+// The HEAD is kept, not the tail. This section exists for one question - what
+// the agent did in its first two minutes - and on a box that logs heavily the
+// current boot passes the cap within those very minutes. Keeping the last
+// bytes instead would answer a different question, and answer it with the same
+// region agent_log_nand already carries.
+func readFromLastBootMarker(path string, max int) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "ERR: " + err.Error()
+	}
+	txt := string(b)
+	if i := strings.LastIndex(txt, agentBootMarker); i >= 0 {
+		// Back up to the start of that line so the timestamp comes with it.
+		if nl := strings.LastIndexByte(txt[:i], '\n'); nl >= 0 {
+			txt = txt[nl+1:]
+		} else {
+			txt = txt[i:]
+		}
+	}
+	if len(txt) > max {
+		return txt[:max] + "\n...(truncated)"
+	}
+	return txt
+}
+
+// boseFirmwareDebug runs the three firmware reads at once and returns them in
+// the order the bundle lists them. They touch three different endpoints on the
+// same box and have nothing to say to each other, so the only thing serialising
+// them buys is three timeouts where one will do.
+func (s *Server) boseFirmwareDebug() (setup, network map[string]any, config string) {
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); setup = s.boseSetupDebug() }()
+	go func() { defer wg.Done(); network = s.boseNetworkDebug() }()
+	go func() { defer wg.Done(); config = s.boseConfigStatus() }()
+	wg.Wait()
+	return setup, network, config
+}
+
+// boseSetupDebug is the speaker's own /setup, the endpoint that says whether
+// the box is genuinely in out-of-box setup. Errors are reported, not hidden: a
+// firmware that does not answer this is itself the finding.
+func (s *Server) boseSetupDebug() map[string]any {
+	if s.boxHost == "" {
+		return map[string]any{"err": "no box host configured"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := boxapi.New(s.boxHost).GetSetupStatus(ctx)
+	if err != nil {
+		return map[string]any{"err": err.Error()}
+	}
+	return map[string]any{"state": st.State, "systemstate": st.SystemState}
+}
+
+// boseNetworkDebug is /networkInfo reduced to what a diagnosis uses. Network
+// names become tags and the addresses and MACs are dropped: this endpoint
+// answers an unauthenticated LAN GET and its body is the diagnostic bundle.
+func (s *Server) boseNetworkDebug() map[string]any {
+	if s.boxHost == "" {
+		return map[string]any{"err": "no box host configured"}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	n, err := boxapi.New(s.boxHost).GetNetwork(ctx)
+	if err != nil {
+		return map[string]any{"err": err.Error()}
+	}
+	ifaces := make([]map[string]any, 0, len(n.Interfaces))
+	for _, i := range n.Interfaces {
+		ifaces = append(ifaces, map[string]any{
+			"type": i.Type, "name": i.Name, "state": i.State,
+			"signal": i.Signal, "mode": i.Mode,
+			"ssidTag": ssidTag(i.SSID), "hasAddress": i.IP != "",
+		})
+	}
+	return map[string]any{"wifiProfileCount": n.WifiProfileCount, "interfaces": ifaces}
+}
+
+// configStatusRe pulls the verdict out of /soundTouchConfigurationStatus,
+// whichever of the two shapes the firmware uses (element text or attribute).
+var configStatusRe = regexp.MustCompile(`(?i)(SOUNDTOUCH_CONFIGURED|NOT_CONFIGURED|CONFIGURING)`)
+
+// boseConfigStatus reads the firmware's own provisioning verdict. It is the
+// one answer nothing in STM has ever asked for, and it separates "the speaker
+// thinks it still has to be set up" from "the speaker is configured and its
+// source is merely stuck".
+func (s *Server) boseConfigStatus() string {
+	if s.boxHost == "" {
+		return "ERR: no box host configured"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b, err := boxGet(ctx, "http://"+s.boxHost+":8090/soundTouchConfigurationStatus", 4<<10)
+	if err != nil {
+		return "ERR: " + err.Error()
+	}
+	if m := configStatusRe.FindSubmatch(b); m != nil {
+		return string(m[1])
+	}
+	// NOT the body. Bose's :8090 roots carry deviceID="<12 hex>", which is the
+	// SCM MAC and on the never-publish list, and /debug/state answers an
+	// unauthenticated LAN GET. Every neighbouring reader in this file is
+	// careful the other way (boseNetworkDebug hashes the SSID and reduces the
+	// address to hasAddress), so an unrecognised shape is reported as a shape.
+	return fmt.Sprintf("ERR: unrecognised body (%d bytes, root %q)", len(b), xmlRootName(b))
+}
+
+// xmlRootName is the first element name in a firmware document, so an
+// unrecognised answer can be reported without repeating its contents.
+func xmlRootName(b []byte) string {
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if se, ok := tok.(xml.StartElement); ok {
+			return se.Name.Local
+		}
+	}
+}
+
+// handleDebugProbe issues an HTTP request from inside the box to a
+// caller-supplied URL and returns the raw response (status, headers,
+// body) as JSON. Built as a temporary diagnostic to verify whether
+// the BCO wifi-chipset HTTP responder on :80 also answers on the
+// loopback interface (it is documented as not having a Linux socket,
+// but the chipset may intercept lo traffic too). LAN-only, 5 s
+// timeout, body capped to keep the JSON small.
+//
+// Query parameters:
+//
+//	url     full URL to probe (required)
+//	method  HTTP method (default GET)
+//	body    request body, sent verbatim
+func (s *Server) handleDebugProbe(w http.ResponseWriter, r *http.Request) {
+	if !isLocalLAN(r.RemoteAddr) {
+		http.Error(w, "debug only from LAN", http.StatusForbidden)
+		return
+	}
+	target := r.URL.Query().Get("url")
+	if target == "" {
+		http.Error(w, "missing url query parameter", http.StatusBadRequest)
+		return
+	}
+	// Scheme gate: this is a deliberate diagnostic that DOES probe the box's own
+	// loopback services (Bose :8090, STM :8888), so we do NOT use the SSRF dial
+	// guard here, but we still reject non-http(s) schemes (file://, gopher://,
+	// ...) so the LAN-gated debug endpoint cannot be turned into a local-file or
+	// arbitrary-protocol reader.
+	if err := netutil.SafeHTTPURL(target); err != nil {
+		http.Error(w, "invalid url: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	method := r.URL.Query().Get("method")
+	if method == "" {
+		method = http.MethodGet
+	}
+	bodyStr := r.URL.Query().Get("body")
+	timeoutSec := 5
+	if t := r.URL.Query().Get("timeout"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil && v >= 1 && v <= 120 {
+			timeoutSec = v
+		}
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+	var reqBody io.Reader
+	if bodyStr != "" {
+		reqBody = strings.NewReader(bodyStr)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, target, reqBody)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"target": target,
+			"phase":  "build-request",
+			"error":  err.Error(),
+		})
+		return
+	}
+	client := &http.Client{Timeout: time.Duration(timeoutSec) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"target": target,
+			"method": method,
+			"phase":  "do-request",
+			"error":  err.Error(),
+		})
+		return
+	}
+	defer resp.Body.Close()
+	const maxBody = 8 * 1024
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	hdrs := map[string]string{}
+	for k, v := range resp.Header {
+		if len(v) > 0 {
+			hdrs[k] = v[0]
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"target":      target,
+		"method":      method,
+		"status_code": resp.StatusCode,
+		"status":      resp.Status,
+		"headers":     hdrs,
+		"body":        string(respBody),
+		"body_bytes":  len(respBody),
+	})
+}

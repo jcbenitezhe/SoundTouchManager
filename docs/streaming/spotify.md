@@ -1,0 +1,663 @@
+# Spotify Connect: integration spike
+
+Status: shipped. Spotify Connect went live as a beta in v0.7.0 and has been
+hardened through the v0.9.x line (go-librespot sidecar, see the decision
+update below); carries the history. The rest of this document is the
+spike trail plus the shipping notes, kept for the reasoning behind the
+architecture.
+
+## TL;DR (updated after live testing)
+
+**Native Bose Spotify Connect still works and is the primary path; no new
+code is needed for the common case.** Live-verified on a taigan Portable
+running STM (2026-06-04): a Spotify app on the LAN discovered the speaker
+("Living Room 9870"), it authenticated and played an on-demand track
+(now_playing `source="SPOTIFY"`, the box connected to Spotify's AP on
+port 4070, no stored account). librespot is kept as the future-proof
+fallback (built + run-verified on the box, 5.5 MB) for if/when Spotify
+ever drops the frozen eSDK. The rest of this document is the spike trail.
+
+## Known limitation: accounts in Spotify's PlayPlay-DRM cohort (2026)
+
+Since roughly December 2025 Spotify has been forcing a per-account DRM
+migration: accounts created after a cutoff somewhere in 2024/2025 get
+**every** legacy AES audio-key request refused with `code 1`, while older
+accounts on the same device, track, and network keep playing. This hits
+every open-source Spotify Connect client (go-librespot, librespot-org,
+spotifyd); official/eSDK partner clients use the licensed PlayPlay path
+and are unaffected, so the box's NATIVE Spotify Connect keeps working for
+exactly the accounts that fail on STM's engine.
+
+Signature in the agent log: engine authenticates fine (`authenticated AP`,
+`authenticated Login5`), then `failed retrieving aes key with code 1` on
+every track ("skipping track ... stopping after N consecutive unplayable
+tracks"), often plus `context resolve: 403` and a `429` from the put-state
+fallout. Premium status does not matter; family sub-accounts created
+recently (e.g. the "Basic Family" plan, which only exists since Nov 2025)
+are typical victims.
+
+There is no engine-side fix: OAuth re-login, credential resets, bitrate
+and client-token changes are all documented not to help, and implementing
+PlayPlay upstream was rejected as a DMCA hazard (go-librespot#317). Our
+fork already carries the mitigations that exist (alternative-track
+relinking, PR; skip-on-refusal, commit bad77f3). Discriminator for
+support: a pre-2024 account plays on the same (STM) device while the new
+account does not. Upstream tracking: librespot-org/librespot#1649,
+devgianlu/go-librespot#279. First field case: (2026-08-01).
+
+## Decision update (2026-06-04): go-librespot is the open backend, not librespot-org
+
+The earlier spike picked librespot-org (MIT) as the sidecar. Building the
+**Spotify-preset** feature surfaced a requirement that flips the choice:
+**hardware preset buttons 1..6 must recall a saved Spotify playlist
+autonomously**, with no phone app present. That means the box itself must
+issue "play URI X".
+
+- **librespot-org has no local control API.** Its only autonomous path is
+  the Spotify **Web API** with a refreshable OAuth token **stored on the
+  box**, a real security surface and a token-refresh subsystem on every
+  user's device.
+- **go-librespot ships a local HTTP control API**
+  (`POST /player/play {uri}`) that plays a URI from its own cached
+  credential, no Web API, no token plane.
+
+So the **primary open backend is go-librespot**; librespot-org stays the
+**fallback** (cleaner pure-Rust static build, and its Ogg passthrough is
+the audio fallback if a Bose model refuses the live WAV stream).
+
+Costs accepted with go-librespot:
+- **Audio is PCM, not Ogg.** Its pipe backend emits s16le only. We wrap it
+  as a streaming **WAV** and serve it at `/spotify/stream`; the box plays
+  it over UPnP. Bose lists WAV as a supported format, but the live-WAV
+  path is the **one on-box unknown to validate** (de-risk: stream any WAV
+  to the box's UPnP before trusting the full chain). If it fails, fall
+  back to librespot-org + Ogg and revisit control. (Resolved in the end:
+  rather than stream WAV, go-librespot was patched to emit **raw Ogg
+  passthrough** (`.github/patches/go-librespot-passthrough.patch`,
+  `audio_output_pipe_passthrough`), so the box decodes Ogg natively and no
+  PCM/WAV is ever served, see "Where the engine comes from" below.)
+- **cgo build.** go-librespot decodes Vorbis/FLAC through C (libogg,
+  libvorbis, flac), so unlike librespot's pure-Rust static musl it needs a
+  cgo cross build. Handled once in CI (`.github/workflows/go-librespot.yml`,
+  static-linked armv7 in an emulated Alpine container so it runs on the
+  box's glibc 2.15). One-time CI cost vs. an ongoing on-box token plane.
+
+Implementation landed (commit pivoting the manager): `internal/spotify`
+supervises go-librespot (config: pipe -> /dev/stdout raw Ogg passthrough
+via the STM patch, local API on, zeroconf + persist credentials),
+`ServeOgg` streams the audio, `Play` drives recall; `cmd/agent` +
+`internal/webui` route both hardware and software Spotify preset presses
+to `Play(uri)` + `/spotify/stream.ogg`.
+
+### Where the engine comes from (`third_party/go-librespot`, nothing else)
+
+The speaker's engine is built by `.github/workflows/go-librespot.yml` (and
+the engine job in `release.yml`) from **`third_party/go-librespot/`** in this
+repository: a vendored copy of the fork's `master` (originally
+`JRpersonal/go-librespot`, commit `ca90623d555c`). That source, and only
+that source, carries both halves the box needs: the Ogg-passthrough (the box
+decodes, the engine never does) and the merged upstream.
+`third_party/go-librespot.base` names the last upstream commit it contains;
+`upstream-drift.yml` reports what upstream has added since. Locally,
+`make engine-build` runs the same recipe into the embed slot.
+
+Building from anything else (an older fork branch, plain upstream) is not a
+harmless mistake, because the
+failure looks like a box problem: the engine starts, authenticates, and
+then refuses every single track with `failed initializing ogg vorbis
+stream: vorbis decoder not compiled in this build (pipe passthrough
+only)`, while the speaker just sits on a byte-less stream and dies with
+`3101 AUDIO_ERROR_BAD_URL`. That cost a deploy round on 2026-08-21.
+
+Rule of thumb: fix it in `third_party/go-librespot`, run the workflow,
+verify the artifact's SHA256, hot-swap it onto a test box
+(`POST :PORT/api/agent/sidecar`, no reboot needed), then listen through at
+least two track changes before believing it.
+
+### Before shipping go-librespot (standing gate)
+
+1. **Security audit of the go-librespot source** at the pinned tag:
+   malware / backdoors / data exfiltration / unexpected network calls.
+   The bundled binary must be trustworthy for end users.
+2. **Validate the live-WAV-over-UPnP path** on real hardware (the one
+   unknown above).
+3. **Credits**: add go-librespot (and librespot-org) to the project
+   credits and the website.
+4. **Architecture diagram / docs** updated to show the sidecar + the
+   audio (`/spotify/stream`) and control (local API) planes.
+
+### Long tracks: where the memory goes, and the seam mechanism (off)
+
+**Read this first (2026-09-08).** The retention is the SPOTIFY ENGINE's,
+not the speaker firmware's, and the seam mechanism described below is
+therefore OFF by default. A measurement on a live Portable cut three seams
+a megabyte apart while a track played: every seam was accepted, playback
+continued, and the box freed nothing (`freedKB` -928, +80, -556, the
+effectiveness latch engaged after the third), while the engine's own
+resident memory climbed from 19.9 to 22.4 MB across the same three links.
+go-librespot's chunked reader keeps every fetched chunk of the current
+track in memory (`audio/chunked-reader.go`, one 256 KiB `chunkItem` per
+chunk of the whole file, never cleared) and the reader is only dropped at a
+track change, which is exactly why a playlist is stable and one long track
+is not.
+
+**Fixed in the engine, same night.** The fork releases the chunks the read
+position has passed and keeps four behind plus the two prefetched, so the
+reader holds 1.75 MiB whatever the track length; a released chunk is
+re-downloaded transparently, and the window is switched off while a
+completion callback is registered, because that callback reads the whole
+file back to persist it to the audio cache (STM pins that cache off, so on
+a speaker the window is always active). Measured on the Portable
+immediately afterwards, same preset, same length of run: the engine's
+resident size settles around 20 MB and stays there for six minutes while
+the speaker's free memory is flat, against 19.3 to 24.5 MB and 7.3 MB lost
+in two minutes before. The release pipeline builds the engine from the
+fork's master, so a release carries it.
+
+What remains valuable on the STM side is the instrument: the engine's
+resident size now sits next to the speaker's free memory in the health
+line, the heartbeat and the diagnostic file, which is what settled this in
+two minutes.
+
+**The field finding (2026-09-07, SoundTouch 20 sm2, FW 27.0.6, 122 MB
+RAM).** Memory falls in proportion to the audio delivered *within one
+logical Ogg stream* and recovers when a new logical stream begins, i.e. at
+a BOS page with a new serial. That reading was consistent with the
+firmware holding the buffer, and the paragraph below was built on it; the
+measurement above showed the same pattern has a different owner, because
+the engine drops its chunk cache at exactly that moment. Ordinary
+playlists (3 to 9 minute songs, a BOS between every two) kept
+`memAvailableKB` flat for 46 minutes and 45 MB of audio, even inside one
+uninterrupted 15-minute HTTP attach. One 60-minute track, a single logical
+stream for the whole hour, dropped it monotonically at ~1.25 bytes per byte
+of audio (29.9 MB to 3.8 MB in 1092 s) until STM's memory guard rebooted the
+box after 20 to 30 minutes. Bluetooth does not leak; an HTTP re-attach, a
+pause or a standby frees nothing. The "irreducible ~0.4 MB/min floor" of
+the earlier flush-size sweep was this same retention measured across the
+frees at track boundaries. Details in `docs/FIRMWARE-NOTES.md`.
+
+**The mechanism (`internal/spotify/oggchain.go`), off unless switched on.**
+It gives the decoder a logical-stream boundary of STM's own making: it splits a long track into a chain
+of logical streams. At the seam the current page P goes out with the EOS
+flag, then the track's own header pages (identification, comment, setup)
+are re-emitted under a fresh serial S2 with page sequence 0..h-1, and every
+following page is re-stamped with S2 and a contiguous sequence. Granule
+positions are never touched (absolute continuation, the late-join shape
+the box already decodes), no packet is reassembled, the HTTP connection
+and chunking stay as they are. P must complete its last packet (final
+lacing value below 255) so the next page starts a fresh packet; a page that
+completes no packet, a BOS or an already-EOS page is never P. The decoder
+re-initialises from identical headers and the firmware frees the old
+link. Cost: a naive cut loses the overlap between the last packet before
+and the first after the seam, a quarter block each (a few milliseconds),
+at most once every ~10 minutes of a long track. A primer packet that would
+make it sample-exact is deliberately not built until a hardware A/B says
+which decoder class the box runs; `openLink` is the hook.
+
+**Trigger.** Never inside the first 2 MiB of a link; at the latest at the
+ceiling (12 MiB, ~10.5 min at 160 kbps); 4 MiB when meminfo is unreadable.
+A `MemAvailable` reading may end a link earlier only when the memory can be
+attributed to *that link*, which takes three things together: the reading is
+below 12 MiB, it has fallen by at least 0.5 bytes per byte of the link since
+the link's first probe (the field leak runs at 1.25), and the link carries at
+least 60 s of audio, counted from the granule positions the pages already
+carry rather than from wall clock. The level alone is not enough: a box that
+sits between the memory guard's 6 MiB and this 12 MiB gate for hours or days
+for an unrelated reason (the BoseApp leak family) would otherwise be seamed at
+the 2 MiB minimum on every ordinary song, once per ~105 s at 160 kbps and once
+per ~52 s at 320, each an audible ~23 ms dropout and one line into the NAND
+log, with the effectiveness latch never engaging because each seam does free
+its own link. Such a box now only ever sees the 12 MiB ceiling. The baseline
+the fall is measured against is the link's first probe, which lands at the
+2 MiB minimum (the cadence from there is one probe per 512 KiB of audio, about
+twice a minute, no timer) and therefore after the box has finished freeing the
+previous link, so it is a settled reading; the price is that a leak at the
+field rate seams at ~3.5 MiB rather than at the 2 MiB minimum. Ordinary songs
+on a healthy box never see a seam. Three consecutive seams that free under
+10 % of their link warn once and stop seaming until the next real track
+boundary (the engine holding the memory instead of the firmware).
+
+**Knob / kill switch.** `/mnt/nv/stmanager/spotify-chain-mb`: absent = OFF (the default since 2026-09-08),
+`0` = off (byte-identical passthrough), 1..64 = the ceiling in MiB. Read
+at engine start, at every real track boundary and after every seam, never
+polled, so `echo 0 > /mnt/nv/stmanager/spotify-chain-mb` lands at the next
+boundary without a restart; remove the file to return to the default.
+
+**What the log shows.** One Info line per seam, `spotify: chain seam, long
+track split so the box frees its stream buffer`, written ~20 s after the
+cut (earlier at a real BOS, a detach or the engine exit, then with
+`forcedBy`), carrying `track, seam, reason=memory|period|fallback, linkKB,
+linkSec, granuleSec, oldSerial, newSerial, memBeforeKB, memAfterKB,
+availAtLinkStartKB, fellKB, fellPerByte, freedKB, probeSec, engineRSSKB`.
+`freedKB` positive and roughly `linkKB * 1.25` confirms the mechanism;
+`availAtLinkStartKB`, `fellKB` and `fellPerByte` are the evidence a
+`reason=memory` seam was judged on, so a bundle shows whether the box really
+was losing memory to that link (`fellPerByte` at or above 0.50, the field
+value ~1.25) or was merely low; the latch warning `chain seams are not
+freeing memory on this box` marks the other cases. `resource health` lines and
+the crash heartbeat now carry `engineRSSKB` (a climb in step with the
+audio means go-librespot's chunk reader holds the track and the fix
+belongs in the fork), the detach line carries `seams`, and the
+`spotify_chain` section of `/api/debug/state` keeps the last seam's
+readings for a bundle after the NAND ring has rolled.
+
+### Lyrics run ahead of the audio: the buffer lag is measured, not corrected
+
+Field report (2026-09): with STM's Spotify entry the lyrics in the Spotify
+app run ahead of the sound, with the speaker's own Spotify entry they line
+up. The mechanism follows from the architecture above. go-librespot reports
+its position from the bytes it has written to the pipe, while that audio is
+still travelling through STM's batch and the box's own buffer, and STM
+deliberately keeps roughly ten seconds there (`leadCapSec` in
+`internal/spotify/engine.go`, the flush batch in `drain.go`). The app shows
+the delivered position; the lyrics follow the app.
+
+What was never known is the size of the offset on real hardware, and any
+correction applied before that number exists would be a guess. So
+`internal/spotify/boxlag.go` measures it and does nothing else: the drain
+publishes the delivered timeline of the last page it handed to the box, the
+speaker's own clock comes from UPnP `RelPosition` (`GetPositionInfo`'s
+`RelTime`), and the difference is logged as `spotify: buffer lag measured
+(audio delivered vs audio played)` with both sides and `diffSec`. The last
+reading is also in the `spotify_chain` section of `/api/debug/state`, so a
+field bundle carries it after the NAND ring has rolled.
+
+Event-driven only, once per attachment and once per track boundary: no
+ticker, no standing poll, nothing on the wire while nothing happens. A
+boundary caused by a skip is labelled `track-boundary after a skip`, because
+the box drops its buffer there and both clocks are mid-jump.
+
+The two clocks only mean something against a shared base, which is most of
+what the code does:
+
+- The baseline is taken in the drain, on the first audio page the new
+  attachment actually receives, not where the box attached. The engine keeps
+  producing while no box is attached (`engineHot`, see `recall.go`), so the
+  delivered counter at the attach instant is the value at the PREVIOUS
+  detach, and basing on it folded that whole detached window into every later
+  reading of the attachment.
+- Delivered counts only audio handed to the box. The pages a skip cut throws
+  away, and a batch dropped when the box goes, are never played, so the
+  box's `RelTime` cannot contain them; counting them inflated every later
+  reading by up to a full lead cap, i.e. by the same order of magnitude as
+  the quantity being measured.
+- The delivered timeline carries across go-librespot runs. The sink outlives
+  one engine run by design (crash restart, volume-config restart, the OTA
+  sidecar swap), and a per-run counter starting at zero under an attached box
+  made every later reading negative.
+- `RelPosition` reports whether the field was READABLE, not whether the call
+  succeeded. Bose answers `NOT_IMPLEMENTED` for fields it has no value for,
+  which parses as zero, and a zero box clock reads as the largest lag the
+  measurement can express. No usable clock means no line and no stored
+  reading; the same goes for a baseline that has not been taken yet and for a
+  timeline that was rebuilt underneath the box. A missing number is worth
+  more than a plausible wrong one.
+
+## Why native Spotify works without the Bose cloud
+
+Spotify Connect has two login paths. Bose's app used the **account-linked**
+one: enter your account in the Bose iOS app, the Bose cloud brokered the
+Spotify OAuth and stored the account on the speaker so it appeared
+everywhere. That broker (the Bose cloud) is dead, which is why the account
+can no longer be changed from the Bose app.
+
+But the **zeroconf path** is independent and alive: the speaker's eSDK
+advertises Spotify Connect on the LAN; the user's Spotify app (logged in
+to their account) discovers it and performs the login handshake **itself**,
+handing the speaker a one-time credential derived from the app's own
+session (via the eSDK's Diffie-Hellman exchange). The speaker logs in to
+Spotify's AP (port 4070) directly and streams from the CDN. The Bose cloud
+is never in this path, so it survived the shutdown. Evidence:
+now_playing shows `sourceAccount="SpotifyConnectUserName"` with no stored
+account, and the box holds a live TCP connection to a Spotify AP on 4070.
+
+## Connecting accounts (there is no "linking" step)
+
+Any Spotify account just: open the Spotify app on the same Wi-Fi as the
+speaker, tap the device picker, choose the speaker, play. The app does the
+auth; whoever connects last controls it. No Bose app, no stored account,
+no cloud, no STM config. The only thing lost versus the old Bose flow is
+the permanent "appears everywhere under one account" presence (that needed
+the cloud-brokered stored account); the practical pick-and-play works.
+
+STM's role: the marge stub answers the Bose cloud source-provider list,
+so BoseApp enables the SPOTIFY source, loads the eSDK, and advertises
+zeroconf. STM therefore likely delivers native Spotify essentially for
+free (to confirm: whether a post-cloud box without STM leaves the source
+disabled).
+
+## Goal
+
+A SoundTouch speaker running STM should be linkable to one or more
+Spotify accounts and then appear as a playback target ("device") in the
+Spotify app, so a user picks it in the app and audio plays on the
+speaker. The Spotify setting is network-wide: it is configured once in
+the desktop app and rolled out to every speaker on the LAN.
+
+## The constraint (why the old path is dead)
+
+The SoundTouch firmware's built-in Spotify Connect hung off Bose-issued
+Spotify partner credentials baked into the cloud. With the cloud gone and
+the OEM agreement ended, the speaker's native Spotify source no longer
+authenticates and cannot be revived. Playback therefore has to come from
+a Spotify Connect implementation STM controls, not the speaker's dead
+built-in source. See for the longer history.
+
+## How Spotify Connect actually works
+
+A Connect "device" advertises itself on the LAN over mDNS/zeroconf
+(`_spotify-connect._tcp`). The Spotify app discovers it and authenticates
+through Spotify's own servers, so:
+
+- **No password is stored on the device** in zeroconf/discovery mode. The
+  user picks the device in their app and it just works.
+- **Multiple accounts work for free**: anyone on the LAN sees the device
+  and can take it over from their own app. This satisfies "one or more
+  accounts" with zero per-account configuration.
+
+This is the UX the goal asks for, and it is implemented by the open
+`librespot` family.
+
+## Building blocks (researched)
+
+| Project | Lang | License | Zeroconf | Audio out | Notes |
+|---|---|---|---|---|---|
+| [librespot](https://github.com/librespot-org/librespot) | Rust | **MIT** | yes (discovery mode) | ALSA, pipe, subprocess, ... | Reference impl. MIT = clean to bundle. |
+| [go-librespot](https://github.com/devgianlu/go-librespot) | Go | **GPL-3.0** | yes (builtin mDNS or avahi) | ALSA, PulseAudio, **pipe** (s16le/f32le) | Active. Has an HTTP control API. GPL matters, see below. |
+| [AfterTouch / gesellix](https://github.com/gesellix/Bose-SoundTouch) | Go | - | - | - | Community post-cloud SoundTouch toolkit; references for the box side. |
+
+### Licensing (decisive)
+
+STM is MIT. **go-librespot is GPL-3.0, so its Go packages must never be
+imported/linked into STM's Go code** (that would force STM to GPL).
+Either implementation may only be used as a **separate sidecar binary**
+invoked over a process boundary (exec + its HTTP API / pipe), which is
+mere aggregation, not a derivative work. STM uses go-librespot exactly
+this way: it execs the binary and talks to it over localhost HTTP, never
+importing its packages, so STM stays MIT. Shipping a GPL-3.0 binary
+obliges us to offer its source; it is public and the build is pinned +
+Sigstore-attested (`go-librespot.yml`). See the Decision update at the
+top: go-librespot is chosen for its local control API; librespot-org
+(MIT, no GPL obligation) remains the fallback.
+
+## Where does the audio go?
+
+A Connect receiver decodes the Spotify stream to PCM and needs an audio
+sink. On the box, Bose owns the audio output, which first looked like the
+hard blocker. It is not: STM already plays audio on the box by pointing
+its UPnP at an HTTP stream, so the on-box receiver can feed that same path
+on loopback (see Architecture A). The design:
+
+### Architecture A: on-box sidecar (the chosen path)
+
+The STM agent ships and supervises a librespot sidecar **on the speaker**
+in zeroconf mode, so the box itself appears as its own Connect device.
+No PC has to be running; the network-wide config is rolled out to every
+agent and each box self-advertises.
+
+**The audio path is the key insight, and it is already solved in STM.**
+STM does not write audio to ALSA; it plays on the speaker by pointing the
+box's own UPnP AVTransport at an HTTP stream URL (the radio path,
+Box:8091). Architecture A reuses exactly that:
+
+1. on-box librespot runs in zeroconf mode (box = the Connect device);
+2. when a user plays, librespot decodes to a **local HTTP stream** served
+   by the agent's stream layer (pipe backend -> PCM/WAV over HTTP, or a
+   light transcode);
+3. the agent tells the box's own UPnP to play
+   `http://127.0.0.1:<port>/spotify`.
+
+So there is no direct ALSA access and no fight with Bose's audio
+ownership: Spotify audio reaches the speaker over the same proven path as
+radio. The remaining unknowns shrink to a hardware session:
+
+- librespot ARMv7l build (Rust, MIT) and NAND footprint, stripped.
+- sustained CPU on the weakest model (ST10): decode + serve/transcode.
+- play / pause / seek latency through the Bose UPnP buffer.
+- track metadata: surface the current title via the agent's now-playing.
+
+### Architecture B: desktop bridge (fallback only)
+
+librespot runs on the desktop host instead, advertising one device per
+speaker and re-streaming to the box via UPnP. This was considered and
+**rejected as the primary path**: its one distinguishing piece (re-stream
+from the PC) is thrown away in A, so it does not de-risk A's real
+question, and it forces the PC to stay on while the device shown is a
+PC-hosted proxy, not the box itself. Keep B in reserve only if librespot
+turns out not to run on the box at all (NAND / CPU limits).
+
+## Network-wide config and rollout
+
+Per the requirement, Spotify is one network-wide setting, configured in
+the desktop app and applied to all speakers:
+
+- A single `spotify` config object (at least: `enabled`, device-naming
+  pattern, bitrate, normalization) lives in the desktop app.
+- **Architecture A:** the desktop app pushes that config to every
+  discovered agent (a new `/api/spotify/config` on the agent, same
+  rollout pattern as presets/region). Each agent starts/stops and
+  configures its own librespot sidecar. Each box self-advertises, so
+  multi-box is natural.
+- **Architecture B:** the desktop app owns N librespot instances (one per
+  speaker) directly; "network-wide" is intrinsic since one app manages
+  all of them. Heavier on the host (N decoders, N streams).
+- Multi-account needs no rollout: zeroconf stores no credentials, so the
+  same `enabled` config gives every account on the LAN access to every
+  speaker.
+
+## Proof-of-concept plan (Architecture A, on approval)
+
+A hardware session on the test speaker (SSH to the maintainer's own box
+on his LAN):
+
+1. Cross-compile librespot for ARMv7l (Rust, MIT), strip it, and check
+   the NAND footprint against free space.
+2. Run it on the box in zeroconf mode; confirm the box appears in the
+   Spotify app and a session starts (no audio yet).
+3. pipe backend -> a minimal agent HTTP endpoint that serves the PCM/WAV
+   stream on loopback.
+4. Point the box's own UPnP AVTransport at `http://127.0.0.1:<port>/...`;
+   confirm audio plays on the speaker and measure play/pause/seek latency.
+5. Measure sustained CPU on the weakest reachable model.
+6. Then wrap it: agent supervises the sidecar; a new `/api/spotify/config`
+   receives the network-wide config the desktop app rolls out to all
+   agents; surface track metadata via now-playing.
+
+## Component choice: native eSDK now, librespot as the fallback
+
+(Updated: the on-box test showed the native eSDK actually works via
+zeroconf, see the TL;DR. So native is the primary path today; the
+analysis below is why librespot is kept ready as the fallback for the
+frozen-component risk, not why it is primary.)
+
+The speaker already ships Spotify's official embedded SDK
+(`/usr/lib/libspotify_embedded_shared.so`, dated Aug 2022) plus the audio
+socket `/var/volatile/tmp/spotifyaudio.uds`. Bose used the account-linked
+Connect model: you entered your Spotify account in the Bose iOS app, the
+Bose cloud brokered the Spotify OAuth and pushed the credential to the
+speaker, which logged in and registered with Spotify so it appeared in
+your app everywhere. Only that broker (the Bose cloud) is dead; the eSDK
+itself is intact.
+
+Reusing the eSDK is in fact the primary path: it works today (zeroconf,
+no cloud, verified). But it carries one structural risk that keeps
+librespot in reserve:
+
+- The eSDK is **frozen at Aug 2022 and will never be updated by Bose**.
+  When Spotify next deprecates the protocol version or revokes the
+  embedded partner key, native Spotify dies with no recourse, the exact
+  vendor-abandonment failure STM exists to undo.
+- Driving a closed Spotify C library with Bose's partner key outside
+  Bose's flow is heavy reverse engineering with uncertain payoff.
+
+### librespot on-box results (live, 2026-06-04)
+
+Validated end to end on the taigan Portable except the final audio
+plumbing:
+
+- Builds + runs (static musl). OAuth login works; the credential is
+  cached to `credentials.json` and is **persistent (survives reboot)** ,
+  this is the session cache that makes autonomous presets possible.
+- Authenticated as a Premium account and registered as a Spotify Connect
+  device; it even shows up account-bound ("devices on another network")
+  since local zeroconf is off on this box. **librespot refuses Free
+  accounts** (`does not support "free" accounts`); the native eSDK does
+  not, so Free users keep native live Spotify, presets are Premium-only
+  (on-demand recall needs Premium anyway).
+- **Idle RAM ~4 MB** (VmRSS 4208 kB), NAND 5.5 MB. Footprint is a
+  non-issue.
+- Control path works: pressing play in the app makes librespot decode and
+  emit audio to the pipe backend.
+- Audio routing is the one remaining build: run librespot with
+  **`-P/--passthrough`** so it emits the raw Ogg/Vorbis stream (not PCM),
+  have the agent serve that over HTTP (streamproxy), and point the box's
+  own UPnP at it, so the Bose firmware decodes the Ogg (offloading the
+  Cortex-A8). Then preset save/recall: a preset stores the Spotify URI,
+  recall tells librespot to play it and routes the audio this way.
+  (Pitfall found: without `--passthrough`, librespot writes raw PCM at
+  ~176 KB/s; never let that land on NAND.)
+
+librespot is the fallback because it is **open, actively
+maintained (v0.8.0, Nov 2025), and STM controls its update path**: if
+Spotify ever drops the frozen eSDK, we rebuild librespot from source and
+ship it over OTA. It also does the
+same **account-linked** model via its OAuth login (`librespot-oauth`), so
+the familiar "appears in your Spotify app under your account" UX is
+preserved, not just local zeroconf. This mirrors STM already replacing
+the dead TuneIn integration with radio-browser. The eSDK reuse stays
+documented only as a rejected alternative.
+
+## How login works (no special Spotify partnership) and the data flow
+
+librespot has no partner status with Spotify; it is reverse-engineered.
+The robust, least-grey login is **zeroconf**, where Spotify's own app
+does the authentication:
+
+1. librespot advertises `_spotify-connect._tcp` on the LAN.
+2. The user's official Spotify app (same LAN) discovers the device and,
+   being legitimately logged in, performs the auth and hands librespot a
+   reusable session credential. librespot itself does no OAuth here.
+3. librespot logs in to `ap.spotify.com` with that credential and
+   registers the device with Spotify's backend. From then on it shows up
+   in the user's Spotify app, including remotely, exactly the
+   account-linked UX Bose had. One-time LAN login, then account-bound.
+
+Data flow during playback: control ("play on device X") goes through
+Spotify's servers to librespot; librespot pulls the encrypted Ogg from
+Spotify's CDN, decrypts it, and with `passthrough-decoder` hands the Ogg
+through undecoded to the box, whose Bose firmware decodes and plays it
+(Architecture A). Audio never streams phone-to-speaker directly.
+
+A standalone OAuth path also exists (`librespot-oauth`, using a public
+Spotify client id) but it is the more fragile, greyer route and is not
+needed when zeroconf is used. The residual risk that Spotify breaks
+unofficial clients is the reason for choosing a maintained OSS component
+we can rebuild and ship over OTA.
+
+The frozen Bose eSDK keeps no idle footprint to stop: `ps` shows no
+Spotify process; the eSDK is loaded on demand only when Bose's (now
+account-less, dead) Spotify source is selected. Integration just avoids
+triggering it and ensures only librespot advertises Spotify Connect.
+
+## Spike results so far
+
+- **Build (transparent, from source):** `.github/workflows/librespot.yml`
+  builds librespot v0.8.0 from source as a static-musl armv7 binary,
+  size-optimised, Sigstore-attested, no opaque blob. Features:
+  `with-libmdns` (zeroconf), `rustls-tls-webpki-roots` (pure-Rust TLS, no
+  OpenSSL), `passthrough-decoder` (pass Ogg/Vorbis through so the Bose
+  firmware decodes it, not the Cortex-A8). No ALSA.
+- **Footprint:** the binary is **5.5 MB** (5,542,460 bytes). The box has
+  ~20.4 MB free on `/mnt/nv`; the STM agent is 11.3 MB, so agent +
+  librespot is ~17 MB, under budget. NAND is **not** a blocker, and a
+  hand-rolled client would not save meaningful disk (a Go binary would be
+  similar or larger). The library-vs-custom question therefore comes down
+  to runtime RAM/CPU, not size.
+- **Box profile (taigan Portable):** armv7l, single-core Cortex-A8
+  (AM33XX) with NEON, glibc 2.15 (hence static musl), ~52 MB RAM
+  available. CPU/RAM at runtime is the one open risk; `passthrough-decoder`
+  exists specifically to keep decode off the box.
+- **On-box run (taigan Portable, live):** the static-musl binary
+  **executes** on the box (`librespot 0.8.0 ... exit 0`), confirming the
+  build is compatible. With the 5.5 MB binary on `/mnt/nv` there is still
+  14.6 MB free.
+- **zeroconf is blocked on this box:** the kernel (3.14) has **no IPv6**
+  (`/proc/net/if_inet6` absent, no `net.ipv6` sysctl), so libmdns's
+  discovery server fails to bind (`os error 97`, EAFNOSUPPORT) and
+  librespot, with no discovery and no credentials, exits. `avahi-daemon`
+  is installed but not running.
+- **Therefore the credential/OAuth path is the one for this hardware:**
+  librespot with a provided credential authenticates straight to
+  `ap.spotify.com` with no discovery server, side-stepping the IPv6
+  issue, and it is exactly the account-linked model (device appears in
+  the user's Spotify app). The zeroconf-is-cleaner point is moot here
+  because the box cannot run the mDNS responder. (Alternative, not
+  chosen: build `with-avahi` and run the box's avahi-daemon, more moving
+  parts and Bose-mDNS conflict risk.)
+- **Still to measure (needs a one-time OAuth login):** run librespot with
+  cached OAuth credentials so it stays up, then idle RAM/CPU, CPU during
+  a session, and play/pause/seek latency through the box's UPnP buffer.
+
+## Spotify presets via librespot (multi-account design)
+
+Native eSDK gives live Spotify but cannot recall a preset autonomously
+(no persistent session). librespot with a cached credential can: a preset
+holds a Spotify URI, recall tells librespot to play it, audio routes to
+the box. The vision (which the Bose original never did): several household
+members each log in their own Spotify account and save their own
+playlists; a preset tile shows it is Spotify and whose account it is.
+
+Data model (done, `internal/presets`): a preset carries `Type="spotify"`,
+`URI` (the resource), and `Account` (whose it is) instead of a StreamURL.
+
+Build phases:
+- **P0 foundation (done):** preset model carries URI + Account, tested.
+- **P1 single account:** agent supervises one librespot (cached cred,
+  `--passthrough`), serves its Ogg over HTTP (streamproxy), recall =
+  librespot play URI -> box UPnP plays the Ogg. Frontend: save the
+  current Spotify now-playing as a preset (capture the URI) and play it.
+- **P2 multi-account:** per-account cached credentials; a preset's
+  `Account` selects which credential/session plays it (one librespot per
+  account, or switch). OAuth done once per account.
+- **P3 UI:** preset tiles show a Spotify badge + the account, so each
+  member recognises their own.
+
+Prerequisites that are their own work: the OAuth credential must reach
+the box (desktop app does the OAuth in a webview, pushes the credential),
+and librespot must be deployed (built in CI, see librespot.yml; shipped
+on the stick / via OTA, MIT so bundling is fine after the security
+audit).
+
+## Before shipping (mandatory gates)
+
+Once the on-box test confirms librespot works, these must be done before
+it ships to any user:
+
+1. **Security audit of the librespot source at the pinned tag.** STM
+   bundles a binary that runs on users' speakers, so review for
+   backdoors, malware, data exfiltration, and unexpected outbound
+   endpoints; sanity-check the dependency tree (the Cargo.lock) and
+   diff the pinned tag against upstream. Pin to an audited tag and only
+   bump after re-auditing. Users must not be surprised one day.
+2. **Credits / thanks.** Add librespot (librespot-org, MIT) to the
+   project's credits, alongside the existing community acknowledgements.
+3. **Website.** Add librespot to the credits/acknowledgements on
+   the website (`site/`) and describe the Spotify feature on the relevant page.
+4. **Architecture.** Add the librespot sidecar + the Ogg-passthrough ->
+   UPnP-loopback path to docs/ARCHITECTURE.md (component map + the
+   external-dependency / data-flow tables) and the CLAUDE.md diagram.
+
+## Acceptance for closing
+
+This doc plus a working (even hacky) PoC of the chosen path on at least
+one model, and the remaining blockers before it can ship to all users
+(licensing posture for the bundled sidecar, NAND footprint for A, the
+PC-on caveat for B).
+
+## Falsified / non-options
+
+- Reviving the speaker's native Spotify source: impossible without Bose
+  partner credentials.
+- 30-second Web API previews: useless for real playback.
+- Importing go-librespot into STM's Go modules: license-incompatible
+  (GPL-3.0 vs MIT). Sidecar only.

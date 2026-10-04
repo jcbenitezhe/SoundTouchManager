@@ -1,0 +1,3 @@
+"starting" = "SoundTouch Manager wird gestartet…";
+"backend_failed" = "SoundTouch Manager konnte nicht starten: %@";
+"cancel" = "Abbrechen";

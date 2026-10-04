@@ -1,0 +1,437 @@
+/*
+ * Visual layer on top of style.css: card surfaces, softer palette, icon tabs,
+ * a primary play button and roomier preset tiles. Only restyles; every rule
+ * here can be dropped without breaking behaviour.
+ *
+ * Token overrides use the same selectors as style.css (:root for dark,
+ * html.a11y-light for light) and leave html.a11y-contrast alone, so the
+ * high-contrast theme keeps its maximum-contrast palette.
+ */
+
+/* ---------- Tokens ---------- */
+
+:root {
+  /* Palette taken from the app icon: navy-black panel, electric blue, neon
+     red. Text tiers on --c-surface-3 (the lightest surface): 13.3, 9.7,
+     6.5 and 5.2:1; --brand 6.3:1. */
+  --c-bg: #050b14;
+  --c-surface: #0b1524;
+  --c-surface-2: #111d30;
+  --c-surface-3: #182740;
+  --c-border: #1e3150;
+  --c-border-2: #2b4468;
+  --c-text: #eaf2fc;
+  --c-text-2: #c3d1e3;
+  --c-muted: #9aacc4;
+  --c-faint: #8799b2;
+  --brand: #07b3ff;
+  --brand-hover: #4fcbff;
+  --brand-bg: #06223d;
+  --brand-bg-soft: #0a3159;
+  --brand-border: #1466b8;
+  --brand-text: #cdeeff;
+  --brand-text-mid: #86d2ff;
+  --brand-deep: #0b4fb3;
+  /* Neon red of the icon's "M". Decorative accent only, never a signal. */
+  --accent: #fc513f;
+  /* Text on a solid --brand fill: white reaches only 2.4:1 on #07b3ff. */
+  --on-brand: #021020;
+  --brand-glow: 0 0 0 1px rgba(7, 179, 255, 0.35), 0 0 14px rgba(7, 179, 255, 0.28);
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-hover: 0 4px 14px rgba(0, 0, 0, 0.45);
+}
+
+html.a11y-light {
+  --c-bg: #f3f6fb;
+  --c-surface: #ffffff;
+  --c-surface-2: #f5f8fc;
+  --c-surface-3: #eaf0f7;
+  --c-border: #dde5ef;
+  --c-border-2: #c3cfdd;
+  /* 5.3:1 on white, 4.6:1 on --c-surface-3. */
+  --brand: #0b6bcb;
+  --brand-hover: #0852a0;
+  --brand-bg: #e5f3ff;
+  --brand-bg-soft: #d2eaff;
+  --brand-border: #93c6f2;
+  --brand-text: #0a3566;
+  --brand-text-mid: #1f5fa8;
+  --brand-deep: #0a3f8f;
+  --accent: #d93a2b;
+  --on-brand: #ffffff;
+  --brand-glow: 0 0 0 1px rgba(11, 107, 203, 0.25);
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.05), 0 1px 3px rgba(16, 24, 40, 0.07);
+  --shadow-hover: 0 6px 16px rgba(16, 24, 40, 0.10);
+}
+
+html.a11y-contrast {
+  --c-text: #ffffff;
+  --c-text-2: #ffffff;
+  --c-muted: #ffffff;
+  --c-faint: #e6e6e6;
+  --accent: #ff8a8a;
+  --on-brand: #000000;
+  --brand-glow: none;
+  --shadow-card: none;
+  --shadow-hover: none;
+}
+
+select { background-color: var(--c-surface); }
+select option { background-color: var(--c-surface); }
+
+/* ---------- Layout ---------- */
+
+#app {
+  max-width: 1040px;
+  padding: 12px 24px 16px;
+}
+
+/* The donate card sits bottom-left, like a sidebar footer, instead of
+   floating mid-height beside the presets. Only the left side is reserved:
+   the column no longer needs to look centred against a rail on both sides. */
+@media (min-width: 62em) {
+  .layout { padding-left: 11.5rem; padding-right: 0; }
+  .donate-side {
+    top: auto;
+    bottom: 1rem;
+    left: 1rem;
+    transform: none;
+    background: var(--c-surface);
+    border: 1px solid var(--c-border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-card);
+  }
+}
+
+/* ---------- Brand ---------- */
+
+.app-logo-mark {
+  width: 34px;
+  height: 34px;
+  flex: none;
+  object-fit: contain;
+}
+/* Exo 2 ExtraBold, subset to printable ASCII (the name is never translated).
+   License: public/fonts/Exo2-OFL.txt. */
+@font-face {
+  font-family: 'Exo 2 STM';
+  src: url('/fonts/exo2-extrabold-latin.woff2') format('woff2');
+  font-weight: 800;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0020-007E;
+}
+.app-brand {
+  font-family: 'Exo 2 STM', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+.app-brand-accent { color: var(--brand); font-style: normal; }
+
+/* ---------- Tabs ---------- */
+
+.tabs {
+  gap: 2px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--c-border);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabs::-webkit-scrollbar { display: none; }
+.tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  padding: 10px 10px;
+  font-size: 13px;
+  font-weight: 500;
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.tab-btn:hover { background: var(--c-surface-2); }
+.tab-btn.active { font-weight: 600; }
+.tab-icon { flex: none; opacity: 0.85; }
+.tab-btn.active .tab-icon { opacity: 1; }
+
+/* ---------- Buttons ---------- */
+
+.btn,
+.btn-source {
+  border-radius: var(--radius-sm);
+  transition: background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.btn { font-weight: 500; }
+.btn:focus-visible,
+.btn-source:focus-visible,
+.tab-btn:focus-visible {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+.btn-primary {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--on-brand);
+}
+.btn-primary:hover:not(:disabled) { background: var(--brand-hover); }
+
+.btn-icon,
+.btn-icon-sm { border-radius: var(--radius-sm); }
+.btn-icon:hover { background: var(--brand-bg); }
+
+/* ---------- Speaker picker ---------- */
+
+.topbar { gap: 8px; margin-bottom: 12px; }
+.topbar-title { font-size: 15px; font-weight: 600; color: var(--c-text); }
+.box-select {
+  background: transparent;
+  padding: 0;
+  gap: 8px;
+}
+.box-btn {
+  background: var(--c-surface);
+  border-color: var(--c-border);
+  border-radius: var(--radius-sm);
+  padding: 8px 32px 8px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.box-btn:hover { background: var(--c-surface); border-color: var(--c-border-2); box-shadow: var(--shadow-hover); }
+.box-btn.active {
+  background: var(--c-surface);
+  color: var(--c-text);
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px var(--brand), var(--shadow-card);
+}
+.box-btn small { font-weight: 400; font-size: 11px; margin-top: 1px; }
+.box-btn.box-add-ip { width: 40px; min-width: 40px; align-self: stretch; }
+
+/* ---------- Now playing ---------- */
+
+.status-bar {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 12px;
+  min-height: 56px;
+  font-size: 14px;
+  box-shadow: var(--shadow-card);
+}
+.status-bar.status-play,
+.status-bar.status-buf,
+.status-bar.status-err,
+.status-bar.status-idle { border-left-width: 4px; padding-left: 14px; }
+.status-bar.status-play {
+  background: color-mix(in srgb, var(--signal-green) 7%, var(--c-surface));
+  border-color: color-mix(in srgb, var(--signal-green) 35%, var(--c-border));
+  border-left-color: var(--signal-green);
+}
+.status-bar.status-buf { border-left-color: var(--signal-yellow); }
+.status-bar.status-err { border-left-color: var(--signal-red); }
+.status-bar.status-idle { border-left-color: var(--c-border-2); }
+.status-bar .now { font-size: 15px; }
+.now-art {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  margin-right: 12px;
+  border-radius: var(--radius-sm);
+  object-fit: cover;
+  background: var(--c-surface-2);
+}
+
+/* ---------- Transport controls ---------- */
+
+.controls { gap: 8px; margin-bottom: 20px; }
+.controls .btn,
+.controls .btn-source { min-height: 36px; }
+.controls > .btn:not(.btn-mini) { padding: 8px 16px; }
+#pauseBtn {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--on-brand);
+  font-weight: 600;
+}
+#pauseBtn:hover { background: var(--brand-hover); border-color: var(--brand-hover); }
+.btn-source {
+  background: var(--c-surface);
+  border-color: var(--c-border);
+  padding: 7px 12px;
+}
+.btn-source:hover { background: var(--c-surface-2); }
+.btn-source.active,
+html.a11y-light .btn-source.active {
+  background: color-mix(in srgb, var(--signal-green) 12%, var(--c-surface));
+  color: var(--c-text);
+  box-shadow: none;
+}
+.volume-control input[type=range] { accent-color: var(--brand); }
+
+/* ---------- Preset keys ---------- */
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 4px 0 10px;
+}
+.section-head h3 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--c-text);
+}
+
+.grid { gap: 12px; margin-bottom: 12px; }
+.preset {
+  background: var(--c-surface);
+  border-color: var(--c-border);
+  border-radius: var(--radius);
+  padding: 10px 12px 12px;
+  min-height: 96px;
+  box-shadow: var(--shadow-card);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, transform 0.15s ease;
+}
+.preset:hover,
+.preset:active {
+  background: var(--c-surface);
+  border-color: var(--brand-border);
+  box-shadow: var(--shadow-hover);
+}
+.preset.empty { background: var(--c-surface-2); box-shadow: none; }
+.preset.playing,
+html.a11y-light .preset.playing {
+  background: color-mix(in srgb, var(--signal-green) 8%, var(--c-surface));
+  border-color: var(--signal-green);
+  box-shadow: 0 0 0 1px var(--signal-green), var(--shadow-card);
+}
+.preset.playing .name,
+html.a11y-light .preset.playing .name { color: var(--c-text); }
+.preset.error,
+html.a11y-light .preset.error {
+  background: color-mix(in srgb, var(--signal-red) 8%, var(--c-surface));
+  border-color: var(--signal-red);
+  box-shadow: none;
+}
+.preset.error .name,
+html.a11y-light .preset.error .name { color: var(--c-text); }
+
+.preset-head { align-items: center; }
+.preset .num {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--c-surface-3);
+  color: var(--c-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.preset .ren,
+.preset .del {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border-radius: 6px;
+}
+.preset .ren:hover,
+.preset .del:hover { background: var(--c-surface-3); }
+.preset-body { gap: 12px; margin-top: 8px; }
+.preset-logo {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--radius-sm);
+  background: var(--c-surface-2);
+}
+.preset .name { font-size: 14.5px; line-height: 1.25; }
+.preset-bitrate { font-size: 11.5px; margin-top: 2px; }
+.preset-hint { font-size: 11px; margin-top: 6px; line-height: 1.3; }
+.long-press-bar { border-radius: 0 0 var(--radius) var(--radius); }
+.preset.long-press { box-shadow: 0 0 0 2px var(--brand); }
+
+.preset-copy-row { margin-bottom: 4px; }
+
+/* ---------- Station search ---------- */
+
+.search {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-top: 16px;
+  box-shadow: var(--shadow-card);
+}
+.search h3 { font-size: 15px; font-weight: 600; color: var(--c-text); margin-bottom: 12px; }
+.search-input-row { gap: 8px; margin-bottom: 12px; }
+.search-input-row input {
+  min-height: 40px;
+  padding: 8px 12px 8px 36px;
+  font-size: 14px;
+  background-color: var(--c-surface);
+  border-radius: var(--radius-sm);
+  /* Mid grey reads on both the light and the dark surface. */
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238a94a6' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: 11px center;
+  background-size: 16px 16px;
+}
+.search-input-row input:focus { box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand) 22%, transparent); }
+.search-input-row .btn { min-height: 40px; padding: 8px 16px; }
+#searchBtn {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: var(--on-brand);
+  font-weight: 600;
+  padding: 8px 22px;
+}
+#searchBtn:hover { background: var(--brand-hover); border-color: var(--brand-hover); }
+
+.search-filters { gap: 10px 16px; font-size: 12.5px; }
+.search-filters select {
+  background-color: var(--c-surface);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
+
+.genre-chips { gap: 6px; max-height: 96px; margin-bottom: 12px; }
+.chip {
+  background: var(--c-surface-2);
+  border-color: var(--c-border);
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+.chip:hover { background: var(--c-surface-3); }
+
+/* ---------- Busy button ---------- */
+
+.btn-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 7px;
+  vertical-align: -1px;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.btn[aria-busy="true"] { cursor: progress; opacity: 1; }
+
+/* ---------- Motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .preset, .box-btn, .btn, .btn-source, .chip, .tab-btn { transition: none; }
+}

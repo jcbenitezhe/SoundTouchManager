@@ -1,0 +1,1428 @@
+// Package webui provides the config web interface on port 8888.
+// Contains the HTML UI plus a REST API that is later also used by the
+// Wails desktop app.
+package webui
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/url"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/jcbenitezhe/SoundTouchManager/internal/alarm"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/autopair"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxapi"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxcli"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/groupkeys"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/mediaservers"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/netutil"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/presets"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/recent"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/streamproxy"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/upnp"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/webhooks"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/zones"
+)
+
+// Server kapselt den Webui HTTP Server.
+type Server struct {
+	addr    string
+	boxHost string
+	// Group volume step bookkeeping (zoneVolumeStep): the levels the last
+	// step wrote per member IP, and when. Guarded by groupStepMu, which also
+	// serialises the steps themselves.
+	groupStepMu   sync.Mutex
+	groupStepBase map[string]int
+	groupStepAt   time.Time
+	// quietWake is a member wake done for a group join: the level the speaker
+	// had before it was muted for the wake, restored once the speaker joins a
+	// zone or the window runs out. Guarded by quietWakeMu.
+	// zoneChangedAt is when the speaker last joined, led or left a zone, as the
+	// firmware itself reported it. It exists so the re-push watchdog can tell a
+	// stream that DROPPED from one that ended because the group changed under it
+	// Deliberately not derived from quietWakeUntil: the zone join is what
+	// CLEARS that, so reading it here is a race that the push wins or loses by a
+	// quarter of a second. Guarded by quietWakeMu, which already covers the other
+	// piece of group-wake state and is taken on the same events.
+	zoneChangedAt time.Time
+
+	quietWakeMu    sync.Mutex
+	quietWakeVol   int
+	quietWakeUntil time.Time
+	// quietWakeEpisodeUntil is how long this speaker counts as "STM woke me for
+	// a group operation", independently of the mute. quietWakeUntil answers a
+	// different question (is the level still held down) and the zone join
+	// CLEARS it, which is why the preset reconcile could not use it: the join
+	// lands a second before the reconcile looks. This one is a plain
+	// deadline that nothing clears early. Guarded by quietWakeMu.
+	quietWakeEpisodeUntil time.Time
+	logger                *slog.Logger
+	presets               *presets.Store
+	// snapshotPath is the NAND file where the agent persisted the box's
+	// pre-takeover presets + sources (internal/boxsnapshot). Served verbatim
+	// by GET /api/box/snapshot so the app can warn about account-linked cloud
+	// sources (Deezer, ...) STM cannot carry over. Empty = feature off.
+	snapshotPath string
+	// reflectPath is the reflect-sources file the experimental restore endpoint
+	// appends to so the marge stub keeps advertising restored cloud sources.
+	reflectPath string
+	// zones persists this box's multiroom membership so a zone auto-reforms
+	// after reboot/standby. nil when not wired; zone write endpoints
+	// then still drive the box but do not persist.
+	zones *zones.Store
+	// zoneFormSerial serializes zone form/dissolve drives so two member
+	// changes never interleave against the firmware; zoneFormSeq stamps each
+	// arriving form request so a request that waited behind a newer one can
+	// stand down and let the newest full member list win (rapid successive
+	// taps then cost one drive, not N).
+	zoneFormSerial sync.Mutex
+	zoneFormSeq    atomic.Uint64
+	// zoneDocDoubt holds the fingerprint of the stored group document that the
+	// speaker's own firmware has already contradicted once (see boxInZone). It
+	// is the FIRST of the two observations needed before that document is
+	// dropped, and it is deliberately NOT persisted: losing it in a crash or a
+	// restart costs one more observation, whereas persisting it could carry a
+	// wrong verdict across a restart. Only the resulting clear reaches NAND.
+	zoneDocDoubt   string
+	zoneDocDoubtMu sync.Mutex
+	// dissolveSweepBusy marks a straggler sweep scheduled by a firmware
+	// zone-dissolve frame (dissolvesweep.go) so repeated frames for the same
+	// collapse schedule one sweep, not one per frame.
+	dissolveSweepBusy atomic.Bool
+	// memberIDs remembers, per member IP, the SoundTouch deviceID that
+	// speaker's own firmware reported. Zone forming corrects the caller's
+	// deviceID from a live /info read, because a two-chip chassis announces
+	// its wlan0 MAC over mDNS and that is not the ID /setZone keys on. When
+	// that read times out (a member waking, or busy right after an OTA) the
+	// correction used to be skipped and the wrong ID went into the group, so
+	// a phantom member was enrolled that never joined. This cache carries the
+	// answer from the last successful read across such a moment.
+	memberIDs   map[string]string
+	memberIDsMu sync.RWMutex
+	// mediaServers remembers which DLNA/UPnP media servers the user turned into
+	// native music sources, because the speaker forgets them on reboot. nil when
+	// not wired; the endpoints then still drive the box but nothing is restored
+	// after a restart.
+	mediaServers *mediaservers.Store
+	// mediaLoc remembers, per media server UDN, the device-description URL the
+	// last successful discovery resolved. A phone library search whose single
+	// M-SEARCH round goes unanswered then re-probes that address directly
+	// instead of reporting the server missing, which on the desktop side was
+	// and here made a search look like an empty library.
+	mediaLoc   map[string]string
+	mediaLocMu sync.Mutex
+	// publishStoredMusic hands the enabled media servers to the marge account
+	// responses so the box picks them up on its own poll. nil when not wired.
+	publishStoredMusic func([]StoredMusicSource)
+	renderer           *upnp.Renderer
+	// sleep is the armed sleep timer, if any. See sleeptimer.go.
+	sleep       sleepState
+	autoPair    *autopair.Manager
+	regionMu    sync.RWMutex
+	region      string // ISO 3166-1 alpha-2 from the setup wizard, empty if unknown
+	regionFile  string // path for persistent storage
+	streamProxy *streamproxy.Server
+	// webhooks holds the user-configured HTTP requests (thumbs trigger). nil
+	// when not wired; endpoints then report unavailable.
+	webhooks *webhooks.Store
+	// groupKeys holds the saved groups bound to the remote's thumbs keys
+	// nil when not wired; the endpoint then reports unavailable.
+	groupKeys *groupkeys.Store
+	// alarms holds the alarm clock document, and alarmState what has already
+	// been fired. nil when not wired; the endpoint then reports unavailable and
+	// no scheduler runs. See alarms.go.
+	alarms     *alarm.Store
+	alarmState *alarm.StateStore
+	// alarmNow is the scheduler's test clock, nil = time.Now.
+	alarmNow func() time.Time
+	// alarmReload wakes the scheduler when an editor saves the document.
+	alarmReload chan struct{}
+	// alarmZoneWarned rate-limits the unknown-zone warning. Touched only by the
+	// scheduler goroutine.
+	alarmZoneWarned bool
+	// alarmSeen is the document the scheduler evaluated last time, so it can
+	// tell which alarms an editor just added, re-enabled or moved (see
+	// acknowledgeAlarmEdits). alarmSeeded is whether it has been taken at all:
+	// the first evaluation after a start records the document as the baseline
+	// rather than treating every stored alarm as new. Scheduler goroutine only.
+	alarmSeen   alarm.Document
+	alarmSeeded bool
+	// alarmMu guards the clock-trust bookkeeping, which the status endpoint
+	// reads from another goroutine.
+	alarmMu sync.Mutex
+	// alarmClockBad is whether the last evaluation found the clock implausible.
+	alarmClockBad bool
+	// alarmBackground tracks the wake-and-recall and its verify, which outlive
+	// the evaluation that started them. The tests wait on it; nothing in
+	// production does yet, but a graceful shutdown would.
+	alarmBackground sync.WaitGroup
+	// spotifySwitchedAway tells the Spotify manager the box was pointed at a
+	// non-Spotify source, so its auto-attach does not yank the box back.
+	// nil when Spotify is not configured.
+	spotifySwitchedAway func(ctx context.Context)
+	// spotifyStream serves the live Ogg from the go-librespot manager to
+	// the box over HTTP (registered at /spotify/stream). nil when Spotify
+	// is not configured. Injected as a handler so webui need not import
+	// the spotify package.
+	spotifyStream http.HandlerFunc
+	// spotifyPlay tells go-librespot to play a Spotify URI on the given
+	// account (the control side of a Spotify preset recall). The account is
+	// the username the preset was saved under; an empty account plays with
+	// go-librespot's current login (see manager PlayAccount / SwitchAccount).
+	// nil when Spotify is not configured. Injected as a func for decoupling.
+	// shuffle selects a fresh random start vs the default resume-where-left-off.
+	spotifyPlay func(ctx context.Context, uri, account string, shuffle, repeat bool) error
+	// peerSeedFn accepts speakers pushed from the desktop app (see WithPeerSeed).
+	peerSeedFn func([]PeerSeed)
+	// peerForgetFn removes one sticky-picker entry (see WithPeerForget).
+	peerForgetFn func(host string) bool
+	// peersFn lists the other STM speakers on the LAN for the on-box page's
+	// "Other speakers" section. nil hides the section.
+	peersFn func(ctx context.Context) []PeerLink
+	// networkChangedFn is the post-switch state refresh, fired after a
+	// CONFIRMED live Wi-Fi switch (see SetNetworkChangedFn). nil = no refresh.
+	networkChangedFn func(reason string)
+	// spotifyUser returns go-librespot's currently logged-in account, used to
+	// stamp the account onto a newly saved Spotify preset. nil when Spotify
+	// is not configured.
+	spotifyUser func(ctx context.Context) string
+	// pairPartnerGone names the missing half of a restored stereo pair, so
+	// the zone answer can say why a speaker refuses to play.
+	pairPartnerGone func() (ip, deviceID string)
+	// spotifyContext returns the Spotify context URI go-librespot is currently
+	// playing, used by the preset-save path to stamp the LIVE account when the
+	// saved preset is the content that is playing right now (so a preset saved
+	// from another household member's session gets that member's account, not a
+	// stale one). nil when Spotify is not configured.
+	spotifyContext func() string
+	// spotifyShuffle reports go-librespot's live shuffle state, used by the
+	// preset-save path to stamp the shuffle flag onto a Spotify preset saved
+	// from the running playback. nil when Spotify is not configured.
+	spotifyShuffle func(ctx context.Context) bool
+	// spotifyRepeat reports go-librespot's live repeat state, used by the
+	// preset-save path the same way spotifyShuffle is. nil when Spotify is not
+	// configured, and a nil resolver simply leaves the preset's repeat alone.
+	spotifyRepeat func(ctx context.Context) bool
+	// spotifyMeta resolves a stable cover image URL and the human title for a
+	// Spotify context URI (the playlist image + name), stamped onto a newly
+	// saved Spotify preset so its tile has a steady logo and a real name (not a
+	// bare "Spotify"). nil when Spotify is not configured.
+	spotifyMeta func(ctx context.Context, uri string) (cover, title string)
+	// spotifyStreaming reports whether the box is currently pulling the Ogg
+	// stream, the definitive "Spotify is playing" signal for verifyRecall.
+	// nil when Spotify is not configured.
+	spotifyStreaming func() bool
+	// spotifySkip advances go-librespot to the next/previous track for the phone
+	// remote's Previous/Next controls (forward = next), the same skip the hardware
+	// remote keys perform during Spotify playback (the box cannot skip a UPnP
+	// source itself). nil when Spotify is not configured; the transport handler
+	// then falls back to skipping the STM play queue.
+	spotifySkip func(ctx context.Context, forward bool) error
+	// spotifySkipCh/spotifySkipOnce back the async skip queue: presses are
+	// acknowledged immediately and drained back-to-back by one worker, so a
+	// slow go-librespot ack can never stack button presses into a minute-long
+	// serial wait (live Portable, 2026-07-31). See enqueueSpotifySkip.
+	spotifySkipCh   chan bool
+	spotifySkipOnce sync.Once
+	// skipRepushMu guards the skip re-attach bookkeeping: hwSkipAt marks a
+	// recent hardware skip (whose flow re-attaches the box itself), and
+	// lastSkipRepushAt debounces the soft-skip re-push so a burst of presses
+	// tears the box's stream down at most once. See reattachAfterSoftSkip.
+	skipRepushMu     sync.Mutex
+	hwSkipAt         time.Time
+	lastSkipRepushAt time.Time
+	// spotifySkipBoundary reports when a user skip's track boundary last
+	// reached the forwarded stream; the soft-skip re-push waits for it so the
+	// box's buffer is only dropped once the new track is actually flowing.
+	// nil when Spotify is not configured (the re-push then stays on a fixed
+	// short delay).
+	spotifySkipBoundary func() time.Time
+	// spotifyArmRecallCut arms the engine's boundary cut for a preset recall,
+	// so the box's fresh attachment is never fed the OLD track's audio while
+	// the new context loads. Armed before PlayURLMime, next to
+	// spotifySetRecalling. nil when Spotify is not configured.
+	spotifyArmRecallCut func()
+	// spotifyBoundaryStaleKB reports how many stale (pre-boundary) KB the
+	// box's current attachment was fed before the last cut boundary. The
+	// recall re-push reads it: ~0 means the cut kept the box clean and no
+	// buffer-dropping re-push is needed. nil when Spotify is not configured.
+	spotifyBoundaryStaleKB func() int64
+	// recallReattachWait overrides reattachAfterRecall's boundary-wait budget.
+	// Test seam only; zero means the production 12s.
+	recallReattachWait time.Duration
+	// spotifyReady reports whether go-librespot has finished authenticating, so
+	// a soft Spotify recall can wait out a cold start instead of pointing the box
+	// at a not-yet-flowing stream (which starves and detaches). nil when Spotify
+	// is not configured.
+	spotifyReady func() bool
+	// spotifyCanRecall reports whether a Spotify recall can proceed: go-librespot
+	// holds a live session right now OR a reusable credential is persisted (so it
+	// can re-auth from it). Gating on a persisted credential ALONE wrongly refused
+	// recall on a box with a live-but-never-persisted zeroconf session that played
+	// Spotify fine (Patrick, ST10, 2026-06-24). Only when this is false does the
+	// handler return the "log this speaker into Spotify first" hint instead of
+	// optimistically reporting "playing" and failing silently (Pierre). nil
+	// until wired.
+	spotifyCanRecall func(ctx context.Context) bool
+	// spotifyPremiumRequired reports whether the logged-in Spotify account is
+	// free/open and so cannot do the autonomous recall playback. nil until
+	// wired; the recall handler uses it to return a clear "needs Premium" error.
+	spotifyPremiumRequired func() bool
+
+	// phoneLangSeen counts the Accept-Language values the remote page was asked
+	// for, so a diagnostic shows what the phones actually claim rather than what
+	// we assume they claim. See notePhoneLanguage.
+	phoneLangMu   sync.Mutex
+	phoneLangSeen map[string]int
+	// spotifyExportCred / spotifyImportCred move the go-librespot login between
+	// speakers so a user logs into Spotify ONCE and STM copies the credential to
+	// the other boxes (root cause: account=""). nil until wired.
+	spotifyExportCred func() ([]byte, error)
+	spotifyImportCred func(ctx context.Context, data []byte) error
+	// margeGroupGet/Set/Clear bridge the marge stereo-pair record so the
+	// pairing flow can install the SAME canonical pair document on both
+	// members' marges (each box's firmware otherwise re-creates the record
+	// from its own point of view and the RIGHT box stores itself as master).
+	// The desktop app relays the document to the partner because agent-to-
+	// agent HTTP is blocked between series-I boxes. nil until wired.
+	margeGroupGet    func() (xmlDoc string, canonical bool, ok bool)
+	margeGroupSet    func(xmlDoc string) error
+	margeGroupClear  func(reason string)
+	margeGroupRename func(name string) error
+	// margeGroupName returns the stored pair's display name so the phone remote
+	// can show a pair under its own name instead of a member box name.
+	margeGroupName func() string
+	// margeForward registers (or clears) a developer machine the box's cloud
+	// conversation is relayed to. nil disables the endpoint. See margelab.go.
+	margeForward func(target string) error
+	// spotifySetRecalling marks an in-flight recall so ServeOgg drives the new
+	// track from its start instead of resuming mid-position. nil when Spotify is
+	// not configured.
+	spotifySetRecalling func()
+	// spotifySuppressActivate holds go-librespot's auto-repoint (maybeActivate/
+	// repointBox) off for the given window. The hardware-skip recovery calls it so
+	// the competing auto-attach cannot race the clean slot recall while the box
+	// is tearing its UPnP source down. nil when Spotify is not configured.
+	spotifySuppressActivate func(time.Duration)
+	// spotifyExpectReattach marks the next Ogg re-attach as deliberate (an
+	// STM re-push), keeping it out of the engine's storm damping.
+	spotifyExpectReattach func(time.Duration)
+	// spotifyInfo answers GET /spotify/info with the live Spotify state
+	// (ready, measured bitrate, device name) the UI reads to show the real
+	// stream bitrate on a Spotify preset tile. nil when not configured.
+	spotifyInfo http.HandlerFunc
+	// spotifyQuality answers GET/POST /spotify/quality: the engine's
+	// preferred streaming bitrate. nil when not configured.
+	spotifyQuality http.HandlerFunc
+	// spotifyReload restarts the supervised go-librespot so it re-execs from its
+	// (just-overwritten) binary path, activating a freshly OTA-delivered engine
+	// WITHOUT a box reboot. Called from handleAgentSidecar after the sidecar
+	// write; returns whether a running engine was restarted. nil when Spotify is
+	// not configured. See Manager.ReloadBinary.
+	spotifyReload func() bool
+	// spotifyStop stops the supervised go-librespot and waits for it to exit, so
+	// the space-pressed OTA write can actually free the engine's NAND blocks before
+	// dropping it (a running binary's blocks stay pinned through an unlink). nil
+	// when Spotify is not configured. See Manager.StopEngine.
+	spotifyStop func() bool
+	// wifiSignalFn returns the latest Wi-Fi signal class observed on the
+	// gabbo WebSocket (set from cmd/agent's boxws client). Used to fill
+	// the signal for BCO boxes, whose /networkInfo reports none.
+	wifiSignalFn func() string
+
+	// boxNameFn returns the box display name and model the agent currently
+	// knows (from its mDNS announcer cache). Exposed through the version
+	// endpoint so the desktop app can read a flashed speaker's name straight
+	// from the running agent, instead of falling back to "stm-<ip>" whenever
+	// the cross-LAN /info probe is slow right after an OTA restart.
+	// nil until wired by cmd/agent.
+	boxNameFn func() (name, model string)
+
+	// nativePresetLocator decides whether a preset can be stored as a native
+	// LOCAL_INTERNET_RADIO station (returning its orion location) instead of a
+	// UPnP stream that the box refuses to activate on its own. nil until wired
+	// by cmd/agent, and nil on the desktop side, where "" keeps the UPnP form.
+	nativePresetLocator func(name, streamURL, art string) string
+
+	// now_playing micro-cache. The Bose firmware app (:8090) on BCO
+	// speakers cannot sustain a high request rate, so /api/status caches
+	// the last good now_playing body for statusCacheTTL and serves repeat
+	// polls from it. This caps how often the box itself is hit no matter
+	// how fast or how many clients poll: defense in depth behind the
+	// desktop app's adaptive poll cadence.
+	statusMu   sync.Mutex
+	statusBody []byte
+	statusCode int
+	statusAt   time.Time
+	// statusStaleWarned dedupes the "serving a stale status" WARN so a box
+	// that stays unreachable logs once per outage, not once per client poll.
+	// Guarded by statusMu; reset whenever a fresh body is cached.
+	statusStaleWarned bool
+
+	// boxCmdMu serializes state-changing commands sent to the speaker
+	// (play, volume, pause, stop, source, bass). The Bose firmware's tiny
+	// HTTP/UPnP server mishandles concurrent commands: a volume PUT landing
+	// during the wake+play of a station made the play itself fail (reported
+	// live: rapid volume slides right before a preset press killed the
+	// start). Serializing the writes makes a volume wait for the play to
+	// finish instead of colliding with it. Reads (now_playing/info) are not
+	// gated; they have their own micro-cache.
+	boxCmdMu sync.Mutex
+
+	// wlanMu serializes the background Wi-Fi change so two PUT /api/box/wlan
+	// requests cannot run applyWLANChange concurrently and interleave their
+	// writes to wlan-creds / wpa_supplicant.conf.
+	wlanMu sync.Mutex
+
+	// lastPlay remembers the stream STM last told the box to play, so the
+	// auto-re-push can resume it when the Bose renderer drops a long
+	// stream on its own (reported: radio stops after ~11 min, no STM error).
+	// boxSourceFn seams the now_playing source read (boxSourceNow) so the
+	// standby-vs-awake decision is assertable without a live box.
+	boxSourceFn func() string
+	// deferred holds a resume waiting for the user to switch the box on; STM
+	// never powers a speaker on by itself. Guarded by deferredMu.
+	deferredMu sync.Mutex
+	deferred   *deferredResume
+
+	lastPlayMu sync.Mutex
+	lastPlay   *lastPlayInfo
+	// rePushInFlight coalesces stream-drop resumes (see HandleStreamDisconnect).
+	// A SERVER-level latch on purpose, guarded by lastPlayMu: it used to live on
+	// lastPlayInfo, but setLastPlay replaces that struct on every fresh play, so
+	// a drop of the NEW stream while an older maybeRePush was still waiting out
+	// the recall-ownership window spawned a second concurrent re-pusher, and the
+	// first one's deferred release then cleared the latch the second one owned -
+	// the box got double SetURI+Play (two audible re-buffers) and a third
+	// goroutine could stack. One latch per Server survives the struct swap.
+	rePushInFlight bool
+	// recallGen counts every stream push recorded via setLastPlay. Each
+	// recall's verify loop captures the generation of its own play; any later
+	// play bumps it, telling the older verify it was superseded so it stands
+	// down instead of re-pushing its now-unwanted stream over the user's newer
+	// choice (two rapid preset presses used to ping-pong stations for ~15s).
+	// Guarded by lastPlayMu.
+	recallGen uint64
+	// resumeAttempts counts consecutive AUTOMATIC resume attempts (power-on
+	// resume / reconnect recovery) that never reached stable playback, and
+	// lastResumeAt is when the newest one was pushed. They drive the
+	// auto-resume crash-loop guard (see resume_guard.go): a stream that
+	// crashes the box on playback otherwise loops boot -> auto-resume ->
+	// crash -> watchdog reboot forever. Guarded by lastPlayMu; persisted
+	// inside last-play.json so the count survives the very reboot it counts.
+	resumeAttempts int
+	lastResumeAt   time.Time
+	// lastPlayPath is the NAND file the last-played stream is persisted to, so
+	// the power-on resume survives an agent restart across a long/overnight
+	// standby (in-RAM only lost the station and the box fell back to its native
+	// "Preset not assigned", Klaus). Empty disables persistence (tests).
+	lastPlayPath string
+	// postOTAResumeSuppressUntil arms the post-OTA resume suppression: set once
+	// in New() by consumeOTARebootMarker() when the last reboot was our own
+	// maintenance OTA, read-only afterwards (no lock). See resume_standby.go.
+	postOTAResumeSuppressUntil time.Time
+
+	// mirrorSkips remembers, per zone member, why the last mirror reconcile
+	// tick skipped it, so the skip is logged at INFO only on a state change
+	// Touched only by the single reconcile goroutine — no lock.
+	mirrorSkips map[string]string
+
+	// mirrorKick asks the reconcile goroutine for an out-of-turn round right
+	// after a fresh play, so a group re-forms in seconds instead of on the next
+	// 5-minute tick. Capacity 1 and non-blocking sends: several plays in quick
+	// succession collapse into one round. Going through the SAME goroutine is
+	// deliberate — it keeps mirrorSkips lock-free and makes two mirror pushes
+	// at once impossible.
+	mirrorKick chan struct{}
+	// mirrorKickPending is true between scheduling a kick and sending it, so a
+	// burst of plays produces one reconcile rather than one per play.
+	mirrorKickPending atomic.Bool
+	// groupFormHushUntil suppresses the play-triggered group re-form until this
+	// instant (unix nanos, 0 = not hushed). The alarm arms it: an alarm is per
+	// speaker and must not wake the rest of the house. See hushGroupForm in
+	// zones_default_group.go.
+	groupFormHushUntil atomic.Int64
+	// defaultFormMu/lastDefaultFormAt rate-limit the play-triggered re-form of
+	// the persisted default group (zones_default_group.go), so preset zapping
+	// does not drive the firmware with back-to-back setZone rounds.
+	defaultFormMu     sync.Mutex
+	lastDefaultFormAt time.Time
+
+	// wedge tracks the "box accepts transport pushes but never plays" state
+	// that only a power-cycle clears; streamActivityFn (the stream proxy's
+	// LastActivity) tells it apart from a failing station. See wedge.go.
+	wedge            wedgeState
+	streamActivityFn func() (lastFetch, lastFailure time.Time)
+
+	// refusal tracks the silent variant of the not-logged-in refusal family:
+	// recalls that exhaust while the box drops its source to STANDBY on its
+	// own, without ever sending a 1036. See wedge.go / RecallRefusal.
+	refusal refusalState
+
+	// loginErr tracks the last time the box rejected a source as not-logged-in
+	// (errorUpdate 1036), so verifyRecall stands its retry down while a forced
+	// re-login runs instead of thrashing the box. See wedge.go / NoteBoxLoginError.
+	loginErr loginErrState
+
+	// boxSetup counts the firmware's own setup episodes, so the desktop app can
+	// say "the speaker was finishing its own setup" for a window it could not
+	// see at all. See boxsetup.go.
+	boxSetup boxSetupState
+
+	// lastUserStop is when the user last DELIBERATELY stopped playback, so the
+	// auto-re-push does not fight a wanted stop (v0.7.0: a single Stop
+	// did not hold because the proxy disconnect that a stop causes looks
+	// identical to a box-side drop). Set from the STM Stop/Pause endpoints
+	// (definite intent) and from a gabbo STOP_STATE frame (the physical
+	// remote / box button). maybeRePush suppresses a resume within
+	// userStopWindow of this.
+	lastUserStopMu sync.Mutex
+	lastUserStop   time.Time
+
+	// lastExplicitStop is the narrower signal: a stop or pause that came in as a
+	// REQUEST (the app, the phone remote, a webhook), never the box's own
+	// STOP_STATE. The two must be told apart, because a speaker that collapses
+	// while resuming emits a STOP_STATE on the way down, and lastUserStop
+	// therefore says "the user stopped this" exactly when the user did not. Any
+	// recovery that reads lastUserStop as intent stands down at the moment it is
+	// needed, which is how the paused library track stayed silent (2026-08-11).
+	lastExplicitStopMu sync.Mutex
+	lastExplicitStop   time.Time
+
+	// pausePos is how far into the track the speaker was when the user paused,
+	// read before the pause is issued. It is what lets a resume that has to
+	// re-push the file continue where the listener stopped instead of starting
+	// the track over. Zero for radio and for anything the box reports no
+	// position for.
+	pausePosMu sync.Mutex
+	pausePos   time.Duration
+
+	// lastStandbyStop debounces the standby-bounce mitigation: some ST20
+	// (scm) firmware oscillates UPNP->STANDBY->UPNP on a power-off, re-selecting
+	// STM's UPnP source so the box turns itself back on. HandleEnterStandby clears
+	// the transport once per standbyStopDebounce so the rapid flip does not issue a
+	// burst of Stops.
+	standbyStopMu   sync.Mutex
+	lastStandbyStop time.Time
+	// lastStandbyClear rate-limits the transport clear during a power-off bounce
+	// (separate from lastStandbyStop, which gates the resume-suppression window):
+	// the clear re-fires on each flip of the UPNP<->STANDBY oscillation so a clear
+	// that lost the ~170 ms race is retried, bounded by standbyClearMinGap.
+	lastStandbyClear time.Time
+	// lastUserPlayStart is when a user last explicitly asked for playback (a
+	// hardware preset press or an app play). HandleEnterStandby reads it to tell
+	// a UPNP->STANDBY flip that interrupts the user's own fresh recall (firmware
+	// settling) from a real power-off, and NoteUserPlay stamps it while
+	// clearing the stop latches (the press is newer intent than any prior stop).
+	// Guarded by standbyStopMu.
+	lastUserPlayStart time.Time
+	// lastSpontResume single-flights the spontaneous-power-off recovery so a
+	// flapping source cannot stack resume goroutines. Guarded by standbyStopMu.
+	lastSpontResume time.Time
+	// userActivityFn reports when the box last emitted a userActivityUpdate
+	// frame (a physical key press, box or IR remote); zero = none seen. Wired to
+	// boxws.LastUserActivity. HandleEnterStandby uses it to recognise the
+	// firmware spontaneously powering off STM's UPnP source with no user input
+	// nil or all-zero (a firmware that never sends the frame) falls back
+	// to the conservative power-off handling.
+	userActivityFn func() time.Time
+
+	// storm1036Fn reports whether the box is currently rejecting essentially
+	// every recall (1036), how many rejections are in the window and since
+	// when. Wired to boxws.Storm1036. Surfaced on the version envelope so the
+	// desktop app and the phone remote can offer a SOFT reboot: the remedy
+	// users reach for on their own, pulling the plug, resets the box clock and
+	// poisons the next boot, while a soft reboot clears the state (
+	// Finding 4). nil = not wired (no storm reported).
+	storm1036Fn func() (bool, int, time.Time)
+	// heldRefusalFn reports the last hold-to-store gesture STM had no preset
+	// form for: when, which slot, and what the box was playing. A long press
+	// while Spotify runs is the common one, and until now it left no trace the
+	// owner could see, so the key simply snapped back.
+	heldRefusalFn func() (time.Time, int, string, string, bool)
+	// startVolumePath overrides the NAND file holding the per-box start
+	// level, so a test can point it at a temp tree.
+	startVolumePath string
+
+	// balanceWriteFn sends a stereo-balance write on the box WebSocket (see
+	// SetBalanceWriteFn). nil means no socket is available, and the balance
+	// endpoint then reports itself as not settable instead of failing a write.
+	balanceWriteFn func(deviceID string, target int) error
+
+	// suppress1036Fn stands the 1036 storm COUNTER down until the given time.
+	// Wired to boxws.Suppress1036Until. Used where STM itself provokes the
+	// rejection it would otherwise count as a symptom (a zone teardown kills
+	// every member's in-flight UPnP session). nil = not wired; every rejection
+	// counts, which is the pre-existing behaviour.
+	suppress1036Fn func(time.Time)
+
+	// ownTransportCmdFn reports when STM itself last issued a transport-
+	// mutating SOAP command; zero = never. Wired to
+	// boxws.LastOwnTransportCommand. HandleEnterStandby uses it to excuse a
+	// source flip that answers STM's own push. nil-safe.
+	ownTransportCmdFn func() time.Time
+
+	// playStateFn overrides boxPlayState for tests. nil = the real :8090 probe.
+	playStateFn func() (standby, busy bool)
+
+	// nowPlayingFn overrides pollNowPlaying for tests. The end detection is a
+	// state machine over what the box reports, so it is only testable if the
+	// reports can be scripted.
+	nowPlayingFn func() (status string, pos, total time.Duration, standby bool)
+
+	// nowPlayingBodyFn seams the raw now_playing read behind the foreign-content
+	// guard (resume_foreign.go), so the decision is assertable without a live
+	// box. nil = the real :8090 fetch.
+	nowPlayingBodyFn func() string
+
+	// resumeOnPowerOnPath persists the per-box opt-out for "resume the last
+	// station when the speaker is switched on" (default on; file absent or "1").
+	// Empty falls back to defaultResumeOnPowerOnPath.
+	resumeOnPowerOnPath string
+
+	// playModePath persists the sticky queue play mode (shuffle/repeat), see
+	// playmode.go. Empty falls back to defaultPlayModePath.
+	playModePath string
+
+	// displayTrackPath persists the per-box opt-IN for "show the live radio track
+	// on the speaker's display" (default OFF; file absent or "0"). Pushing the ICY
+	// title to the box re-issues SetAVTransportURI, which makes the box re-buffer
+	// (a brief audio gap on each track change, verified on a Portable), so it is
+	// off unless the user turns it on. Empty falls back to defaultDisplayTrackPath.
+	displayTrackPath string
+
+	// lastDisplayPush debounces the ICY display push so a station that flips its
+	// StreamTitle between the song and promo/talk lines does not cause a re-buffer
+	// gap every few seconds. Guarded by lastPlayMu.
+	lastDisplayPush time.Time
+	// lastICYTitle is the most recent radio StreamTitle seen, kept so enabling the
+	// display push or changing its mode can show the CURRENT track immediately
+	// instead of waiting for the next title change. Guarded by lastPlayMu.
+	lastICYTitle string
+
+	// announceAudio holds the most recently fetched announcement audio, the
+	// cloud-free replacement for the firmware's /speaker TTS endpoint. It is served
+	// once to the box at /announce/audio WITH a Content-Length so the player stops
+	// at the end, instead of the radio stream proxy's reconnect-on-EOF behaviour
+	// (which looped a finite TTS clip ~60x, verified on a Portable). Guarded by
+	// announceMu.
+	announceMu    sync.Mutex
+	announceAudio []byte
+	announceMime  string
+
+	// recent is the capped, debounced recently-played ring. nil when not
+	// wired (dev builds / Spotify-less boxes still work): the /api/recent
+	// endpoint then serves an empty list and the play handlers skip recording.
+	// recentRadioCard / recentSpotifyCard remember the active source card so the
+	// live track callbacks (HandleStreamTitle for radio ICY, NoteRecentSpotifyTrack
+	// for Spotify) can attribute tracks to them without re-deriving the card.
+	recent            *recent.Store
+	recentMu          sync.Mutex
+	recentRadioCard   recentCardCtx
+	recentSpotifyCard recentCardCtx
+	// recentRadioLastTrack is the last ICY title recorded under the CURRENT
+	// radio card, and recentRadioStaleTrack is the PREVIOUS card's last title,
+	// carried across a station change so the first ICY title after the switch is
+	// suppressed when the box's now-playing text still lags on the old song
+	// (KLove's "This is Our God" showed under Exclusively Rush because its
+	// ICY arrived a beat after the station change). Spotify already had this
+	// de-dup; radio did not.
+	recentRadioLastTrack  string
+	recentRadioStaleTrack string
+	// recentQueueCard remembers the DLNA folder currently playing as an
+	// auto-advancing queue, so each track the queue pushes is recorded under one
+	// "library" card (folder plays were never added to Recently played).
+	// Cleared when the queue stops (a single play, a stop, or running out).
+	recentQueueCard recentCardCtx
+
+	// boxPresets is the box's OWN preset list as last reported over the gabbo
+	// presetsUpdated frame, including foreign sources (DEEZER etc.) STM did not
+	// set. Lets the app show/preserve/recall them (Option C). Guarded by boxPresetsMu.
+	boxPresetsMu sync.Mutex
+	boxPresets   []BoxPreset
+	// deletedBoxSlots tombstones slots the user just deleted, so a presetsUpdated
+	// burst the box emits right after the removal does not resurrect the slot in
+	// the app's merged view before the box-side RemovePreset has settled (a user
+	// reported a deleted preset reappearing as a UPNP entry after an app restart).
+	// Keyed slot -> deletion time; entries older than boxPresetTombstoneTTL are
+	// ignored/pruned. Guarded by boxPresetsMu.
+	deletedBoxSlots map[int]time.Time
+	// presetsReadLast rate-limits the GET /api/presets read log per client
+	// (presets_readlog.go); presetsReadNow is a test clock, nil = time.Now.
+	presetsReadMu   sync.Mutex
+	presetsReadLast map[string]*presetsReadMark
+	presetsReadNow  func() time.Time
+
+	// The stereo /getGroup hang tracker (see handleZoneGet): consecutive
+	// timeouts and the pause window they earn. Guarded by groupReadMu.
+	groupReadMu        sync.Mutex
+	groupReadFails     int
+	groupReadSkipUntil time.Time
+
+	// BoseApp (:8090) outage episodes, fed by the /api/status fetch path. The
+	// 2026-08-18 ST20 freeze was only provable by counting statusStaleWarned
+	// transitions by hand; this records the episodes so a bundle answers "how
+	// long and how often was the firmware webserver dead" directly. Guarded by
+	// statusMu. boseappDownSince is zero while :8090 answers.
+	boseappDownSince time.Time
+	boseappOutages   []boseappOutage
+
+	// queue is the agent-side DLNA library play queue. It
+	// auto-advances on track end so a NAS/FRITZ!Box folder plays through like the
+	// original SoundTouch box-side queue, even with the desktop app closed. A
+	// watcher goroutine polls now_playing while a queue is active; queueGen
+	// invalidates the per-track timing when a new track is pushed. queueMu guards
+	// the watcher lifecycle and timing fields; the playQueue has its own lock.
+	queue           *playQueue
+	queueMu         sync.Mutex
+	queueCancel     context.CancelFunc
+	queueGen        int
+	queueTrackStart time.Time
+	queueTrackDur   time.Duration
+	// queueRecallSlot binds the active play queue to the preset slot it was
+	// recalled from; queueRecallAt marks when. QueueLiveURL uses them so the
+	// box-native /stream/<slot> fetch of a queue preset serves the right queue's
+	// current track, and only holds while a recall is genuinely in flight.
+	// Guarded by queueMu.
+	queueRecallSlot int
+	queueRecallAt   time.Time
+	// queueEp is the play-queue episode running right now and queueEpPast the
+	// last few that ended, with the reason each one ended. queueLogMu
+	// guards both; it is taken alone, never while boxCmdMu or queueMu is held,
+	// so it cannot join an existing lock order.
+	queueLogMu  sync.Mutex
+	queueEp     *queueEpisode
+	queueEpPast []queueEpisode
+	// baseCtx is the server-lifetime context (set in Run), the parent for the
+	// long-lived queue watcher so it outlives the request that started the queue.
+	baseCtx context.Context
+}
+
+// boxPresetTombstoneTTL is how long a just-deleted slot is filtered out of the
+// box's reported preset list. It covers the box's post-change presetsUpdated
+// burst and the RemovePreset round-trip; after it expires a slot the box still
+// reports is shown again (it genuinely still exists on the box).
+const boxPresetTombstoneTTL = 90 * time.Second
+
+// BoxPreset is one of the box's own presets (incl. foreign sources like DEEZER),
+// served by GET /api/box/presets so the app can show and preserve them. Mirrors
+// boxws.BoxPreset; the agent maps the gabbo frame into this via NoteBoxPresets.
+type BoxPreset struct {
+	Slot          int    `json:"slot"`
+	Source        string `json:"source"`
+	Type          string `json:"type"`
+	Location      string `json:"location"`
+	SourceAccount string `json:"sourceAccount"`
+	Name          string `json:"name"`
+	// StmOrigin marks a slot STM itself wrote (its proxy or native station
+	// form). The desktop shows such a slot as a key STM no longer backs when
+	// the store has nothing on it, instead of as a playable speaker-side
+	// preset: after a removal and reinstall the firmware keeps the old keys,
+	// and the app drew six playable stations on a speaker whose store was
+	// empty. Set by the agent at the composition root, never dropped
+	// here: the desktop is the place to explain a dead key, not to hide it.
+	StmOrigin bool `json:"stmOrigin"`
+	// Lost is the agent's verdict on a StmOrigin slot: the store has nothing
+	// on it AND no webhook-only key claims it, so a press plays nothing. The
+	// second condition is why the verdict is made here and not on the
+	// desktop: a webhook-only key carries a placeholder in STM's own
+	// form and is kept out of the store on purpose, and the desktop sees
+	// neither the store nor the webhook slots. Stamped alongside StmOrigin
+	// at the composition root.
+	Lost bool `json:"lost"`
+}
+
+// recentCardCtx is the current source card for a source, retained so the live
+// track callbacks (radio ICY title, Spotify track change) can hang their tracks
+// under it. homepage is the station website, carried so each ICY-title
+// track entry keeps the "website" link target.
+type recentCardCtx struct{ key, name, art, url, account, homepage, mime string }
+
+// lastPlayInfo is the box-facing URL + metadata of the current stream plus the
+// re-push state. rePushes counts consecutive resume attempts on THIS stream and
+// drives an exponential backoff; once it hits maxRePushes the stream is marked
+// failed and never re-pushed again until a fresh play (setLastPlay) replaces it.
+// The drop-coalescing latch lives on the Server (rePushInFlight), NOT here: a
+// per-play latch died with every setLastPlay struct swap and let concurrent
+// re-pushers stack (see the Server field).
+type lastPlayInfo struct {
+	boxURL, title, art, mime string
+	ts                       time.Time
+	rePushes                 int
+	failed                   bool
+}
+
+// resumeMaxAge bounds how stale the last station may be and still come back on a
+// power-on press. Generous (a week) because a user expects "abends aus, morgens
+// an" to resume, like Bose did; the persisted lastPlay on NAND makes a long age
+// reachable across the agent restart a long standby often causes (Klaus).
+const resumeMaxAge = 7 * 24 * time.Hour
+
+// maxRePushes is the hard cap on consecutive resume attempts for one stream.
+// After this many the stream is declared dead and left alone (no re-arm) until
+// the user plays something new. The exponential backoff (capped at 30s) spaces
+// the attempts out, so this many spans several minutes, not seconds: a
+// SoundTouch 10 was seen to have its long radio stream dropped by the renderer
+// after ~11 min and then recover slowly, so a cap of 5 (~30s of attempts) gave
+// up far too early and the radio stayed silent. 10 keeps retrying for a few
+// minutes while the backoff + the rePushInFlight latch still prevent the
+// dozens-per-second runaway the cap originally fixed (v0.7.5).
+const maxRePushes = 10
+
+// statusCacheTTL bounds the staleness of a cached now_playing response and
+// thus the maximum /now_playing hit rate against the Bose app to about
+// 1/TTL per second regardless of client poll frequency.
+const statusCacheTTL = 2 * time.Second
+
+// statusStaleAfter is the cached now_playing age past which /api/status marks
+// its fallback response as stale (X-STM-Status-Stale) and logs one WARN. The
+// body itself keeps being served: clients regex-parse it as the box's XML, so
+// blanking or replacing it would break them, but without the marker a box
+// whose BoseApp died kept "Playing <station>" on every client forever.
+const statusStaleAfter = 30 * time.Second
+
+// playDetachTimeout bounds a play/recall push that has been detached from the
+// caller's request context: long enough for the standby wake (~6-8s)
+// plus the UPnP SetURI+Play on a just-woken box, short enough that an
+// abandoned request cannot hold boxCmdMu indefinitely.
+const playDetachTimeout = 12 * time.Second
+
+// ensureBoxReady wakes the box from standby (with retry+poll until
+// really awake) and ensures the marge account is active.
+// Called before every play call.
+// handleBoxWake wakes the speaker from standby (the :17000 TAP wake) WITHOUT
+// starting any playback. The desktop app calls it on a zone member that a user
+// switched off at the speaker before enrolling it: the firmware otherwise adds a
+// still-asleep box to the group and it stays silent while STM reports success
+// Waking an already-awake box is a fast no-op.
+func (s *Server) handleBoxWake(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	if s.boxHost == "" {
+		http.Error(w, "box host not configured", http.StatusServiceUnavailable)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 10*time.Second)
+	defer cancel()
+	// A quiet wake is for a group join, not for listening to THIS speaker. The
+	// firmware's power-on resumes the speaker's own last station at its own
+	// level, so for a few seconds every joining member played something else,
+	// loudly, before the zone took it over; on one member the join then failed
+	// against the still-starting station. So:
+	// mute first, wake, stop whatever the firmware resumed, answer. The level
+	// comes back the moment the speaker joins a zone (NoteBoxZoneState) or
+	// after a bounded wait.
+	quiet := wakeQuietRequested(r.URL.Query())
+	var err error
+	if quiet {
+		err = s.quietWake(ctx)
+	} else {
+		err = boxcli.WakeAndWait(ctx, s.boxHost, 8*time.Second, s.logger)
+	}
+	if err != nil {
+		http.Error(w, "wake failed: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"awake": true})
+}
+
+// wakeQuietRequested reads the quiet flag off a wake request. Two spellings,
+// and the second one exists ONLY because of what an OLD agent does with the
+// first: v0.9.74 and v0.9.75 honour quiet=1 without the quietWakeNeeded gate
+// below, so they mute and STOP a speaker that is happily playing. The app wakes
+// the full desired member list on every group edit, and users update the app
+// long before they update each speaker, so asking those agents for quiet would
+// silence the members of a playing group on the normal update path.
+//
+//   - quietifasleep=1 is the name only a gated agent knows. An old agent does
+//     not recognise the key and does today's plain wake, which is exactly the
+//     behaviour it had before the app started asking.
+//   - quiet=1 keeps its meaning for everything that already sends it.
+//
+// Both mean the same thing HERE: the gate lives inside quietWake, so this agent
+// leaves an awake speaker alone whichever spelling it was asked with.
+func wakeQuietRequested(q url.Values) bool {
+	return q.Get("quiet") == "1" || q.Get("quietifasleep") == "1"
+}
+
+// quietWakeNeeded says whether the quiet treatment (mute, wake, stop) has any
+// work to do. Only a sleeping speaker does: there is no power-on self-resume to
+// mute or stop on one that is already up, and muting a member that is playing
+// in the very group being edited silences it for nothing. The app wakes the
+// FULL desired member list on a group change, not only the speakers being
+// added, so without this every existing member of a playing group was muted and
+// stopped when one speaker was added or removed. A state that cannot be read
+// (empty source) is treated as asleep, which is what it was before this gate.
+func quietWakeNeeded(np nowPlayingSnapshot) bool {
+	return np.Source == "" || np.Source == "STANDBY"
+}
+
+// quietWakeNowPlaying is the seam for the tests: the real read reaches the
+// firmware on a fixed port, so a test server on a random port cannot be
+// reached through it (same pattern as hushforupload.go and
+// dissolvestragglers.go). Production always uses the real implementation.
+var quietWakeNowPlaying = func(ctx context.Context, host string) nowPlayingSnapshot {
+	return fetchNowPlayingPeer(ctx, host)
+}
+
+// quietWake wakes the speaker for a group operation, not for listening to
+// it: the firmware's power-on resumes the speaker's own last station at its
+// own level, so the speaker is muted the moment it shows life, whatever the
+// firmware resumed is stopped, and the level comes back when it joins a zone
+// or after a bounded wait (armQuietWakeRestore). Used by the app's group-join
+// wake (/api/box/wake?quiet=1) and by the zone form for a sleeping master,
+// which otherwise started its last station in every room the moment the
+// group was created. A speaker that is not in standby is
+// left exactly as it is.
+func (s *Server) quietWake(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	// Only a sleeping speaker gets the quiet treatment (quietWakeNeeded). The
+	// other callers check standby themselves (zones_stereo.go, rejoinDecision),
+	// so for them this early return never fires; the app path is the one that
+	// wakes speakers that are already playing.
+	if !quietWakeNeeded(quietWakeNowPlaying(ctx, s.boxHost)) {
+		return nil
+	}
+	// Stamped before the wake, not after it: a wake that fails half way still
+	// leaves a speaker that was pulled out of standby, and the preset write
+	// would start music on that one just the same.
+	s.noteQuietWakeEpisode()
+	var prevVol = -1
+	if v, err := boxapi.New(s.boxHost).GetVolume(ctx); err == nil {
+		prevVol = v.Actual
+	}
+	// The mute has to land AFTER the power-on, not before it: a level
+	// written while the speaker sleeps is accepted by its API and then
+	// overwritten by the firmware's own remembered level the moment it
+	// powers on (measured 2026-09-06: set to 0 in standby, woke at 30).
+	// So a watcher polls for the first sign of life and mutes right then,
+	// a few hundred milliseconds into the resume instead of seconds.
+	muteDone := s.setVolumeOnFirstLife(ctx, 0)
+	err := boxcli.WakeAndWait(ctx, s.boxHost, 8*time.Second, s.logger)
+	<-muteDone
+	if err != nil {
+		if prevVol >= 0 {
+			_ = boxapi.New(s.boxHost).SetVolume(ctx, prevVol)
+		}
+		return err
+	}
+	// Belt and braces: the watcher may have raced the firmware's level
+	// restore, so the mute is written once more now that the box is up.
+	_ = boxapi.New(s.boxHost).SetVolume(ctx, 0)
+	// Whatever the firmware resumed on power-on is stopped, so the zone
+	// join meets an idle speaker instead of a station still spinning up.
+	if np := quietWakeNowPlaying(ctx, s.boxHost); np.PlayStatus != "" && np.PlayStatus != "STOP_STATE" && np.Source != "STANDBY" {
+		_ = boxapi.New(s.boxHost).Key(ctx, "STOP")
+	}
+	if prevVol >= 0 {
+		s.armQuietWakeRestore(prevVol)
+	}
+	s.logger.Info("wake: quiet wake for a group operation", "mutedFrom", prevVol)
+	return nil
+}
+
+// setVolumeOnFirstLife starts a watcher that writes vol the moment the speaker
+// shows its first sign of life, and returns a channel closed when the watcher
+// is done. It exists because a level written while the speaker is in standby is
+// accepted by its API and then overwritten by the firmware's own remembered
+// level on power-on (measured 2026-09-06: set to 0 in standby, woke at 30), so
+// the write has to be raced into the resume rather than made before it.
+//
+// Shared by the quiet wake (which writes a mute) and the alarm (which writes
+// the level you want to wake up to).
+func (s *Server) setVolumeOnFirstLife(ctx context.Context, vol int) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c := boxapi.New(s.boxHost)
+		for ctx.Err() == nil {
+			if np := quietWakeNowPlaying(ctx, s.boxHost); np.Source != "" && np.Source != "STANDBY" {
+				_ = c.SetVolume(ctx, vol)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(150 * time.Millisecond):
+			}
+		}
+	}()
+	return done
+}
+
+// quietWakeEpisodeWindow is how long after a group wake the speaker is treated
+// as still settling. It has to outlast the whole sequence, not just the mute:
+// the wake takes about four seconds, the zone forms two or three after that,
+// and the preset re-sync the wake scheduled starts writing right behind it.
+const quietWakeEpisodeWindow = 30 * time.Second
+
+// noteQuietWakeEpisode stamps the settling window. Called by the quiet wake
+// itself, so every group wake is covered whichever caller made it.
+func (s *Server) noteQuietWakeEpisode() {
+	s.quietWakeMu.Lock()
+	s.quietWakeEpisodeUntil = time.Now().Add(quietWakeEpisodeWindow)
+	s.quietWakeMu.Unlock()
+}
+
+// QuietWakeEpisodeActive reports whether STM woke this speaker for a group
+// operation moments ago and the operation has not settled yet.
+//
+// The preset reconcile asks this before a forced pass. Writing the six native
+// preset elements makes the firmware select LOCAL_INTERNET_RADIO and start
+// playing, which is invisible on a speaker that was already idle and left
+// alone, and very audible on one that was just woken and un-muted by a zone
+// join (re-confirmed on v0.9.79 with the write and the source change 168
+// ms apart). The forced pass already stands down in front of live audio for
+// the mirror-image reason.
+func (s *Server) QuietWakeEpisodeActive() bool {
+	s.quietWakeMu.Lock()
+	defer s.quietWakeMu.Unlock()
+	return time.Now().Before(s.quietWakeEpisodeUntil)
+}
+
+// quietWakeActive reports whether a quiet wake is still holding this speaker
+// down, i.e. STM itself pulled the box out of standby for a group operation
+// moments ago.
+//
+// The power-on resume needs this. Its own self-wake guard asks whether the box
+// is in a zone, on the reasoning that a standalone box can only have been woken
+// by a user pressing power. That is true right up until STM wakes the box in
+// order to form a zone: at that instant the zone does not exist yet, the guard
+// sees a standalone box and the last station starts playing. Reported,
+// a group formed while nothing was playing and music started (2026-09-08):
+//
+//	17:23:50 power-on detected, attempting last-station resume
+//	17:23:51 wake: quiet wake for a group operation  mutedFrom=32
+//	17:23:53 wake resume: resumed last stream after power-on
+//	17:23:54 zone: forming (beta)
+//
+// The mute did not save it either: the zone join lifts the mute a second later
+// and the resumed stream becomes audible at full level.
+func (s *Server) quietWakeActive() bool {
+	s.quietWakeMu.Lock()
+	defer s.quietWakeMu.Unlock()
+	return !s.quietWakeUntil.IsZero()
+}
+
+// quietWakeRestoreAfter bounds how long a member stays muted after a quiet
+// wake when no zone join arrives.
+const quietWakeRestoreAfter = 20 * time.Second
+
+// armQuietWakeRestore remembers the level a quiet wake muted from and starts
+// the bounded fallback that restores it if no zone join does.
+func (s *Server) armQuietWakeRestore(vol int) {
+	s.quietWakeMu.Lock()
+	// The level already armed wins: a SECOND quiet wake inside the window
+	// would otherwise snapshot the level the first one already muted (0) and
+	// then "restore" the speaker to silence. That is the normal case, not an
+	// edge one: the app races each wake against a 4 s deadline and retries,
+	// while a real wake out of standby needs longer than that. So a repeat
+	// arming only pushes the deadline out.
+	if s.quietWakeUntil.IsZero() {
+		s.quietWakeVol = vol
+	}
+	s.quietWakeUntil = time.Now().Add(quietWakeRestoreAfter)
+	s.quietWakeMu.Unlock()
+	time.AfterFunc(quietWakeRestoreAfter, func() { s.restoreQuietWakeVolume("timeout") })
+}
+
+// restoreQuietWakeVolume puts the level back that a quiet wake muted, once.
+func (s *Server) restoreQuietWakeVolume(why string) {
+	s.quietWakeMu.Lock()
+	vol, until := s.quietWakeVol, s.quietWakeUntil
+	armed := !until.IsZero()
+	// A repeat arming pushed the deadline out and started its own timer, so
+	// the timer of the earlier wake must not un-mute a speaker that a later
+	// quiet wake is still holding down. It leaves the arming alone and the
+	// later timer does the work. A zone join is not a deadline and always
+	// restores.
+	if armed && why == "timeout" && time.Now().Before(until) {
+		s.quietWakeMu.Unlock()
+		return
+	}
+	s.quietWakeUntil = time.Time{}
+	s.quietWakeMu.Unlock()
+	if !armed || vol < 0 || s.boxHost == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := boxapi.New(s.boxHost).SetVolume(ctx, vol); err != nil {
+		s.logger.Warn("wake: could not restore the level after a quiet wake", "vol", vol, "why", why, "err", err)
+		return
+	}
+	s.logger.Info("wake: level restored after a quiet wake", "vol", vol, "why", why)
+}
+
+func (s *Server) ensureBoxReady(ctx context.Context) { _ = s.ensureBoxReadyErr(ctx) }
+
+// ensureBoxReadyErr is ensureBoxReady for the callers that must know whether
+// the box actually came back, rather than driving on into a speaker that is not
+// answering. Forming a group is the case that pays for this: the wake failing
+// is the earliest honest sign that the rest of the drive will fail too.
+func (s *Server) ensureBoxReadyErr(ctx context.Context) error {
+	var wakeErr error
+	if s.boxHost != "" {
+		// Detach from the caller's request context: a slow wake must not be
+		// cancellable by the app giving up on the play POST, because the very
+		// same r.Context() then drives the SetURI that follows. When the wake
+		// (or the pair below) blocked past the app's request timeout, the app
+		// cancelled the request and the recall's own PlayURL then ran on an
+		// already-cancelled context and failed instantly with "context
+		// cancelled" - every preset recall dead on ST20/ST30 (bernd).
+		wakeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 8*time.Second)
+		if err := boxcli.WakeAndWait(wakeCtx, s.boxHost, 6*time.Second, s.logger); err != nil {
+			s.logger.Warn("Box could not be woken from STANDBY", "err", err)
+			wakeErr = err
+		}
+		cancel()
+	}
+	if s.autoPair != nil {
+		// Fire-and-forget. The marge-account refresh is NOT needed for the
+		// UPnP playback that follows, yet the box's :8090 setMargeAccount POST
+		// can hang for seconds on some firmwares. Running it inline blocked the
+		// recall past the app's request timeout (see above), so run it in the
+		// background on its own context and never delay the play on it.
+		go func() {
+			pairCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+			defer cancel()
+			s.autoPair.TriggerNow(pairCtx)
+		}()
+	}
+	return wakeErr
+}
+
+// New creates a new webui server.
+func New(addr string, logger *slog.Logger, opts ...Option) *Server {
+	s := &Server{addr: addr, logger: logger, queue: newPlayQueue(),
+		mirrorKick: make(chan struct{}, 1), alarmReload: make(chan struct{}, 1)}
+	for _, o := range opts {
+		o(s)
+	}
+	s.loadLastPlay()
+	// If STM itself rebooted the box for an update, stand the automatic power-on
+	// resume down briefly so it does not blast the room right after the update
+	// (a genuine power outage leaves no marker and resumes as before).
+	s.consumeOTARebootMarker()
+	return s
+}
+
+// Run starts the server and blocks until ctx is cancelled.
+//
+// Every step that can fail or block emits a phase-marker log at WARN
+// level so that even on a `--log-level warn` deployment (or with the
+// diagnostic capturing only the tail of /tmp/stmanager-agent.log) the
+// bundle shows which step the agent reached. Without these markers an
+// agent that bound :8090 but silently failed :8888 looked identical
+// in the bundle to one that crashed mid-init.
+const (
+	// See the construction inside Run for why these two and no others.
+	agentReadHeaderTimeout = 10 * time.Second
+	agentIdleTimeout       = 120 * time.Second
+)
+
+func (s *Server) Run(ctx context.Context) error {
+	s.logger.Warn("webui phase: Run entered", "addr", s.addr)
+	s.baseCtx = ctx
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/manifest.webmanifest", s.handleManifest)
+	mux.HandleFunc("/icon.png", s.handleIcon)
+	mux.HandleFunc("/icon-large.png", s.handleIconLarge)
+	mux.HandleFunc("/api/peers", s.handlePeers)
+	mux.HandleFunc("/api/peers/seed", s.handlePeerSeed)
+	mux.HandleFunc("/api/peers/forget", s.handlePeerForget)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// REST API
+	mux.HandleFunc("/api/presets", s.handlePresets)
+	// Deliberately OUTSIDE the "/api/presets/" prefix. An agent older than this
+	// endpoint registers only the prefix, so a move request sent there reaches
+	// the per-slot handler, which parses "move" as a slot number and answers
+	// 400 "invalid slot, must be 1-6". The new endpoint answers exactly that
+	// sentence for a genuinely out-of-range slot, so the app could not tell an
+	// old agent from a real refusal, and guessing wrong runs a destructive
+	// two-step fallback. Off the prefix, an old agent has no handler at all and
+	// answers a plain 404, which cannot be confused with anything.
+	mux.HandleFunc("/api/box/preset-move", s.handlePresetMove)
+	mux.HandleFunc("/api/presets/", s.handlePresetSlot)
+	mux.HandleFunc("/api/play", s.handlePlay)
+	mux.HandleFunc("/api/play/", s.handlePlaySlot)
+	mux.HandleFunc("/api/pause", s.handlePause)
+	mux.HandleFunc("/api/resume", s.handleResume)
+	mux.HandleFunc("/api/stop", s.handleStop)
+	// Source-aware skip for the phone remote's Previous/Next controls: skips
+	// Spotify when it is the live source, otherwise advances the STM play queue.
+	mux.HandleFunc("/api/next", s.handleTransportNext)
+	mux.HandleFunc("/api/prev", s.handleTransportPrev)
+	mux.HandleFunc("/api/queue", s.handleQueue)
+	mux.HandleFunc("/api/queue/next", s.handleQueueNext)
+	mux.HandleFunc("/api/queue/prev", s.handleQueuePrev)
+	mux.HandleFunc("/api/queue/shuffle", s.handleQueueShuffle)
+	mux.HandleFunc("/api/queue/repeat", s.handleQueueRepeat)
+	mux.HandleFunc("/api/queue/mode", s.handleQueueMode)
+	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/position", s.handlePosition)
+	mux.HandleFunc("/api/recent", s.handleRecent)
+	// Radio search/browse moved app-side (the app queries radio-browser
+	// directly; see the app-first direction). The box no longer serves
+	// /api/radio/* and no longer compiles in the radiobrowser package.
+	mux.HandleFunc("/api/agent/version", s.handleAgentVersion)
+	mux.HandleFunc("/api/agent/update", s.handleAgentUpdate)
+	mux.HandleFunc("/api/agent/sidecar", s.handleAgentSidecar)
+	mux.HandleFunc("/api/agent/enable-ssh", s.handleAgentEnableSSH)
+	mux.HandleFunc("/api/agent/ssh", s.handleAgentSSH)
+	mux.HandleFunc("/api/box/settings", s.handleBoxSettings)
+	mux.HandleFunc("/api/box/language", s.handleBoxLanguage)
+	mux.HandleFunc("/api/box/name", s.handleBoxName)
+	mux.HandleFunc("/api/box/volume", s.handleBoxVolume)
+	mux.HandleFunc("/api/box/bass", s.handleBoxBass)
+	mux.HandleFunc("/api/box/levels", s.handleBoxSpeakerLevels)
+	mux.HandleFunc("/api/box/source", s.handleBoxSource)
+	mux.HandleFunc("/api/box/power", s.handleBoxPower)
+	mux.HandleFunc("/api/region", s.handleRegion)
+	mux.HandleFunc("/api/box/wlan", s.handleBoxWLAN)
+	mux.HandleFunc("/api/box/wlan/scan", s.handleBoxWLANScan)
+	mux.HandleFunc("/api/box/reboot", s.handleBoxReboot)
+	mux.HandleFunc("/api/box/remove-conflicting-mod", s.handleRemoveConflictingMod)
+	mux.HandleFunc("/api/box/restore-cloud-url", s.handleRestoreCloudURL)
+	mux.HandleFunc("/api/box/start-volume", s.handleStartVolume)
+	mux.HandleFunc("/api/favorites", s.handleFavorites)
+	mux.HandleFunc("/api/box/foreign-influence", s.handleForeignInfluence)
+	mux.HandleFunc("/api/box/wake", s.handleBoxWake)
+	mux.HandleFunc("/api/box/airplay-opt", s.handleBoxAirplayOpt)
+	mux.HandleFunc("/api/box/resume-on-power-on", s.handleResumeOnPowerOn)
+	mux.HandleFunc("/api/box/display-track", s.handleDisplayTrack)
+	mux.HandleFunc("/api/box/mediaservers", s.handleMediaServers)
+	mux.HandleFunc("/api/library/search", s.handleLibrarySearch)
+	mux.HandleFunc("/api/library/servers", s.handleLibraryServers)
+	mux.HandleFunc("/api/library/browse", s.handleLibraryBrowse)
+	mux.HandleFunc("/api/library/locate", s.handleLibraryLocate)
+	mux.HandleFunc("/api/queue/replay-card", s.handleQueueReplayCard)
+	mux.HandleFunc("/api/box/presets", s.handleBoxPresets)
+	mux.HandleFunc("/api/box/presets/recall", s.handleBoxPresetRecall)
+	mux.HandleFunc("/api/box/snapshot", s.handleBoxSnapshot)
+	mux.HandleFunc("/api/box/snapshot/restore", s.handleBoxSnapshotRestore)
+	mux.HandleFunc("/api/announce", s.handleAnnounce)
+	mux.HandleFunc("/announce/audio", s.handleAnnounceAudio)
+	mux.HandleFunc("/api/box/sync-presets", s.handleBoxSyncPresets)
+	mux.HandleFunc("/api/box/zone", s.handleBoxZone)
+	mux.HandleFunc("/api/box/balance", s.handleBoxBalance)
+	mux.HandleFunc("/api/box/zone/volume", s.handleZoneVolume)
+	mux.HandleFunc("/api/box/sleep", s.handleSleep)
+	mux.HandleFunc("/api/box/zone/member", s.handleZoneMember)
+	mux.HandleFunc("/api/box/zone/purge", s.handleZonePurge)
+	mux.HandleFunc("/api/box/zone/stereo-name", s.handleStereoName)
+	mux.HandleFunc("/api/box/group", s.handleBoxGroup)
+	mux.HandleFunc("/api/marge/group", s.handleMargeGroupDoc)
+	mux.HandleFunc("/api/webhooks", s.handleWebhooks)
+	mux.HandleFunc("/api/webhooks/test", s.handleWebhooksTest)
+	mux.HandleFunc("/api/groupkeys", s.handleGroupKeys)
+	mux.HandleFunc("/api/alarms", s.handleAlarms)
+	mux.HandleFunc("/api/stick/status", s.handleStickStatus)
+	mux.HandleFunc("/api/debug/state", s.handleDebugState)
+
+	// LOCAL_INTERNET_RADIO: the adapter endpoints the BMX service registry
+	// points at, so the box can resolve and play a native radio ContentItem
+	// (see lir.go).
+	mux.HandleFunc("/lir/", s.handleLIRStation)
+	mux.HandleFunc("/core02/svc-bmx-adapter-orion/prod/orion/station", s.handleOrionStation)
+	mux.HandleFunc("/core02/svc-bmx-adapter-orion/prod/orion/token", s.handleOrionToken)
+	mux.HandleFunc("/api/debug/marge-lab", s.handleMargeLab)
+	mux.HandleFunc("/api/debug/native-preset-probe", s.handleNativeProbe)
+	// Radio service icons the BMX registry points the speaker at. Must be a
+	// real route: without it these fall through to the catchall and the speaker
+	// receives an HTML page where it asked for an image.
+	mux.HandleFunc(bmxIconPrefix, s.handleBMXIcon)
+	// Station artwork over plain HTTP: the speaker cannot fetch https itself.
+	mux.HandleFunc(artProxyPath, s.handleArt)
+	mux.HandleFunc("/api/debug/probe", s.handleDebugProbe)
+
+	// Stream proxy: stable URLs for radio streams with token expiry.
+	// See internal/streamproxy for details.
+	if s.streamProxy != nil {
+		s.streamProxy.Register(mux)
+	}
+	if s.spotifyStream != nil {
+		// .ogg suffix matters: the Bose UPnP renderer keys playability off
+		// the URL extension and rejects an extensionless Ogg stream
+		// (INVALID_SOURCE) even with audio/ogg Content-Type + protocolInfo.
+		mux.HandleFunc("/spotify/stream.ogg", s.spotifyStream)
+		// Per-slot aliases (same single stream, distinct URLs) so the box can
+		// store a UNIQUE location per Spotify preset. Without this, two Spotify
+		// presets share the identical location and the box drops one of them
+		// (observed: slot 1 vanished when 1 and 6 both used /spotify/stream.ogg).
+		for slot := 1; slot <= 6; slot++ {
+			mux.HandleFunc(fmt.Sprintf("/spotify/stream-%d.ogg", slot), s.spotifyStream)
+		}
+	}
+	if s.spotifyInfo != nil {
+		mux.HandleFunc("/spotify/info", s.spotifyInfo)
+	}
+	if s.spotifyQuality != nil {
+		mux.HandleFunc("/spotify/quality", s.spotifyQuality)
+	}
+	if s.spotifyExportCred != nil || s.spotifyImportCred != nil {
+		mux.HandleFunc("/spotify/credential", s.handleSpotifyCredential)
+		// Alias: the desktop app's preset-copy flow called this spelling for
+		// weeks while only /spotify/credential was served; the catch-all index
+		// answered it with 200 + HTML, which read as success and silently
+		// transferred nothing (the "Spotify preset needs the app once" field
+		// reports). Serve both so no client generation can fall through to the
+		// index again.
+		mux.HandleFunc("/api/spotify/credential", s.handleSpotifyCredential)
+	}
+
+	// Bound the two phases a peer can stall in, and only those two.
+	//
+	// Without a header timeout, a peer that accepts the connection and then
+	// says nothing holds a handler goroutine for as long as it likes. On a
+	// whitelisted chassis the firmware REDIRECT can leave exactly that kind of
+	// half open connection behind, and the symptom is nasty: the port still
+	// accepts, so the speaker looks reachable, while nothing is served, the
+	// hardware keys stop working, and no diagnostic can be captured because
+	// capturing one needs this very server. The marge servers have had a
+	// header timeout since they were written; this one never did.
+	//
+	// ReadTimeout and WriteTimeout are deliberately NOT set. This server also
+	// carries the radio stream proxy and the Spotify audio passthrough, which
+	// are meant to run for hours, and it receives the agent and engine uploads,
+	// which are 13 and 16 MB over a speaker Wi-Fi link. Either timeout would
+	// cut the music or fail an update, so the fix is limited to the phases that
+	// are genuinely bounded: reading the request head, and sitting idle between
+	// keep alive requests.
+	srv := &http.Server{
+		Addr:              s.addr,
+		Handler:           corsMiddleware(mux),
+		ReadHeaderTimeout: agentReadHeaderTimeout,
+		IdleTimeout:       agentIdleTimeout,
+	}
+	s.logger.Warn("webui phase: mux ready, calling ListenTCP", "addr", s.addr)
+	// SO_REUSEADDR so the agent can rebind after a watchdog respawn
+	// while the previous listener is still in TIME_WAIT.
+	ln, err := netutil.ListenTCP(ctx, s.addr)
+	if err != nil {
+		s.logger.Error("webui phase: ListenTCP failed", "addr", s.addr, "err", err)
+		return fmt.Errorf("webui listen %s: %w", s.addr, err)
+	}
+	s.logger.Warn("webui phase: ListenTCP succeeded, starting Serve", "addr", s.addr, "local", ln.Addr().String())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(ln)
+	}()
+	// The alarm scheduler outlives every request, so it hangs off the server's
+	// context rather than any one of them. It returns on ctx.Done.
+	go s.runAlarms(ctx)
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		return srv.Shutdown(shutdownCtx)
+	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return fmt.Errorf("webui server: %w", err)
+	}
+}
+
+// allowedCORSOrigins are the browser origins permitted to READ this agent's
+// answers. Only the desktop app's webview is in it: Wails serves the frontend
+// from wails://wails on macOS and Linux and from http://wails.localhost on
+// Windows (WebView2).
+//
+// The phone remote is deliberately absent, and needs to be: it is served BY
+// this agent and fetches relative paths, so it is same-origin and CORS never
+// enters into it.
+var allowedCORSOrigins = map[string]bool{
+	"wails://wails":           true,
+	"http://wails.localhost":  true,
+	"https://wails.localhost": true,
+	// `wails dev` serves the frontend from its own dev server on this fixed
+	// port (desktop-app/README.md), so leaving it out would break the
+	// maintainer's own build the moment this shipped. One exact port, not
+	// localhost in general: a page served from any other local port is as
+	// foreign as one on the open web.
+	"http://localhost:34115": true,
+	"http://127.0.0.1:34115": true,
+}
+
+// corsMiddleware lets the desktop app's webview read this agent's answers, and
+// nobody else.
+//
+// It used to answer every request with "Access-Control-Allow-Origin: *", which
+// is the agent telling the browser that ANY page may read the body. That is not
+// a theoretical grant. A user opens some website; its JavaScript runs in their
+// browser, which sits on their own LAN; it fetches http://<speaker>:17008/... ;
+// the request passes every LAN check because it genuinely comes from the LAN;
+// and the star then hands the page the answer. The same-origin policy exists to
+// stop exactly that, and the star switched it off.
+//
+// Measured on a live speaker 2026-09-15: GET /spotify/credential with a foreign
+// Origin answered 200 with the reusable Spotify Connect login.
+//
+// So: a request with NO Origin is not a browser cross-origin read at all (a Go
+// client, curl, a same-origin page load) and is served as before. A request
+// whose Origin we know gets permission. Any other origin is still SERVED, it
+// simply gets no permission header, so the browser refuses to hand the body to
+// the page. Nothing that worked stops working; only the reading stops.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && allowedCORSOrigins[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			// Vary, because the answer now differs per origin and a cache that
+			// forgot this would hand one origin's permission to another.
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
+		if r.Method == http.MethodOptions {
+			// A preflight from an origin we do not know is refused here rather
+			// than answered with a silent 204: without the permission headers
+			// the browser blocks it anyway, and 403 says why in a network log.
+			if origin != "" && !allowedCORSOrigins[origin] {
+				http.Error(w, "origin not allowed", http.StatusForbidden)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requireMethod responds 405 and returns false unless the request method is one
+// of the allowed ones, so a handler can guard the method in a single line.
+func requireMethod(w http.ResponseWriter, r *http.Request, allowed ...string) bool {
+	for _, m := range allowed {
+		if r.Method == m {
+			return true
+		}
+	}
+	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
+// decodeJSONRequest decodes a JSON request body (bounded by maxBytes) into v,
+// responding 400 with the parse error on failure. Returns false when the caller
+// should stop handling the request.
+func decodeJSONRequest[T any](w http.ResponseWriter, r *http.Request, maxBytes int64, v *T) bool {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes)).Decode(v); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return false
+	}
+	return true
+}

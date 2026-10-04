@@ -1,0 +1,433 @@
+// Regression tests for the in-app SSH installer. Each test is named
+// after the user-visible failure mode it guards against so future
+// refactors that re-introduce the same bug fail loudly in CI before
+// they hit a real user. Issues referenced are on the public tracker.
+
+package main
+
+import (
+	"errors"
+	"os"
+	"strings"
+	"testing"
+)
+
+// TestSSHFlagSetsRejectDeprecatedPubkeyOption guards against the
+// "Bad configuration option: pubkeyacceptedalgorithms" regression
+// PubkeyAcceptedAlgorithms was introduced in OpenSSH 8.5
+// (April 2021); macOS Big Sur ships OpenSSH 8.1, which aborts ssh
+// with that exact error before any negotiation if the option is
+// present. v0.5.2 carried the option and was unusable on Big Sur.
+// STM uses passwordless root login so the option is unnecessary
+// anyway. No set in the fallback chain must carry it ever again.
+func TestSSHFlagSetsRejectDeprecatedPubkeyOption(t *testing.T) {
+	for i, set := range sshFlagSets {
+		for _, f := range set {
+			if strings.Contains(strings.ToLower(f), "pubkeyacceptedalgorithms") {
+				t.Errorf("sshFlagSets[%d] contains PubkeyAcceptedAlgorithms which "+
+					"breaks macOS Big Sur (OpenSSH 8.1, issue #60); flag was %q", i, f)
+			}
+		}
+	}
+}
+
+// TestSSHFlagSetsCarryEveryLegacyAlgorithmClass ensures at least
+// one set in the chain patches each algorithm class the Bose box's
+// 2014-era sshd needs. Without these, modern OpenSSH refuses to
+// negotiate and the installer never reaches the stick probe.
+func TestSSHFlagSetsCarryEveryLegacyAlgorithmClass(t *testing.T) {
+	classes := []struct {
+		needle string
+		why    string
+	}{
+		{"hostkeyalgorithms", "Bose offers only ssh-rsa host keys"},
+		{"kexalgorithms", "Bose offers only diffie-hellman-group{1,14}-sha1"},
+		{"ciphers", "Bose offers only CBC ciphers"},
+		{"macs", "Bose offers only SHA1/MD5 MACs"},
+	}
+	for _, c := range classes {
+		seen := false
+		for _, set := range sshFlagSets {
+			for _, f := range set {
+				if strings.Contains(strings.ToLower(f), c.needle) {
+					seen = true
+					break
+				}
+			}
+			if seen {
+				break
+			}
+		}
+		if !seen {
+			t.Errorf("no sshFlagSet patches the %s algorithm class (needed because %s)", c.needle, c.why)
+		}
+	}
+}
+
+// TestSSHFlagSetsHaveBareFallback locks in the last-resort set in
+// the chain. The "bare" fallback must be hygiene-only: if it carried
+// algorithm patches and a user's ssh rejected even one of them, we
+// would lose the escape hatch and bork the installer the same way
+// v0.5.2 did.
+func TestSSHFlagSetsHaveBareFallback(t *testing.T) {
+	if len(sshFlagSets) < 2 {
+		t.Fatalf("expected at least 2 fallback sets, have %d", len(sshFlagSets))
+	}
+	last := sshFlagSets[len(sshFlagSets)-1]
+	for _, f := range last {
+		low := strings.ToLower(f)
+		switch {
+		case strings.HasPrefix(low, "-okexalgorithms="):
+			t.Errorf("bare fallback set carries KEX patch %q which defeats its purpose", f)
+		case strings.HasPrefix(low, "-ociphers="):
+			t.Errorf("bare fallback set carries cipher patch %q which defeats its purpose", f)
+		case strings.HasPrefix(low, "-omacs="):
+			t.Errorf("bare fallback set carries MAC patch %q which defeats its purpose", f)
+		}
+	}
+}
+
+// TestSSHFlagSetsAllSetBatchModeAndStrictHostKeyOff covers the
+// connection-hygiene contract: every set in the chain must
+// suppress interactive prompts and the rotating Bose host key
+// must never end up in the user's known_hosts. Forgetting one of
+// these on a future tweak produces silent UI hangs.
+func TestSSHFlagSetsAllSetBatchModeAndStrictHostKeyOff(t *testing.T) {
+	required := []string{
+		"-oBatchMode=yes",
+		"-oStrictHostKeyChecking=no",
+	}
+	for i, set := range sshFlagSets {
+		joined := strings.ToLower(strings.Join(set, "\n"))
+		for _, want := range required {
+			if !strings.Contains(joined, strings.ToLower(want)) {
+				t.Errorf("sshFlagSets[%d] missing required hygiene flag %q", i, want)
+			}
+		}
+	}
+}
+
+// TestSSHFlagSetsSuppressKnownHostsBanner locks -oLogLevel=ERROR onto every set
+// in the chain. Without it, UserKnownHostsFile=/dev/null makes OpenSSH print
+// "Warning: Permanently added '<host>' (<key>) to the list of known hosts." on
+// stderr every connect (the host is never remembered), and CombinedOutput folds
+// that INFO banner into the byte count the SSH NAND-install verify parses,
+// flipping a byte-perfect transfer to a false "truncated" and making the ST30
+// stick-power fallback useless (13.06). ERROR, not QUIET: it drops the
+// INFO banner while still surfacing the negotiation/auth/host-key errors
+// classifySSHError keys on (those are ERROR/FATAL level).
+func TestSSHFlagSetsSuppressKnownHostsBanner(t *testing.T) {
+	for i, set := range sshFlagSets {
+		joined := strings.ToLower(strings.Join(set, "\n"))
+		if !strings.Contains(joined, "-ologlevel=error") {
+			t.Errorf("sshFlagSets[%d] missing -oLogLevel=ERROR; the known_hosts banner "+
+				"will leak into parsed SSH output and falsely fail the NAND-install verify as 'truncated'", i)
+		}
+		if strings.Contains(joined, "-ologlevel=quiet") {
+			t.Errorf("sshFlagSets[%d] uses LogLevel=QUIET which also hides the real "+
+				"negotiation/auth/host-key errors classifySSHError needs; use ERROR", i)
+		}
+	}
+}
+
+// TestLastIntFieldIgnoresKnownHostsBanner guards the banner-tolerant integer
+// parse shared by the SSH NAND-install byte-count verify and the CPU core-count
+// read against the known_hosts banner leak (ST30 stick-power, 13.06): the box
+// reports a single integer (`wc -c` byte count, `grep -c` core count), but
+// OpenSSH's "Warning: Permanently added '192.0.2.47' (RSA) to the list of known
+// hosts." banner is folded in ahead of it by CombinedOutput. The parse must read
+// the actual integer, not string-match the whole blob, or the verify falsely
+// reports "truncated" (and the whole stick-power fallback is useless) and the
+// core count silently floors to 1. The "leading numeric noise" case pins the
+// load-bearing LAST-token contract: a first-token refactor must fail here.
+func TestLastIntFieldIgnoresKnownHostsBanner(t *testing.T) {
+	cases := []struct {
+		name   string
+		out    string
+		want   int64
+		wantOK bool
+	}{
+		{name: "clean number", out: "11600034\n", want: 11600034, wantOK: true},
+		{
+			name: "known_hosts banner then number (the bug)",
+			out:  "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n11600034\n",
+			want: 11600034, wantOK: true,
+		},
+		{
+			name: "small file with banner (version.txt, 23 bytes)",
+			out:  "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n23\n",
+			want: 23, wantOK: true,
+		},
+		{name: "leading whitespace from busybox wc", out: "      2931\n", want: 2931, wantOK: true},
+		// Pins LAST-token semantics: a stray integer line ahead of the count (a
+		// future verbose/DEBUG ssh notice, or an extra field in a changed verify
+		// command) must not be mistaken for the count. A first-token parser fails
+		// this case; the last-token parser the docstring promises passes it.
+		{name: "leading numeric noise before the count", out: "3\n11600034\n", want: 11600034, wantOK: true},
+		// grep -c core count: single small integer, same parse.
+		{name: "core count with banner", out: "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n2\n", want: 2, wantOK: true},
+		{
+			name: "banner only, remote file missing so wc produced nothing",
+			out:  "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n",
+			want: 0, wantOK: false,
+		},
+		{name: "empty output", out: "", want: 0, wantOK: false},
+		{name: "zero-byte file / grep -c no match", out: "0\n", want: 0, wantOK: true},
+	}
+	for _, c := range cases {
+		got, ok := lastIntField(c.out)
+		if got != c.want || ok != c.wantOK {
+			t.Errorf("%s: lastIntField(%q) = (%d, %v), want (%d, %v)",
+				c.name, c.out, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// TestParseLoadAvgIgnoresKnownHostsBanner guards the load-settle gate's
+// /proc/loadavg parse against the same banner leak. boxLoad1 read fields[0] of
+// the first line, so the folded-in "Warning: Permanently added ..." banner made
+// it return "can't read load" on every box, silently disabling the load-settle
+// gate (the ST30 install-timeout mitigation). parseLoadAvg reads the first
+// field of the LAST non-empty line instead, so the gate keeps working even if
+// the banner ever reappears past LogLevel=ERROR.
+func TestParseLoadAvgIgnoresKnownHostsBanner(t *testing.T) {
+	cases := []struct {
+		name   string
+		out    string
+		want   float64
+		wantOK bool
+	}{
+		{name: "clean loadavg", out: "0.42 0.31 0.20 1/80 1234\n", want: 0.42, wantOK: true},
+		{
+			name: "banner then loadavg (the latent bug)",
+			out:  "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n0.42 0.31 0.20 1/80 1234\n",
+			want: 0.42, wantOK: true,
+		},
+		{name: "zero load", out: "0.00 0.01 0.05 1/60 900\n", want: 0.0, wantOK: true},
+		{
+			name: "banner only, loadavg unreadable",
+			out:  "Warning: Permanently added '192.0.2.47' (RSA) to the list of known hosts.\r\n",
+			want: 0, wantOK: false,
+		},
+		{name: "empty output", out: "", want: 0, wantOK: false},
+	}
+	for _, c := range cases {
+		got, ok := parseLoadAvg(c.out)
+		if ok != c.wantOK || got != c.want {
+			t.Errorf("%s: parseLoadAvg(%q) = (%v, %v), want (%v, %v)",
+				c.name, c.out, got, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// TestClassifySSHErrorRecognizesBadOption guards the user-facing
+// error path that was the single most useful diagnostic:
+// when the local ssh refuses one of our flags with "Bad
+// configuration option", the wizard must name the offending option
+// instead of showing a bare "exit status 255".
+func TestClassifySSHErrorRecognizesBadOption(t *testing.T) {
+	out := "command-line: line 0: Bad configuration option: pubkeyacceptedalgorithms"
+	msg := classifySSHError(out, errors.New("exit status 255"))
+	low := strings.ToLower(msg)
+	if !strings.Contains(low, "refused an option") {
+		t.Errorf("classifier did not surface the 'refused an option' hint; got %q", msg)
+	}
+	if !strings.Contains(low, "pubkeyacceptedalgorithms") {
+		t.Errorf("classifier did not include the offending option name; got %q", msg)
+	}
+}
+
+// TestExtractBadOptionParsesOpenSSHFormat locks the parser against
+// the literal OpenSSH stderr line shape. If a future OpenSSH
+// changes the line, the diagnostic message goes back to "<unknown>"
+// and the user is back to staring at "exit 255" with no clue.
+func TestExtractBadOptionParsesOpenSSHFormat(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"command-line: line 0: Bad configuration option: pubkeyacceptedalgorithms", "pubkeyacceptedalgorithms"},
+		{"Bad configuration option: kexalgorithms", "kexalgorithms"},
+		{"prefix junk\ncommand-line: line 0: Bad configuration option: ciphers\nsuffix junk", "ciphers"},
+		{"no marker here at all", "<unknown>"},
+		{"", "<unknown>"},
+	}
+	for _, c := range cases {
+		got := extractBadOption(c.in)
+		if got != c.want {
+			t.Errorf("extractBadOption(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestDetectStickCopyFailureMatchesRunShMarkers guards the install-time
+// diagnosis of the "agent never started because the binary could not be copied
+// off a flaky stick" failure (ST30 stick-copy, 13.06). install.sh succeeds, the
+// box reboots, run.sh's stick->NAND copy hits an I/O error, and with no prior
+// NAND cache run.sh exits. Without this the desktop showed a generic "agent not
+// up". The strings here MUST stay byte-identical to what usb-stick/run.sh logs;
+// if run.sh's wording changes, this test fails before a release ships a silent
+// regression of the specific message + the auto NAND-copy repair trigger.
+func TestDetectStickCopyFailureMatchesRunShMarkers(t *testing.T) {
+	positives := []string{
+		// sync_stick_to_nand_always, exact run.sh wording.
+		"Fri Jun 12 16:37:26: stick -> NAND cp failed (stick I/O error?), keeping previous NAND binary",
+		// run.sh BIN resolution, exact wording.
+		"Fri Jun 12 16:37:26: ERROR: neither NAND cache nor stick binary available",
+		// Realistic multi-line tail with both markers interleaved with noise.
+		"redeployed run-override.sh\nstick -> NAND cp failed (stick I/O error?), keeping previous NAND binary\nERROR: neither NAND cache nor stick binary available\n",
+	}
+	for _, p := range positives {
+		if !detectStickCopyFailure(p) {
+			t.Errorf("detectStickCopyFailure should match run.sh stick-copy-failure log:\n%q", p)
+		}
+	}
+	negatives := []string{
+		"",
+		"stick binary deployed to NAND cache (10485760 bytes)",
+		"STM webui :8888 listening at uptime=42s",
+		"phase summary: wpa=12s boseHTTP=20s stmAPI=42s",
+	}
+	for _, n := range negatives {
+		if detectStickCopyFailure(n) {
+			t.Errorf("detectStickCopyFailure should NOT match a healthy log:\n%q", n)
+		}
+	}
+}
+
+// TestDetectUSBPowerFailureMatchesVBUSSignature guards the discriminator that
+// keeps STM from blaming the stick for an ST30 USB power dropout. Multiple
+// independent users (13.06.2026) hit install.sh "Input/output error" on the
+// ST30 only, with the SAME stick installing fine on their ST10/ST20: the cause
+// was the speaker's USB port failing to keep VBUS up under read load, visible
+// only in the kernel dmesg. If the matched signatures drift from what musb-hdrc
+// actually logs, the user gets the misleading "stick likely faulty" text again,
+// so this test pins them.
+func TestDetectUSBPowerFailureMatchesVBUSSignature(t *testing.T) {
+	positives := []string{
+		// Exact musb-hdrc VBUS line from the field dmesg.
+		"musb-hdrc musb-hdrc.0.auto: VBUS_ERROR in a_wait_vrise (81, <SessEnd), retry #3",
+		// Enumeration timeouts (-110 = ETIMEDOUT) when VBUS sagged.
+		"usb 1-1: device descriptor read/64, error -110",
+		"usb 1-1: device not accepting address 2, error -110",
+		// Realistic multi-line dmesg tail with the I/O error interleaved.
+		"sda: sda1\nmusb-hdrc musb-hdrc.0.auto: VBUS_ERROR in a_wait_vrise (81, <SessEnd), retry #3\nend_request: I/O error, dev sda, sector 31728\nusb 1-1: USB disconnect, device number 2\n",
+	}
+	for _, p := range positives {
+		if !detectUSBPowerFailure(p) {
+			t.Errorf("detectUSBPowerFailure should match a USB VBUS/enumeration dropout dmesg:\n%q", p)
+		}
+	}
+	negatives := []string{
+		"",
+		// A plain media read error with no power/enumeration signature: this is
+		// the genuine unreadable/oversized-stick case that must stay stick-io-error.
+		"FAT-fs (sda1): unable to read boot sector\nend_request: I/O error, dev sda, sector 0\n",
+		"sd 0:0:0:0: [sda] Attached SCSI removable disk",
+		"# dmesg usb/storage\nusb 1-1: new high-speed USB device number 2 using musb-hdrc",
+	}
+	for _, n := range negatives {
+		if detectUSBPowerFailure(n) {
+			t.Errorf("detectUSBPowerFailure should NOT match a non-power dmesg:\n%q", n)
+		}
+	}
+}
+
+// TestParseDfAvailBytes guards the free-space pre-check that decides whether the
+// SSH repair stages into RAM (tmpfs) or NAND (ubifs). BusyBox df wraps a long
+// device name onto a second line, shifting the column count, so the Available
+// value must be read relative to the END of the last line (3rd from end), not by
+// a fixed index. A regression here would silently make the chooser pick a
+// too-small filesystem (or reject a fine one) before the byte-verify catches it.
+func TestParseDfAvailBytes(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want int64
+	}{
+		{
+			name: "normal single-line row",
+			out:  "Filesystem           1K-blocks      Used Available Use% Mounted on\ntmpfs                    20480      4096     16384  20% /tmp\n",
+			want: 16384 * 1024,
+		},
+		{
+			name: "wrapped long device name",
+			out:  "Filesystem           1K-blocks      Used Available Use% Mounted on\nubi0:rootfs_data\n                         61440     51200     10240  83% /mnt/nv\n",
+			want: 10240 * 1024,
+		},
+		{name: "empty", out: "", want: 0},
+		{name: "header only", out: "Filesystem 1K-blocks Used Available Use% Mounted on\n", want: 0},
+		{name: "df error", out: "df: /nope: can't find mount point\n", want: 0},
+	}
+	for _, c := range cases {
+		if got := parseDfAvailBytes(c.out); got != c.want {
+			t.Errorf("%s: parseDfAvailBytes = %d, want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestBuildStickProbeCmdScansFallbackDirectories guards the broader
+// stick mount probe: scanning /media, /mnt and /run/media for any
+// install.sh fallback. Without the wide scan, a firmware variant
+// that mounts USB sticks somewhere other than /media/sd[a-d]1
+// breaks first-install with the cryptic "install.sh did not
+// appear" UI message.
+func TestBuildStickProbeCmdScansFallbackDirectories(t *testing.T) {
+	cmd := buildStickProbeCmd(stickProbePaths)
+	for _, root := range []string{"/media", "/mnt", "/run/media"} {
+		if !strings.Contains(cmd, root) {
+			t.Errorf("stick probe does not scan %s as fallback (firmware variants may mount sticks there)", root)
+		}
+	}
+	if !strings.Contains(cmd, "STICKPATH=") {
+		t.Error("stick probe does not emit STICKPATH= marker which the caller parses")
+	}
+	if !strings.Contains(cmd, "MISSING") {
+		t.Error("stick probe does not emit MISSING marker which lets the caller distinguish 'no stick' from 'ssh died'")
+	}
+}
+
+// TestPreflightFailuresCarryTheFirmwareNote guards the gap that made a user
+// disable his antivirus for nothing.
+//
+// InstallSTMOnBox reads the speaker's Bose firmware first and builds fwNote
+// when it is older than the last Bose release. That note used to be appended
+// only in the branches past a successful SSH handshake, so every PREFLIGHT
+// failure dropped it - and preflight is exactly where an ancient firmware
+// shows up. A SoundTouch 30 on firmware 10.0.11 (2015) failed three installs
+// and was told each time that a firewall or the wrong Wi-Fi was the likely
+// cause, while "outdated=true" sat in the log unseen (field, 2026-08-04).
+//
+// This reads the source rather than calling the function because every
+// preflight branch needs a reachable speaker in a specific broken state. The
+// property is structural anyway: a new branch must not be able to forget.
+func TestPreflightFailuresCarryTheFirmwareNote(t *testing.T) {
+	src, err := os.ReadFile("install_stm.go")
+	if err != nil {
+		t.Fatalf("read install_stm.go: %v", err)
+	}
+	code := string(src)
+	start := strings.Index(code, `res.Step = "preflight"`)
+	end := strings.Index(code, `res.Step = "ssh-handshake"`)
+	if start < 0 || end <= start {
+		t.Fatal("could not locate the preflight block; if the steps were renamed, update this test")
+	}
+	block := code[start:end]
+
+	var bare []string
+	for _, line := range strings.Split(block, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "res.Message = ") {
+			continue
+		}
+		if !strings.Contains(trimmed, "withFW(") {
+			bare = append(bare, trimmed)
+		}
+	}
+	if len(bare) == 0 && !strings.Contains(block, "withFW(") {
+		t.Fatal("no withFW() call in the preflight block at all - the firmware note is not reaching the user")
+	}
+	for _, b := range bare {
+		t.Errorf("preflight message does not go through withFW(), so an outdated firmware stays hidden: %s", b)
+	}
+}

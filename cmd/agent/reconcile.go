@@ -1,0 +1,1198 @@
+// Preset reconciliation between the local store and the box, and the
+// resync-ask scheduler that gates writes on box wakefulness.
+
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxcli"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxurl"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxwrites"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/presets"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/recent"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/webhooks"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/webui"
+)
+
+// webhookPlaceholderName is what a "webhook only" key shows on the box display.
+// The slot has no station behind it, so the name is all the user ever sees of
+// it; anything longer is truncated by the firmware anyway.
+const webhookPlaceholderName = "Webhook"
+
+// webhookOnlySlots returns the preset keys that are configured as "webhook only"
+// (replace mode) yet have no STM preset behind them.
+//
+// This is the case. An EMPTY preset key is refused by the speaker itself:
+// it blinks orange and emits no presetSelectionUpdated frame at all, and
+// OnPresetSelected, which is what fires the per-key webhook, therefore never
+// runs. Two reporters hit it independently (an ST10 on 2026-08-05, an ST20 and
+// an ST30 on 2026-08-22) and in both bundles the agent log carries no press
+// event whatsoever, while the box's WebSocket bus is plainly connected and
+// delivering other frames. So the webhook is not failing, it is never reached.
+//
+// The fix is to keep something in the slot so the firmware treats the key as
+// assigned and reports the press; the replace-mode branch in OnPresetSelected
+// then withholds the playback, which is exactly what the mode promised.
+func webhookOnlySlots(wh *webhooks.Store, stick []presets.Preset) []int {
+	slots := wh.ReplacePresetSlots()
+	if len(slots) == 0 {
+		return nil
+	}
+	stored := make(map[int]bool, len(stick))
+	for _, p := range stick {
+		stored[p.Slot] = true
+	}
+	out := slots[:0:0]
+	for _, slot := range slots {
+		if !stored[slot] {
+			out = append(out, slot)
+		}
+	}
+	return out
+}
+
+// presetResyncAsk flags one forced full box-preset re-sync for the periodic
+// reconcile (the dead-key self-heal). presetResyncLast rate-limits the
+// routine requests so repeated thumbs presses cannot cause a re-sync storm;
+// presetResyncUrgentLast is a SEPARATE, shorter budget for the deterministic
+// wipe moments (a 1036 source rejection precedes a forced re-login, and the
+// re-onboarding is when the firmware drops its key registrations) so a routine
+// ask consumed minutes earlier cannot starve the heal that is actually needed
+// now (field bundles 2026-07-22: five dead-key presses produced no resync
+// because the boot-time ask had eaten the 10-minute budget).
+var (
+	presetResyncAsk        atomic.Bool
+	presetResyncLast       atomic.Int64 // unix seconds of the last accepted routine request
+	presetResyncUrgentLast atomic.Int64 // unix seconds of the last accepted urgent request
+	// presetResyncAsker names the origin of the pending ask (thumb / 1036 /
+	// paired / power-wake / standby-exit / reconnect), so the standby deferral
+	// WARN and the forced-pass log say WHICH trigger wanted to write - the one
+	// fact overnight field bundles could never answer.
+	presetResyncAsker atomic.Value // string
+	// standbyThumbLast tracks the previous standby-read thumb frame so a
+	// repeat within a minute reads as a human retrying a dead key, not a
+	// phantom frame. presetResyncStandbyOK grants that ask ONE execution
+	// despite a STANDBY reading (the user is demonstrably at the box).
+	standbyThumbLast      atomic.Int64
+	presetResyncStandbyOK atomic.Bool
+)
+
+func requestPresetKeyResync(logger *slog.Logger, asker string) {
+	const minGapSec = 2 * 60
+	now := time.Now().Unix()
+	last := presetResyncLast.Load()
+	if last != 0 && now-last < minGapSec {
+		return
+	}
+	// Plain Store, not CAS: once the budget check passed, the ask MUST arm.
+	// A CAS loser used to be safe because it always lost to another asker who
+	// armed the flag; the standby deferral's budget reset introduced a
+	// non-arming concurrent writer, and losing to IT dropped a wake re-ask.
+	// Two concurrent askers both storing is harmless (one pending ask).
+	presetResyncLast.Store(now)
+	presetResyncAsker.Store(asker)
+	presetResyncAsk.Store(true)
+	if logger != nil {
+		logger.Info("preset self-heal: scheduling a full box preset re-sync (#342)", "asker", asker)
+	}
+}
+
+// requestPresetKeyResyncUrgent is requestPresetKeyResync for the moments where
+// a box-side key wipe is EXPECTED (a 1036 rejection / forced re-login, a fresh
+// pairing): it uses its own short budget so it cannot be starved by a routine
+// ask, and the reconcile's 10s wake bounds how often the forced pass can run.
+func requestPresetKeyResyncUrgent(logger *slog.Logger, asker string) {
+	const minGapSec = 60
+	now := time.Now().Unix()
+	last := presetResyncUrgentLast.Load()
+	if last != 0 && now-last < minGapSec {
+		return
+	}
+	presetResyncUrgentLast.Store(now)
+	presetResyncAsker.Store(asker)
+	presetResyncAsk.Store(true)
+	if logger != nil {
+		logger.Info("preset self-heal: urgent full box preset re-sync scheduled (re-login/pairing wipes the key registrations)", "asker", asker)
+	}
+}
+
+// deferPresetResyncForStandby drops a pending re-sync ask because the box is
+// (or seems to be) in standby: a full AddPreset sweep into a sleeping box
+// resets the firmware's deep-standby countdown and heals nothing a sleeping
+// box can use (the v0.9.17 reconnect writes provably kept boxes awake
+// for days). The wake moment re-asks via OnStandbyExit/OnPowerWake, so the
+// routine budget is reset here or a deferral seconds before a wake would
+// swallow the wake's own re-ask.
+func deferPresetResyncForStandby(logger *slog.Logger, src string) {
+	asker, _ := presetResyncAsker.Load().(string)
+	presetResyncLast.Store(0)
+	// The urgent budget resets too: a 1036/paired asker fires on a box that is
+	// ALREADY awake (no wake hook is coming for it), so when its ask was
+	// dropped on a transient probe error the ONLY natural retrigger is the
+	// next 1036 - which the still-burned 60s budget would silence. Urgent
+	// triggers are external events that never fire autonomously on a sleeping
+	// box, so this cannot create a standby write loop.
+	presetResyncUrgentLast.Store(0)
+	reason := "box idles in STANDBY"
+	if src == "" {
+		reason = "box state unreadable, holding writes"
+	}
+	logger.Warn("preset re-sync deferred: "+reason+", holding the key writes for the wake (#119)",
+		"asker", asker)
+}
+
+// retryHoldVerdict is what the steady-state retry gate decides for a box
+// that reads STANDBY (or nothing at all).
+type retryHoldVerdict int
+
+const (
+	// retryHoldDefer holds the pass: nothing is written, a pending ask is
+	// consumed through the standby deferral, the loop sleeps a full tick.
+	retryHoldDefer retryHoldVerdict = iota
+	// retryHoldRunAsk lets the pass run despite the reading, because a
+	// pending ask carries user-present evidence (repeated dead-key presses).
+	retryHoldRunAsk
+)
+
+// retryHoldDecision is the retry gate's verdict for a STANDBY/unreadable
+// reading, kept pure so the spin fixed on 2026-09-07 stays testable: a
+// pending ask on a sleeping box is DEFERRED (consumed), never left armed for
+// the wait loop to trip over, and only a standby-OK ask runs.
+func retryHoldDecision(src string, askPending, standbyOK bool) retryHoldVerdict {
+	if src != "STANDBY" && src != "" {
+		// Not a hold at all; callers only ask for the two readings above.
+		return retryHoldRunAsk
+	}
+	if askPending && standbyOK {
+		return retryHoldRunAsk
+	}
+	return retryHoldDefer
+}
+
+// proxyStreamURL returns the stable loopback URL for a preset. The Bose
+// UPnP player opens it — the stream proxy in the stick agent resolves the
+// real station redirect behind it and reconnects on token expiry without
+// Bose noticing.
+func proxyStreamURL(slot int) string {
+	return boxurl.StreamSlot(slot)
+}
+
+// boxPresetURL is the location stored in the box's OWN preset slot. On a
+// hardware press the box first tries to activate this stored ContentItem itself
+// (before STM's recall takes over). Radio uses the per-slot stream proxy.
+// Spotify must use the single live Ogg stream STM actually serves, not
+// /stream/<slot> (which has no Spotify source): otherwise the box's own
+// activation fails with INVALID_SOURCE and the display flashes "service
+// unavailable" / "select a preset" before the recall. Pointing it at
+// /spotify/stream.ogg makes the box's own activation attach cleanly (it shows
+// the preset name + buffers) until STM loads the right playlist.
+func boxPresetURL(p presets.Preset) string {
+	return boxurl.Preset(p.Slot, p.Type == "spotify")
+}
+
+// initialBoxPresetSync waits for the box to boot and syncs all stick
+// presets to the box's internal preset store. With a retry loop: failed
+// slots are retried after 10s, up to 12 times. Background: the Bose
+// firmware is sometimes not yet ready for AddPreset calls at boot (autopair
+// not done, marge state not initialised). Without retries, slots would stay
+// permanently without a box entry — hardware buttons 1-6 would then trigger
+// nothing. Initial 30 s wait (was 12 s): measured in practice that the Bose
+// firmware needs ~60 s after a cold boot before /info on 8090 responds and
+// the marge state is ready. 12 s was optimistic.
+// 12 retry slots with a 10 s pause each = ~2 minutes of total runway.
+func initialBoxPresetSync(store *presets.Store, boxHost string, logger *slog.Logger) {
+	time.Sleep(30 * time.Second)
+	specs := make([]boxcli.PresetSpec, 0, 6)
+	for _, p := range store.All() {
+		specs = append(specs, boxcli.PresetSpec{
+			Slot: p.Slot, Name: p.Name, StreamURL: boxPresetURL(p),
+			NativeLocation: nativePresetLocation(context.Background(), boxHost, p),
+		})
+	}
+	if len(specs) == 0 {
+		return
+	}
+	logger.Info("starting initial box preset sync", "count", len(specs))
+
+	pending := make(map[int]boxcli.PresetSpec, len(specs))
+	for _, p := range specs {
+		pending[p.Slot] = p
+	}
+
+	for attempt := 0; attempt < 12 && len(pending) > 0; attempt++ {
+		if attempt > 0 {
+			time.Sleep(10 * time.Second)
+		}
+		retrySpecs := make([]boxcli.PresetSpec, 0, len(pending))
+		for _, p := range pending {
+			retrySpecs = append(retrySpecs, p)
+		}
+		// SyncAllPresets returns ONLY the failed slots; absence means the
+		// slot landed. The old loop ranged over the error map and looked for
+		// nil values, which never occur - so successes were re-pushed on all
+		// 12 attempts and "all synced" could never log.
+		errs := boxcli.SyncAllPresets(context.Background(), boxHost, retrySpecs)
+		for _, spec := range retrySpecs {
+			err, failed := errs[spec.Slot]
+			if !failed {
+				delete(pending, spec.Slot)
+				logger.Info("box preset synced", "slot", spec.Slot, "name", spec.Name, "attempt", attempt)
+			} else if attempt == 5 {
+				logger.Warn("box preset sync failed permanently", "slot", spec.Slot, "err", err)
+			} else {
+				logger.Debug("box preset sync fail, retry", "slot", spec.Slot, "attempt", attempt, "err", err)
+			}
+		}
+	}
+	if len(pending) == 0 {
+		logger.Info("all box presets synced successfully")
+	}
+}
+
+// periodicPresetReconcile checks every 5 minutes whether the box still has
+// all stick presets in its own list. Missing slots are restored via
+// boxcli.AddPreset. This way the fix applies automatically without user
+// action when, e.g., the Bose firmware has lost individual entries after a
+// standby cycle.
+func periodicPresetReconcile(store *presets.Store, boxHost string, logger *slog.Logger, wh *webhooks.Store) {
+	// fullDone tracks whether we have done a full re-sync since the box
+	// last became ready. The boot-time preset sync can run before the
+	// box's preset / hardware-button subsystem is fully up; the slots
+	// then show in /presets (so the missing-only path skips them) yet
+	// the physical buttons do not recognise them until a fresh AddPreset
+	// re-registers them once the box is ready. So the FIRST reconcile
+	// after the box leaves OOB re-pushes ALL slots, not just missing
+	// ones. Resets when the box drops back to OOB so a re-provision
+	// re-registers the buttons. Live-confirmed on a taigan Portable
+	// 2026-06-01: buttons 1/2 stayed "empty" until a full re-sync even
+	// though /presets listed them.
+	//
+	// Converge FAST after a cold boot, then idle. A blind 90s pre-wait
+	// meant the hardware buttons stayed unregistered for ~90s+ after every
+	// reboot, so an early press hit "button not assigned". The box
+	// /info / preset subsystem comes up ~20-45s in, so polling every 10s from
+	// 15s wins that first full re-sync as soon as the box is ready, then the
+	// loop drops to a 5 min maintenance cadence. reconcileOnce is gated on the
+	// box being out of OOB and reachable, so the early polls are cheap no-ops
+	// until it is ready. The fast interval re-tightens automatically if the
+	// box later drops back to OOB (ready=false -> fullDone=false).
+	time.Sleep(15 * time.Second)
+	fullDone := false
+	everFullDone := false
+	lastAwakeForce := time.Now()
+	// forceHeld carries a forced pass across iterations while it waits for
+	// playback to stop. The ask that armed it has already been consumed, so
+	// without this the deferral would DROP the re-sync instead of delaying it,
+	// and nothing would re-ask when the music ends. forceHeldSince anchors the
+	// ceiling to the first hold, not to the latest retry.
+	forceHeld := false
+	var forceHeldSince time.Time
+	// groupWakeHeld keeps the group-wake hold line to one per episode, the
+	// same way retryHoldLogged does for the playback hold.
+	groupWakeHeld := false
+	// retryHoldLogged keeps the "retry pass held" line to ONE per hold
+	// episode: the hold is re-evaluated every maintenance tick for as long as
+	// the box sleeps, and a line per tick is noise in the NAND log.
+	retryHoldLogged := false
+	for {
+		force := !fullDone || forceHeld
+		retryDeferred := false
+		retryHeldSrc := ""
+		if force && everFullDone {
+			// A steady-state retry force (failed AddPresets, a transient
+			// /presets read error) is NOT the boot window: gate it like any
+			// other write, or a box whose BoseApp rejects AddPreset overnight
+			// gets hammered with write attempts every 10s all night. Skipping
+			// the pass entirely also keeps the missing-only heal from doing
+			// the same writes through the back door. The BOOT force stays
+			// ungated on purpose: a just-booted box legitimately reads
+			// STANDBY before the first press, and gating it would regress the
+			// first-press-after-reboot registration.
+			if src := boxNowPlayingSource(boxHost); src == "STANDBY" || src == "" {
+				switch retryHoldDecision(src, presetResyncAsk.Load(), presetResyncStandbyOK.Load()) {
+				case retryHoldRunAsk:
+					// User-present evidence (repeated dead-key presses): the
+					// pending ask runs despite the STANDBY reading, exactly as
+					// the routine path below grants it.
+					presetResyncStandbyOK.Store(false)
+					presetResyncAsk.Store(false)
+				default:
+					retryDeferred = true
+					retryHeldSrc = src
+					if !retryHoldLogged {
+						logger.Info("preset reconcile: retry pass held, box in standby or unreadable; resuming on wake or the next maintenance tick")
+						retryHoldLogged = true
+					}
+				}
+			}
+		}
+		if !retryDeferred {
+			retryHoldLogged = false
+		}
+		if !retryDeferred && !force && presetResyncAsk.CompareAndSwap(true, false) {
+			// Dead-key self-heal: a hardware press produced no
+			// selection frame, so the box's key layer likely lost its
+			// registrations even though /presets still lists them.
+			//
+			// Standby gate at the EXECUTION, for every asker: the
+			// OnConnected gate covered only its own ask, while 1036-urgent,
+			// paired-urgent, thumb and late standby-exit asks all wrote into a
+			// sleeping box, and a failed probe used to count as awake. A
+			// deferred ask is DROPPED, not re-armed - the wake itself re-asks
+			// via OnStandbyExit/OnPowerWake (the deferral resets both ask
+			// budgets so those re-asks are accepted), and re-arming would
+			// turn the 10s wake-poll into an all-night probe loop.
+			//
+			// The routine budget is cleared at CONSUME time, before the
+			// up-to-4s probe: a wake re-ask landing DURING the probe must not
+			// be swallowed by the consumed ask's stale rate-limit stamp. On
+			// the awake path the stamp is restored via CAS - if a re-ask
+			// already overwrote the 0, its own fresh stamp wins.
+			lastConsumed := presetResyncLast.Swap(0)
+			if presetResyncStandbyOK.CompareAndSwap(true, false) {
+				// User-present evidence (repeated dead-key presses): this ask
+				// runs even when the box still reads STANDBY.
+				presetResyncLast.CompareAndSwap(0, lastConsumed)
+				force = true
+			} else if src := boxNowPlayingSource(boxHost); src == "STANDBY" || src == "" {
+				deferPresetResyncForStandby(logger, src)
+			} else {
+				presetResyncLast.CompareAndSwap(0, lastConsumed)
+				force = true
+			}
+		}
+		// Periodic dead-key insurance while the box is AWAKE: the
+		// firmware can silently de-register the hardware key layer while
+		// /presets still lists every slot, and on some boxes a dead press
+		// emits no frame at all - so no event-driven heal ever fires. Before
+		// v0.9.21 the accidental every-11-min reconnect re-sync papered over
+		// this; the keepalive fix removed it and one ST10's remote went dead
+		// within an hour. A forced pass every 20 minutes restores that
+		// insurance, gated on the box NOT being in standby: writes to an
+		// awake box never touch the deep-standby countdown, and a box
+		// in standby gets its re-sync from the standby-exit hook the moment
+		// it wakes.
+		if !force && time.Since(lastAwakeForce) > 20*time.Minute {
+			src := boxNowPlayingSource(boxHost)
+			switch {
+			case src == "" || src == "STANDBY":
+				// asleep or unreadable: the standby-exit hook owns the wake
+			case boxIsPlaying(boxHost):
+				// The source NAME alone stopped being enough when presets moved
+				// to the native form. UPNP used to mean "STM's leftover source,
+				// nothing playing" and is on the allowlist for that reason; on a
+				// native box UPNP is STM's own LIVE stream, so the allowlist was
+				// waving the insurance pass straight through a running station.
+				// The allowlist stays (a PAUSED Bluetooth session must still be
+				// left alone, which a play test alone would not catch); this is
+				// the second condition, not a replacement for it.
+				logger.Info("preset reconcile: periodic awake re-sync skipped, the speaker is playing", "source", src)
+			case !resyncSafeSource(src):
+				// The box is on a source the USER chose. AddPreset names
+				// UPNP, and the firmware activates that source on the write:
+				// a field bundle caught the insurance pass yanking a running
+				// BLUETOOTH session to UPNP 43 ms after the re-sync line
+				// (2026-08-02). Dead-key insurance is not worth interrupting
+				// what someone is listening to; the next wake, press or
+				// maintenance tick on our own source re-registers the keys.
+				logger.Info("preset reconcile: periodic awake re-sync skipped, the box is on a user-chosen source", "source", src)
+			default:
+				force = true
+				logger.Info("preset reconcile: periodic awake re-sync (dead-key insurance, #487)")
+			}
+			// Stamp even when skipped in standby: re-check 20 min later, not
+			// every 10 s tick, and the standby-exit hook owns the wake moment.
+			lastAwakeForce = time.Now()
+		}
+		if force {
+			lastAwakeForce = time.Now()
+		}
+		if retryDeferred {
+			// Held pass: no reconcile at all this round (the missing-only
+			// heal would write the same failed slots right back).
+			//
+			// A pending ask cannot run into the sleeping box either, so it is
+			// consumed through the standby deferral (which resets the budgets
+			// so the wake re-asks) BEFORE the wait starts. Until 2026-09-07 the
+			// wait below exited at once on a pending ask this branch never
+			// consumed, and the loop spun: one /now_playing read per pass, some
+			// 25 a second, for as long as the box slept. A field bundle showed
+			// two ST10s in that state for hours, the firmware's syslog ring
+			// and the NAND agent log flooded (4 MB agent.log of one line). The
+			// wait therefore also has a floor of one tick no matter what: an
+			// asker that re-arms straight after the deferral (its budget was
+			// just reset) must not shorten it to zero.
+			if presetResyncAsk.CompareAndSwap(true, false) {
+				deferPresetResyncForStandby(logger, retryHeldSrc)
+			}
+			time.Sleep(10 * time.Second)
+			// Maintenance cadence, but wake early on a fresh ask (= the box
+			// woke up).
+			for waited := 10 * time.Second; waited < 5*time.Minute && !presetResyncAsk.Load(); waited += 10 * time.Second {
+				time.Sleep(10 * time.Second)
+			}
+			continue
+		}
+		// A forced full pass must not run INTO a live hardware recall: the six
+		// AddPresets activate sources and yank the transport the recall is
+		// driving (live ST30 2026-08-19: the wake-press recall and the
+		// box-became-ready full re-sync interleaved, the source flapped
+		// UPNP/LOCAL_INTERNET_RADIO/INVALID_SOURCE, and the press ended in
+		// silence plus a skip storm). Wait the recall out, bounded: the verify
+		// loops stamp activity for at most ~25 s, and the re-sync still runs
+		// right afterwards, so nothing is lost, only ordered.
+		if force {
+			waitedForRecall := false
+			for waited := time.Duration(0); recallActiveWithin(15*time.Second) && waited < 60*time.Second; waited += 2 * time.Second {
+				waitedForRecall = true
+				time.Sleep(2 * time.Second)
+			}
+			if waitedForRecall {
+				logger.Info("preset reconcile: forced pass waited for a live hardware recall to finish before writing")
+			}
+			// ... and it must not run into a GROUP WAKE either. Writing the
+			// native preset elements makes the firmware select
+			// LOCAL_INTERNET_RADIO and start playing. On a speaker that was
+			// already idle nobody ever noticed. On one STM just woke for a
+			// group, the quiet wake's mute has been lifted by the zone join a
+			// second earlier, so the same write is a room full of music nobody
+			// asked for (re-confirmed on v0.9.79: reconcile at 06:26:55.857,
+			// source change to LOCAL_INTERNET_RADIO at 06:26:56.025).
+			//
+			// The window is a deadline, so this can hold for at most half a
+			// minute and the pass runs straight after with the ask still
+			// pending.
+			if groupWakeSettling() {
+				if !groupWakeHeld {
+					groupWakeHeld = true
+					logger.Info("preset reconcile: forced pass held, this speaker was just woken for a group and the write would start music")
+				}
+				time.Sleep(forcedPlayHoldRetry)
+				continue
+			}
+			groupWakeHeld = false
+			// ... and it must not run into live AUDIO either, nor into a
+			// source somebody is using. A recall is over in seconds; a
+			// station plays for hours and a pairing session is mid-handshake,
+			// and the write ends both.
+			src, playing, playKnown := boxSourceAndPlaying(boxHost)
+			hold, ceilingHit := forcedWriteHold(src, playing, playKnown, everFullDone, forceHeldSince, time.Now())
+			switch {
+			case hold:
+				if forceHeldSince.IsZero() {
+					forceHeldSince = time.Now()
+					logger.Info("preset reconcile: forced pass held, the write would take the box off what it is doing",
+						"reason", forcedHoldReason(src, playing, playKnown),
+						"source", src, "ceiling", forcedPlayHoldCeiling.String())
+				}
+				forceHeld = true
+				// Short retry, not the maintenance cadence: the moment the
+				// music stops the keys should be registered, and one
+				// now_playing read per interval only happens while a pass is
+				// actually waiting.
+				time.Sleep(forcedPlayHoldRetry)
+				continue
+			case ceilingHit:
+				logger.Warn("preset reconcile: forced pass ran anyway, the hold ceiling passed and the hardware keys have to be registered",
+					"reason", forcedHoldReason(src, playing, playKnown),
+					"source", src, "heldFor", time.Since(forceHeldSince).Round(time.Second).String())
+			}
+			forceHeld = false
+			forceHeldSince = time.Time{}
+		}
+		ready := reconcileOnce(store, boxHost, logger, force, wh)
+		fullDone = ready
+		if ready {
+			everFullDone = true
+		}
+		if fullDone {
+			// Maintenance cadence, but wake early when the self-heal asked
+			// for a forced re-sync so a dead key recovers in seconds, not
+			// after up to five minutes.
+			for waited := time.Duration(0); waited < 5*time.Minute && !presetResyncAsk.Load(); waited += 10 * time.Second {
+				time.Sleep(10 * time.Second)
+			}
+		} else {
+			time.Sleep(10 * time.Second)
+		}
+	}
+}
+
+// reconcileOnce returns true once the box is out of OOB and reachable.
+// When forceFull is set it re-pushes EVERY stick preset rather than only
+// the slots missing from the box's /presets list (see fullDone above).
+// resyncSafeSource reports whether a preset re-sync may run while the box is
+// on this source. AddPreset names UPNP and the firmware activates that source
+// on the write, so a re-sync is only safe when the box is idle or already on
+// STM's own source. Anything the user picked would be yanked away mid-listen.
+//
+// Deliberately an ALLOWLIST, never a list of sources to avoid: the input
+// sources are named differently per model and we do not know them all. A
+// CineMate reports its TV input as LOCAL where an ST10 says AUX, an SA-5
+// answers AUX with sourceAccount AUX1..AUX3, and the Wave's tuner sources are
+// invisible to STM entirely. With an allowlist an unknown name is treated as
+// "the user chose this", which costs at most one deferred key refresh; a
+// denylist would silently interrupt every model whose source name we forgot.
+func resyncSafeSource(src string) bool {
+	switch src {
+	case "UPNP", "INVALID_SOURCE":
+		return true
+	default:
+		return false
+	}
+}
+
+// forcedPlayHoldCeiling bounds how long a forced re-sync may wait for playback
+// to stop. Hardware keys that are not registered are silent damage nobody sees
+// until they press one, so the wait must end. Five minutes is long enough to
+// cover a track, short enough that a key is never dead for a whole album.
+const forcedPlayHoldCeiling = 5 * time.Minute
+
+// forcedPlayHoldRetry is how often the held pass re-asks the box. One
+// now_playing read per interval, and only while a forced pass is actually
+// waiting, so a speaker that is not being written to is never polled for this.
+const forcedPlayHoldRetry = 30 * time.Second
+
+// forcedWriteHold decides whether a forced full re-sync must wait because audio
+// is flowing right now.
+//
+// The write itself is the problem, not the source it happens on: six AddPresets
+// name UPNP and the firmware activates that source, so the box leaves whatever
+// it is rendering. Until now only the 20-minute insurance pass was gated at all
+// (resyncSafeSource, on the source NAME), while every FORCED asker - power-wake,
+// standby-exit, reconnect, paired, 1036 - wrote unconditionally.
+//
+// Field evidence, ST20 on v0.9.55, 2026-08-22 20:55: the user switched the box
+// on, STM resumed his station over UPnP and it was playing (ICY titles at
+// :27.5 and :29.4), then the power-wake re-sync wrote six slots at :32.4. The
+// source flipped UPNP -> LOCAL_INTERNET_RADIO -> STANDBY within 290 ms and the
+// music was gone after six seconds. STM's own forensics line names it:
+// "the box changed source across a preset write, before=UPNP after=STANDBY".
+//
+// A hold, never a skip: the keys still have to end up registered, so the wait
+// is bounded and the pass runs anyway once the ceiling passes.
+//
+// The FIRST full registration after the agent starts is never held. A
+// just-started agent may find the box already playing, and holding there would
+// leave the hardware keys unregistered for the whole session - the regression
+// was about. everFullDone false means that first pass has not happened yet.
+//
+// Audio is not the only thing a write interrupts, which is what cost. A
+// speaker in Bluetooth pairing mode reports playStatus INVALID, so the play
+// test above says "not playing" and the hold waved the write through. That
+// reporter's ledger reads addpreset@BLUETOOTH 3, and his box flipped
+// BLUETOOTH -> LOCAL_INTERNET_RADIO -> BLUETOOTH four times inside six seconds
+// while his PC was searching for it. So the source NAME decides too, exactly as
+// it has for the insurance pass since 2026-08-02.
+func forcedWriteHold(src string, playing, playKnown, everFullDone bool, heldSince, now time.Time) (hold, ceilingHit bool) {
+	if !everFullDone {
+		return false, false
+	}
+	if !forcedWriteBusy(src, playing, playKnown) {
+		return false, false
+	}
+	if heldSince.IsZero() {
+		return true, false
+	}
+	if now.Sub(heldSince) >= forcedPlayHoldCeiling {
+		return false, true
+	}
+	return true, false
+}
+
+// forcedWriteBusy reports whether the box is doing something the write would
+// take away from it: audio is flowing, or it sits on a source somebody chose.
+//
+// STANDBY and an unreadable source are the two additions over resyncSafeSource.
+// A sleeping box is the ideal moment to register hardware keys and holding
+// there would delay every wake by the ceiling, and a now_playing read that
+// failed says nothing at all: letting one slow answer defer the write for five
+// minutes would strand the keys on a box that is merely busy booting.
+func forcedWriteBusy(src string, playing, playKnown bool) bool {
+	if playKnown && playing {
+		return true
+	}
+	switch src {
+	case "", "STANDBY":
+		return false
+	case "LOCAL_INTERNET_RADIO":
+		// STM's OWN source on a native-preset box, and the same argument that
+		// puts UPNP on the allowlist applies to it: a station that has stopped
+		// is STM's leftover source, not something the user is listening to.
+		// Without this a box idling on a stopped native station counts as busy
+		// and defers the dead-key self-heal by the full ceiling, and
+		// that heal's whole promise is that a dead key comes back in seconds.
+		// Only when the play state was actually READ. An unreadable box on this
+		// source may well be playing, and guessing wrong there is the
+		// interruption again.
+		return !playKnown || playing
+	}
+	return !resyncSafeSource(src)
+}
+
+// forcedHoldReason names which of the two conditions held the pass, so a
+// bundle says whether a stream or a pairing session was protected.
+func forcedHoldReason(src string, playing, playKnown bool) string {
+	if playKnown && playing {
+		return "playing"
+	}
+	if !forcedWriteBusy(src, playing, playKnown) {
+		return "free"
+	}
+	return "user-chosen source"
+}
+
+func reconcileOnce(store *presets.Store, boxHost string, logger *slog.Logger, forceFull bool, wh *webhooks.Store) bool {
+	stick := store.All()
+	// Keys configured as "webhook only" need a placeholder even when the store
+	// is completely empty, which is the shape the second reporter was in:
+	// no presets anywhere, six dead keys, and a webhook that could never fire.
+	hookSlots := webhookOnlySlots(wh, stick)
+	if len(stick) == 0 && len(hookSlots) == 0 {
+		// Nothing to register, but the box may still list the keys of a
+		// removed install: read once, prune them, then idle at the
+		// maintenance cadence. See preset_recovery.go.
+		return pruneStaleKeysOnEmptyStore(store, wh, boxHost, logger)
+	}
+	// A forced full re-sync is exactly the moment the box's source registration
+	// may have changed (it follows a re-association or a box that just became
+	// ready), so do not decide the preset form from a stale cached verdict.
+	if forceFull {
+		invalidateNativeRadioReady()
+	}
+	// Do not push presets while the box is still in out-of-box setup.
+	// In OOB the Marge state machine is NotAssociated, so every
+	// AddPreset fails with "MargeHSM is in the wrong state" and just
+	// spams BoseApp's log (and ours) once per cycle. Wait until the box
+	// has joined a network. Live-observed on a taigan Portable in OOB,
+	// 2026-05-31.
+	if boxInSetupOOB(boxHost) {
+		logger.Debug("preset reconcile: box still in OOB setup (MargeHSM not associated), skipping until it joins a network")
+		return false
+	}
+	entries, err := fetchBoxPresetsFullFn(boxHost)
+	if err != nil {
+		logger.Debug("preset reconcile: box presets not readable", "err", err)
+		return false
+	}
+	// The read this pass makes anyway refreshes the webui's box-preset cache
+	// that cache was fed only by gabbo frames and the boot seed, so it
+	// could serve the desktop a list hours stale. No extra :8090 read, no
+	// timer; the composition root decides what an empty list means.
+	publishBoxPresetList(entries)
+	boxLocs := make(map[int]string, len(entries))
+	for _, e := range entries {
+		boxLocs[e.Slot] = e.Location
+	}
+	// A box-side EMPTY list while STM's store has presets is the "all presets
+	// suddenly empty" field state (Wave 2026-07-25: keys dead by evening, a
+	// plug pull did not restore them). WARN with both counts so the bundle
+	// shows the loss moment and whether the re-registration below healed it or
+	// the per-slot AddPreset failures explain why the keys stayed dead.
+	if len(boxLocs) == 0 {
+		logger.Warn("preset forensics: box reports an EMPTY preset list while the STM store has presets (box lost its key registrations; re-registering now)",
+			"storeCount", len(stick))
+	}
+	// Add the STM store presets the box is missing (or all, on a forced full
+	// re-sync). stmSlots also drives the prune pass below.
+	//
+	// A slot the box already has is rewritten in one more case: it still holds
+	// the old UPnP form while this box can take a native radio station. That is
+	// the migration for every speaker installed before native presets existed.
+	// Without it nothing would ever change on them, because the slot is present
+	// and a present slot is never re-written.
+	stmSlots := map[int]bool{}
+	var missing []boxcli.PresetSpec
+	migrated, reverted, reowned := 0, 0, 0
+	for _, p := range stick {
+		stmSlots[p.Slot] = true
+		native := nativePresetLocation(context.Background(), boxHost, p)
+		loc, onBox := boxLocs[p.Slot]
+		boxHasNative := onBox && isNativeRadioLocation(loc)
+		upgradable := onBox && native != "" && !boxHasNative && isOwnBoxPresetLocation(loc)
+		// The reverse case matters just as much: the slot is stored natively but
+		// this box can no longer take that form (the radio source did not
+		// register on this boot, or the native write was latched off). Leaving it
+		// would point a hardware key at a source the box cannot enter, which is a
+		// DEAD key - strictly worse than the UPnP form it replaced. Put it back.
+		stale := boxHasNative && native == ""
+		// A slot the box already holds natively is otherwise left alone, and
+		// that is right: every write wakes the speaker and restarts its standby
+		// countdown. One case has to be an exception. Until v0.9.36 a station
+		// logo was judged by the file extension of its URL, so stations whose
+		// logo came from the icon fallback (it answers .ico URLs with PNG bytes)
+		// had STM's stand-in written into the slot. The judgement is fixed, but
+		// the slot keeps what it was given, and the owner sees one station with
+		// a picture and the next without and cannot tell why.
+		//
+		// So: repair a slot that carries our stand-in when the preset now
+		// resolves to a real picture. The condition stops holding as soon as the
+		// rewrite lands, so this is one write per affected slot, once, and never
+		// a recurring one.
+		relogo := boxHasNative && native != "" &&
+			webui.StationLocationCarriesStandInLogo(loc) &&
+			!webui.StationLocationCarriesStandInLogo(native)
+		// The second exception: a native slot the speaker stored ITSELF. Its
+		// hold-to-store gesture keeps the playing item as is, so the slot
+		// fetches whatever the station was playing from (the ad-hoc raw proxy
+		// of an app play) rather than this slot's own stream proxy. STM's store
+		// got the station from marge at that moment (holdstore.go); the slot
+		// is rewritten once onto its own form, and the condition stops holding
+		// as soon as that lands, so this too is one write per slot.
+		reown := boxHasNative && native != "" &&
+			!webui.NativeLocationIsOwnSlotProxy(loc, p.Slot)
+		switch {
+		case upgradable:
+			migrated++
+		case stale:
+			reverted++
+		case reown:
+			reowned++
+		}
+		if forceFull || !onBox || upgradable || stale || relogo || reown {
+			missing = append(missing, boxcli.PresetSpec{
+				Slot: p.Slot, Name: p.Name, StreamURL: boxPresetURL(p),
+				NativeLocation: native,
+			})
+		}
+	}
+	// Claim the "webhook only" keys AFTER the store loop, so a slot that has a
+	// real preset is never treated as one (webhookOnlySlots already excludes
+	// those, this ordering just keeps stmSlots authoritative for the prune).
+	//
+	// stmSlots is set for every hook slot, including the ones left alone below,
+	// so the prune cannot delete the placeholder it just wrote. Turning the
+	// webhook off drops the slot out of hookSlots again, which drops it out of
+	// stmSlots, and the existing prune pass removes the placeholder by itself.
+	placeholders := 0
+	for _, slot := range hookSlots {
+		stmSlots[slot] = true
+		loc, onBox := boxLocs[slot]
+		switch {
+		case onBox && !isOwnBoxPresetLocation(loc):
+			// A foreign entry (a box-cached Deezer or TuneIn preset) already
+			// occupies the key, so the firmware reports the press and the
+			// webhook is reached. Never overwrite what the user has there.
+			continue
+		case onBox && isNativeRadioLocation(loc):
+			// A leftover native station from an earlier install: the firmware
+			// plays that form ITSELF, so replace mode could not withhold it.
+			// Rewrite it in the UPnP form STM drives.
+		case onBox && !forceFull:
+			continue
+		}
+		// NativeLocation is deliberately left empty. A native slot is played by
+		// the box without asking STM, so the one thing replace mode has to do,
+		// withhold the audio, would be impossible.
+		missing = append(missing, boxcli.PresetSpec{
+			Slot: slot, Name: webhookPlaceholderName, StreamURL: boxurl.StreamSlot(slot),
+		})
+		placeholders++
+	}
+	if placeholders > 0 {
+		logger.Info("preset reconcile: placing a placeholder on webhook-only keys, an empty key is refused by the box and never reports its press (#536)",
+			"slots", placeholders)
+	}
+	if migrated > 0 {
+		logger.Info("preset migration: rewriting UPnP slots as native radio stations, so the box activates its own hardware keys instead of refusing them (1036)",
+			"slots", migrated)
+	}
+	if reverted > 0 {
+		logger.Warn("preset migration: the box no longer offers the native radio source, putting those slots back on the UPnP form so the keys keep working",
+			"slots", reverted)
+	}
+	if reowned > 0 {
+		logger.Info("preset reconcile: rewriting slots the speaker stored itself (hold gesture) onto their own stream proxy",
+			"slots", reowned)
+	}
+	syncFailed := false
+	// The FORCED pass is held while the box is on a source somebody picked
+	// (forcedWriteHold, above). The routine pass was not, and it writes too:
+	// a slot that falls out of the box's own /presets list is healed right
+	// here, with no source check at all. So the interruption could still
+	// arrive through this door, on a speaker that happened to lose a key while
+	// its owner was pairing a phone or listening on AUX.
+	//
+	// Hand it to the forced pass instead of writing now. That one already has
+	// the bounded hold, the five-minute ceiling and the log line saying what
+	// was protected, so the key is still registered shortly after the source
+	// frees up, or at the ceiling at the latest.
+	if len(missing) > 0 && !forceFull {
+		if src, playing, playKnown := boxSourceAndPlaying(boxHost); forcedWriteBusy(src, playing, playKnown) {
+			logger.Info("preset reconcile: missing slots held, the write would take the box off what it is doing",
+				"reason", forcedHoldReason(src, playing, playKnown), "source", src, "slots", len(missing))
+			requestPresetKeyResync(logger, "missing-slots-held")
+			missing = nil
+		}
+	}
+	if len(missing) > 0 {
+		if forceFull {
+			logger.Info("preset reconcile: full re-sync after box became ready (registers hardware buttons)", "slots", len(missing))
+		} else {
+			logger.Info("preset reconcile: missing slots on box, syncing", "missing", len(missing))
+		}
+		// SyncAllPresets returns ONLY failed slots; the old nil-check here
+		// could never fire, so healed slots never logged and - worse -
+		// persistent AddPreset failures were swallowed silently, invisible
+		// in every diagnostic bundle.
+		// Forensics for the "the speaker turns itself on" reports (and
+		// the 2026-08-02 bundle): AddPreset names UPNP as its source, and the
+		// firmware appears to ACTIVATE that source on the write, so a re-sync
+		// into a sleeping box can wake it. The ledger already records the
+		// source before the write; capture it again right after so a bundle
+		// shows the flip as cause and effect instead of correlation, and name
+		// which slot the batch started with (the flip lands ~23-43 ms in, i.e.
+		// during the FIRST AddPreset, not the batch as a whole).
+		srcBefore := boxNowPlayingSource(boxHost)
+		boxwrites.NoteN("addpreset", srcBefore, len(missing))
+		errs := boxcli.SyncAllPresets(context.Background(), boxHost, missing)
+		if srcAfter := boxNowPlayingSource(boxHost); srcAfter != srcBefore {
+			logger.Warn("preset forensics: the box changed source across a preset write",
+				"before", srcBefore, "after", srcAfter, "slots", len(missing),
+				"firstSlot", missing[0].Slot, "forced", forceFull)
+		}
+		// "Accepted by the CLI" is not "on the box". The firmware takes an
+		// AddPreset it will not keep and stores nothing, and it does that in
+		// bulk while it is between sources: a speaker whose write ledger reads
+		// addpreset@INVALID_SOURCE eight times over had four slots logged as
+		// healed and four dead hardware keys (2026-09-27). The log said the
+		// opposite of the truth, which cost a day of looking in the wrong place.
+		//
+		// So nothing claims to have healed until the box has been read back. The
+		// native path below does its own readback and re-write on top; this one
+		// covers every form, which is what was missing, because the UPnP form
+		// got no verification at all.
+		var accepted []boxcli.PresetSpec
+		for _, spec := range missing {
+			if serr, failed := errs[spec.Slot]; failed {
+				syncFailed = true
+				logger.Warn("preset reconcile: AddPreset failed", "slot", spec.Slot, "err", serr)
+				continue
+			}
+			accepted = append(accepted, spec)
+		}
+		if len(accepted) > 0 {
+			landed, lost := splitWritesByWhatTheBoxKept(boxHost, accepted)
+			for _, slot := range landed {
+				logger.Info("preset reconcile healed", "slot", slot)
+			}
+			if len(lost) > 0 {
+				syncFailed = true
+				logger.Warn("preset reconcile: the box accepted these writes and kept none of them; the hardware keys for them are dead until a retry lands",
+					"slots", lost, "source", boxNowPlayingSource(boxHost))
+			}
+		}
+		// Read the slots back before believing the sweep, and re-write the ones
+		// that did not land. A native AddPreset the firmware does not like is
+		// accepted at the CLI and stores NOTHING, which reads as six healed
+		// slots in the log while the hardware keys are dead.
+		//
+		// Retrying matters because the misses are not random: measured on an
+		// ST10 across several reboots, it is the FIRST writes of the first
+		// sweep after a boot that vanish (the store is written in a fixed
+		// order and slots 2 and 3 lead it), while the UPnP form for the very
+		// same slots succeeds moments later. So the firmware is briefly
+		// willing to take a preset but not yet able to keep a native one, even
+		// though it already advertises the radio source as READY. A short
+		// backoff turns that into a non-event.
+		if wroteNative(missing) {
+			if lost := verifyNativeWrites(boxHost, missing, logger); len(lost) > 0 {
+				disableNativePresets(fmt.Sprintf("slots %v stayed empty after a native write", lost))
+				syncFailed = true // keep the fast cadence so UPnP is restored now
+			} else {
+				noteNativeWriteLanded()
+			}
+		}
+	}
+	// Prune STM-owned box presets the store no longer backs, so a stale preset
+	// from an earlier install does not linger as a dead button. The box's Bose
+	// firmware keeps its preset list across an STM reinstall, but STM's store is
+	// fresh, so those slots show a name yet cannot play (the store stream URL is
+	// gone) - the reporter saw old presets reappear after a reinstall and not
+	// work. Remove ONLY locations STM itself wrote (strict boxurl shape, not the
+	// loose "/stream/" substring match, which could misread a foreign Icecast
+	// URL containing /stream/ as STM-owned and delete a working box preset); a
+	// foreign preset (e.g. a box-cached Deezer entry) or any slot STM does have
+	// is left untouched. The selection is staleStrSlots (preset_recovery.go),
+	// which also recognises the relative native form the speaker
+	// reports STM's own keys in.
+	pruneBoxSlots(boxHost, staleStrSlots(boxLocs, stmSlots), logger)
+	// A pass with failed AddPresets is NOT done: returning true here dropped
+	// the loop to the 5-minute maintenance cadence while the box's key layer
+	// stayed empty, which is exactly the "hardware keys dead for ~6.5 minutes
+	// after every power cycle" window in the field bundles (a just-booted
+	// BoseApp accepts GET /presets but rejects AddPreset for a while). Report
+	// not-ready so the 10s fast cadence retries until every slot registered.
+	if syncFailed {
+		logger.Warn("preset reconcile: some AddPresets failed, keeping the fast retry cadence")
+		return false
+	}
+	return true
+}
+
+// fetchBoxPresets reads GET /presets from the Bose API and returns each set
+// slot's ContentItem location (slot -> location URL). The location is what tells
+// STM-owned presets (its own /stream/ or /spotify/ URLs) apart from foreign ones,
+// so the reconcile can prune only its own stale entries and never a box-native
+// preset.
+func fetchBoxPresets(boxHost string) (map[int]string, error) {
+	entries, err := fetchBoxPresetsFull(boxHost)
+	if err != nil {
+		return nil, err
+	}
+	out := map[int]string{}
+	for _, e := range entries {
+		out[e.Slot] = e.Location
+	}
+	return out, nil
+}
+
+// boxPresetEntry is one slot of the box's own :8090/presets list, with enough
+// ContentItem detail to seed the webui's box-native snapshot and to identify a
+// lost STM preset for the store recovery.
+type boxPresetEntry struct {
+	Slot     int
+	Location string
+	Name     string
+	Source   string
+	Type     string
+	Account  string
+}
+
+// fetchBoxPresetsFull reads GET /presets and returns each set slot's
+// ContentItem fields.
+func fetchBoxPresetsFull(boxHost string) ([]boxPresetEntry, error) {
+	client := http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://%s:8090/presets", boxHost))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var out []boxPresetEntry
+	// Bose format: <presets><preset id="1" ...><ContentItem location="..."/></preset></presets>
+	for _, blk := range presetBlockRegex.FindAllStringSubmatch(string(body), -1) {
+		slot := 0
+		fmt.Sscanf(blk[1], "%d", &slot)
+		if slot < 1 || slot > 6 {
+			continue
+		}
+		e := boxPresetEntry{Slot: slot}
+		if m := presetLocationRegex.FindStringSubmatch(blk[0]); m != nil {
+			e.Location = m[1]
+		}
+		if m := presetItemNameRegex.FindStringSubmatch(blk[0]); m != nil {
+			e.Name = xmlEntityUnescape(m[1])
+		}
+		if m := presetSourceRegex.FindStringSubmatch(blk[0]); m != nil {
+			e.Source = m[1]
+		}
+		if m := presetTypeRegex.FindStringSubmatch(blk[0]); m != nil {
+			e.Type = m[1]
+		}
+		if m := presetAccountRegex.FindStringSubmatch(blk[0]); m != nil {
+			e.Account = m[1]
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+// xmlEntityUnescape reverses the five predefined XML entities in text content
+// (Bose escapes station names like "Pop & Rock" in /presets).
+var xmlEntityReplacer = strings.NewReplacer(
+	"&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&apos;", "'")
+
+func xmlEntityUnescape(s string) string { return xmlEntityReplacer.Replace(s) }
+
+// margeXMLEscape escapes user-provided text (station names, art URLs) for the
+// marge preset template, which is a text/template and does not escape XML.
+var margeXMLEscaper = strings.NewReplacer(
+	"&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;", "'", "&apos;")
+
+func margeXMLEscape(s string) string { return margeXMLEscaper.Replace(s) }
+
+// firstArtURL returns the first entry of a pipe-separated art fallback chain
+// (how preset.Art is persisted); the box only ever gets one URL.
+func firstArtURL(art string) string {
+	if idx := strings.Index(art, "|"); idx >= 0 {
+		return art[:idx]
+	}
+	return art
+}
+
+// seedBoxPresetsAndRecoverStore runs once in the background at agent start.
+// Two jobs (the ST20 whose presets showed "unassigned although they are
+// assigned"):
+//
+//  1. Seed the webui's box-native preset snapshot from :8090/presets. The
+//     snapshot otherwise stays empty until the box happens to emit a gabbo
+//     presetsUpdated frame, so the app showed every slot as unassigned even
+//     though the box's own list still held them.
+//  2. If the NAND preset store came up EMPTY while the box still lists STM's
+//     own /stream/ presets, the store was lost (the pre-v0.9.14 non-durable
+//     save left presets.json at 0 bytes after a standby power-cut; the loss
+//     surfaced when the OTA restarted the agent). Every hardware press then
+//     404s at the stream proxy: the buttons are dead although the box's key
+//     layer works. Restore what the recently-played history can identify by
+//     exact station/playlist name, so the buttons come back without the user
+//     re-saving every slot.
+//
+// firstAttempt (nil = none) is called exactly once, right after the FIRST
+// :8090/presets read attempt returns, success or not. main gates autopair's
+// first forced re-assert on it: that re-assert makes the box re-read its cloud
+// presets from marge, and with an EMPTY stick store marge answers an empty
+// list, which wipe-prone firmwares translate into dropping their own preset
+// list within seconds - i.e. the re-onboarding at t=8s destroyed the very box
+// list this recovery wanted to read at t=20s, and the presets were lost for
+// good on exactly the warm-restart (OTA) case the recovery targets.
+// Reading first, then pairing, closes the race.
+func seedBoxPresetsAndRecoverStore(store *presets.Store, recentStore *recent.Store, boxHost string, seed func([]webui.BoxPreset), logger *slog.Logger, firstAttempt func()) {
+	// Whatever happens below, the empty-store prune may run once this returns
+	// (preset_recovery.go): it must never delete the slots this recovery
+	// reads its evidence from.
+	defer presetRecoverySettled.Store(true)
+	if boxHost == "" || store == nil {
+		if firstAttempt != nil {
+			firstAttempt()
+		}
+		return
+	}
+	// First read attempt runs IMMEDIATELY: on a warm agent restart (OTA) the
+	// box answers right away, and the snapshot must be taken before autopair's
+	// first forced re-assert (see firstAttempt above). Only a cold boot - where
+	// :8090 needs ~60s to come up - falls back to the gentle 20s polling, which
+	// gives up quietly after ~10 minutes (the periodic reconcile keeps running
+	// regardless).
+	var entries []boxPresetEntry
+	for i := 0; i < 30; i++ {
+		if i > 0 {
+			time.Sleep(20 * time.Second)
+		}
+		var err error
+		entries, err = fetchBoxPresetsFullFn(boxHost)
+		if i == 0 && firstAttempt != nil {
+			firstAttempt()
+		}
+		if err == nil {
+			break
+		}
+		entries = nil
+	}
+	// The verdict goes to /api/debug/state (preset_recovery) whichever way
+	// this ends, so a bundle can say what the recovery saw (a bundle
+	// from a reinstalled speaker could not tell whether the dead keys were
+	// ever read, because a recovery that restored nothing logged nothing).
+	verdict := presetRecoveryVerdict{At: time.Now().Format(time.RFC3339), BoxSlots: len(entries)}
+	defer func() { setPresetRecoveryVerdict(verdict) }()
+	if len(entries) == 0 {
+		verdict.Reason = "no-box-list"
+		return
+	}
+	if seed != nil {
+		bps := boxPresetsFromEntries(entries)
+		seed(bps)
+		logger.Info("box preset snapshot seeded from :8090/presets", "slots", len(bps))
+	}
+	stmOrigin := 0
+	for _, e := range entries {
+		if isOwnBoxPresetLocation(e.Location) {
+			stmOrigin++
+		}
+	}
+	verdict.StmOriginSlots = stmOrigin
+	if len(store.All()) > 0 {
+		verdict.Reason = "store-not-empty"
+		return
+	}
+	if stmOrigin == 0 {
+		verdict.Reason = "no-stm-origin-slots"
+		return
+	}
+	var recents []recent.Entry
+	if recentStore != nil {
+		recents = recentStore.All()
+	}
+	verdict.HistoryEntries = len(recents)
+	recovered := 0
+	for _, e := range entries {
+		if !isOwnBoxPresetLocation(e.Location) || e.Name == "" {
+			continue
+		}
+		if _, exists := store.Get(e.Slot); exists {
+			continue
+		}
+		wantSpotify := strings.Contains(e.Location, "/spotify/")
+		// Newest matching history entry wins (the ring is oldest-first).
+		for i := len(recents) - 1; i >= 0; i-- {
+			r := recents[i]
+			if r.CardName != e.Name || r.CardURL == "" {
+				continue
+			}
+			if wantSpotify != (r.Source == "spotify") {
+				continue
+			}
+			p := presets.Preset{Slot: e.Slot, Name: e.Name, Art: r.CardArt, Homepage: r.Homepage}
+			if wantSpotify {
+				p.Type = "spotify"
+				p.URI = r.CardURL
+				p.Account = r.Account
+			} else {
+				p.Type = "radio"
+				p.StreamURL = r.CardURL
+			}
+			if err := store.SetSlot(p); err != nil {
+				logger.Warn("preset store recovery: could not save recovered slot", "slot", e.Slot, "err", err)
+			} else {
+				// Warn on purpose: this must be visible in a diagnostic bundle.
+				logger.Warn("preset store recovery: restored a lost preset from the recently-played history",
+					"slot", e.Slot, "name", e.Name, "type", p.Type)
+				recovered++
+			}
+			break
+		}
+	}
+	verdict.Recovered = recovered
+	// The seed above went out against the empty store, so its Lost verdicts
+	// named the very slots that are back now. Publish the list once more
+	// (a fresh slice: the cache holds the first one) so the desktop does not
+	// call a recovered key dead until the next reconcile read.
+	if recovered > 0 && seed != nil {
+		seed(boxPresetsFromEntries(entries))
+	}
+	switch {
+	case recovered > 0:
+		verdict.Reason = "ok"
+	case len(recents) == 0:
+		verdict.Reason = "no-history"
+	default:
+		verdict.Reason = "no-name-match"
+	}
+	// WARN on purpose, and ALWAYS in this state: an empty store facing STM's
+	// own keys on the box is either a wiped store (the pre-v0.9.14 standby
+	// power-cut) or a removed-and-reinstalled STM, and a bundle must
+	// show which and what was done about it. "no-history" with an empty
+	// store is the reinstall signature: the removal took the history too.
+	logger.Warn("preset store recovery: store empty, box lists STM-origin slots",
+		"boxSlots", len(entries), "stmOriginSlots", stmOrigin, "historyEntries", len(recents),
+		"recovered", recovered, "reason", verdict.Reason)
+}
+
+// presetBlockRegex captures one <preset id="N" ...> ... </preset> block; (?s)
+// lets . span the newlines Bose puts inside the block. presetLocationRegex then
+// pulls the ContentItem location out of that block.
+var presetBlockRegex = regexp.MustCompile(`(?s)<preset id="(\d+)".*?</preset>`)
+var presetLocationRegex = regexp.MustCompile(`location="([^"]*)"`)
+var presetItemNameRegex = regexp.MustCompile(`<itemName>([^<]*)</itemName>`)
+var presetSourceRegex = regexp.MustCompile(`source="([^"]*)"`)
+var presetTypeRegex = regexp.MustCompile(`type="([^"]*)"`)
+var presetAccountRegex = regexp.MustCompile(`sourceAccount="([^"]*)"`)

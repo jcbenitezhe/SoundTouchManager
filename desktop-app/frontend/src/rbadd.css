@@ -1,0 +1,138 @@
+/* "Add to Radio Browser" dialog (rbadd.js). */
+
+.rb-modal { align-items: flex-start; overflow-y: auto; padding: 24px 0; }
+.rb-add {
+  max-width: 620px;
+  background: var(--c-surface);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius);
+}
+.rb-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.rb-head h3 { margin: 0; }
+.rb-x {
+  border: 0;
+  background: transparent;
+  color: var(--c-muted);
+  font-size: 26px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+}
+.rb-search-row { display: flex; gap: 8px; margin: 8px 0 12px; }
+.rb-search-row input { flex: 1; min-width: 0; }
+.rb-search-row select { flex: 0 1 200px; min-width: 0; }
+.rb-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.rb-footer { justify-content: flex-end; margin-top: 16px; }
+.rb-note { color: var(--c-muted); font-size: 13px; }
+.rb-busy-line { display: flex; align-items: center; gap: 8px; }
+.rb-error { color: #d93025; font-size: 13px; }
+.rb-success { font-size: 17px; font-weight: 700; margin: 8px 0; }
+.rb-ready {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-weight: 700;
+  color: #137333;
+  background: color-mix(in srgb, #1e8e3e 12%, transparent);
+}
+
+.rb-offer {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+}
+.rb-offer p { margin: 0 0 8px; }
+.rb-offer-strong { border-color: var(--brand-border); background: var(--brand-bg); }
+
+.rb-results { display: flex; flex-direction: column; gap: 10px; }
+.rb-card {
+  padding: 10px 12px;
+  border: 1px solid var(--c-border);
+  border-left-width: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--c-surface);
+  font-size: 13px;
+}
+.rb-card.rb-working { border-left-color: #1e8e3e; }
+.rb-card.rb-broken { border-left-color: #d93025; }
+.rb-card.rb-unknown { border-left-color: #f9ab00; }
+.rb-card-top { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.rb-card-title { display: flex; flex-direction: column; min-width: 0; }
+.rb-status { font-size: 12px; color: var(--c-muted); }
+.rb-kv { display: flex; gap: 8px; margin: 2px 0; min-width: 0; }
+.rb-kv > span:first-child { flex: none; width: 110px; color: var(--c-muted); }
+.rb-kv code { overflow-wrap: anywhere; font-size: 12px; }
+.rb-uuid code { color: var(--c-faint); }
+
+.rb-play { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 6px 0 8px; }
+.rb-play-state { font-size: 12px; color: var(--c-muted); }
+.rb-play[data-state="playing"] .rb-play-state { color: #1e8e3e; font-weight: 600; }
+.rb-play[data-state="error"] .rb-play-state { color: #d93025; }
+
+.rb-fav { width: 36px; height: 36px; border-radius: 8px; object-fit: contain; background: var(--c-surface-2); flex: none; }
+.rb-fav-empty { display: inline-block; }
+.rb-fav-lg { width: 56px; height: 56px; margin-top: 6px; }
+
+.rb-form { display: flex; flex-direction: column; gap: 10px; }
+.rb-field { display: flex; flex-direction: column; gap: 4px; }
+.rb-field > span { font-weight: 600; font-size: 13px; }
+.rb-field small { color: var(--c-faint); font-size: 12px; }
+.rb-field .btn-mini { align-self: flex-start; }
+.rb-check { margin-top: 4px; font-size: 13px; }
+.rb-check.rb-broken { color: #d93025; }
+.rb-warn { color: #b06000; }
+
+.rb-preview { display: flex; align-items: center; gap: 12px; margin: 8px 0 12px; }
+.rb-preview b { font-size: 17px; }
+.rb-problems, .rb-warnings {
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.rb-problems { background: color-mix(in srgb, #d93025 10%, transparent); border: 1px solid color-mix(in srgb, #d93025 40%, transparent); }
+.rb-warnings { background: color-mix(in srgb, #f9ab00 10%, transparent); border: 1px solid color-mix(in srgb, #f9ab00 40%, transparent); }
+.rb-problems ul, .rb-warnings ul { margin: 4px 0 0; padding-left: 18px; }
+.rb-dups { margin: 0 0 10px; display: flex; flex-direction: column; gap: 8px; }
+.rb-dups summary { cursor: pointer; font-size: 13px; }
+
+.rb-payload { width: 100%; border-collapse: collapse; font-size: 13px; margin: 4px 0 8px; }
+.rb-payload th, .rb-payload td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--c-border); vertical-align: top; }
+.rb-payload th { width: 130px; color: var(--c-muted); font-weight: 600; }
+.rb-payload code { overflow-wrap: anywhere; }
+.rb-confirm { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 14px; }
+
+.search-addhint-actions .btn-primary { margin-right: 6px; }
+
+/* Phone: the dialog takes the whole screen, with the same large text as the
+   rest of the mobile app. */
+html.stm-mobile .rb-modal { padding: 0; background: var(--c-bg); }
+html.stm-mobile .rb-add {
+  width: 100%;
+  max-width: none;
+  min-height: 100vh;
+  border: 0;
+  border-radius: 0;
+  padding: 16px;
+  font-size: 16px;
+}
+html.stm-mobile .rb-head h3 { font-size: 22px; }
+html.stm-mobile .rb-x { font-size: 34px; }
+html.stm-mobile .rb-add input[type="text"],
+html.stm-mobile .rb-add input[type="url"] { font-size: 17px; min-height: 48px; }
+html.stm-mobile .rb-add .btn { min-height: 48px; font-size: 17px; }
+html.stm-mobile .rb-search-row { flex-wrap: wrap; }
+html.stm-mobile .rb-search-row input { flex-basis: 100%; }
+html.stm-mobile .rb-search-row select { flex: 1 1 0; min-height: 48px; font-size: 17px; }
+html.stm-mobile .rb-footer { justify-content: stretch; }
+html.stm-mobile .rb-footer .btn { flex: 1 1 140px; }
+html.stm-mobile .rb-kv { flex-direction: column; gap: 0; }
+html.stm-mobile .rb-kv > span:first-child { width: auto; }
+html.stm-mobile .rb-card, html.stm-mobile .rb-payload, html.stm-mobile .rb-note,
+html.stm-mobile .rb-problems, html.stm-mobile .rb-warnings { font-size: 15px; }
+html.stm-mobile .rb-payload th { width: 105px; }
+html.stm-mobile .rb-play .btn { flex: 1 1 0; min-width: 0; padding-left: 4px; padding-right: 4px; white-space: nowrap; font-size: 16px; }
+html.stm-mobile .rb-play [data-act="play"] { flex-grow: 1.4; }
+html.stm-mobile .rb-play-state { flex-basis: 100%; font-size: 15px; }

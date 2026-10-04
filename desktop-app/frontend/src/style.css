@@ -1,0 +1,3026 @@
+/*
+ * Farb System:
+ *   --brand           Marke + interaktive Elemente (Tabs, Highlights, CTAs)
+ *   --signal-green    NUR fuer "spielt" / online ok / Erfolg
+ *   --signal-yellow   NUR fuer "buffering" / Update verfuegbar / Achtung
+ *   --signal-red      NUR fuer Fehler / Stick wird geloescht
+ *
+ * Grundregel: --signal-* niemals als Layout / Brand verwenden.
+ */
+:root {
+  /* Tell the engine the UI is dark so NATIVE form controls (<select>, the
+     option list, scrollbars) render in dark mode. Without this, Linux/WebKitGTK
+     paints native selects with the GTK theme: on a light Zorin/GTK theme the
+     closed select showed pale text on a light fill, i.e. unreadable (Brice,
+     v0.7.15). This is theme-independent and keeps the native dropdown arrow. */
+  color-scheme: dark;
+  --brand: #6bd;
+  --brand-hover: #8df;
+  --brand-bg: #1f2a35;
+  --brand-bg-soft: #2a3a4a;
+  --brand-border: #3a5a7a;
+  --brand-text: #cef;
+  --brand-text-mid: #9cd;
+  --signal-green: #6c6;
+  --signal-yellow: #cc6;
+  --signal-red: #c66;
+
+  /* Semantic greyscale tokens. The whole UI's backgrounds, borders and
+     text route through these so the Light and High-contrast themes below
+     are a matter of redefining the tokens, not editing 400 literals.
+     Defaults here are the original dark palette (no visual change). */
+  --c-bg: #1a1a1a;          /* page background */
+  --c-surface: #222;        /* cards, bars, raised surfaces */
+  --c-surface-2: #2a2a2a;   /* slightly higher surface / soft fills */
+  --c-surface-3: #333;      /* highest surface / hover */
+  --c-border: #444;         /* default borders / dividers */
+  --c-border-2: #555;       /* stronger borders */
+  --c-text: #eee;           /* primary text */
+  --c-text-2: #ccc;         /* secondary text */
+  --c-muted: #aaa;          /* muted / sublabels */
+  /* #898989, not: hint text at 11px has to clear 4.5:1 against both the
+     page (#1a1a1a) and a card, and reached only 3.89 and 3.55.
+     Reported for the footer, but the token is used for hints throughout, so
+     the fix belongs here rather than on one selector. */
+  --c-faint: #898989;       /* faint / hints */
+  --c-pill-alpha: #ef9a9a;   /* stage pills, see .alpha-pill */
+  --c-pill-planned: #b0bec5;
+  --c-pill-beta: #ffb74d;
+  /* Group-identity colours, slots 2-4 (slot 1 is --brand). Dark-surface
+     values: 6.89:1, 5.57:1 and 5.18:1 on --c-surface. */
+  --group-c2: #d6a23d;
+  --group-c3: #2aa9a9;
+  --group-c4: #b27fd0;
+}
+
+/* Light theme. Greyscale tokens flip to a light palette and the brand/
+   signal accents are darkened so they keep WCAG-AA contrast on white.
+   color-scheme:light makes native <select>/scrollbars render light too. */
+html.a11y-light {
+  color-scheme: light;
+  /* Group-identity colours darkened for the white surface, the same treatment
+     the brand and signal accents get above: 5.07:1, 4.69:1 and 5.86:1 on
+     --c-surface, so the 11px group caption clears AA. */
+  --group-c2: #8a6112;
+  --group-c3: #0d7a80;
+  --group-c4: #7d4a96;
+  /* Darkened so the pills stay readable on white: the dark theme values
+     measured about 2 to 1 here. */
+  --c-pill-alpha: #a01b12;
+  --c-pill-planned: #41545c;
+  --c-pill-beta: #8a4b00;
+  --c-bg: #ffffff;
+  --c-surface: #f5f5f6;
+  --c-surface-2: #ececee;
+  --c-surface-3: #e2e2e5;
+  --c-border: #cccccf;
+  --c-border-2: #b5b5ba;
+  --c-text: #16181d;
+  --c-text-2: #33363d;
+  --c-muted: #5a5e66;
+  --c-faint: #6b6f77;
+  --brand: #1769aa;
+  --brand-hover: #0f4f80;
+  --brand-bg: #e6f0f8;
+  --brand-bg-soft: #d4e6f4;
+  --brand-border: #9cc3e0;
+  --brand-text: #0f3a5a;
+  --brand-text-mid: #2a6a9a;
+  --signal-green: #1a7f37;
+  --signal-yellow: #9a6700;
+  --signal-red: #b91c1c;
+}
+
+/* High-contrast theme. Black base, pure-white text and borders, brighter
+   accents. Every text tier collapses to maximum contrast on purpose.
+   Also honoured automatically below when the OS asks for more contrast. */
+html.a11y-contrast {
+  color-scheme: dark;
+  /* Group-identity colours at this theme's brightness: 12.39:1, 13.23:1 and
+     10.96:1 on black, so the frames stay as loud as everything else here. */
+  --group-c2: #f0c05a;
+  --group-c3: #5fe0e0;
+  --group-c4: #e0a8ea;
+  --c-bg: #000000;
+  --c-surface: #000000;
+  --c-surface-2: #111111;
+  --c-surface-3: #1a1a1a;
+  --c-border: #ffffff;
+  --c-border-2: #ffffff;
+  --c-text: #ffffff;
+  --c-text-2: #ffffff;
+  --c-muted: #ffffff;
+  --c-faint: #e6e6e6;
+  --brand: #9cdcff;
+  --brand-hover: #c4ecff;
+  --brand-bg: #003355;
+  --brand-bg-soft: #00477a;
+  --brand-border: #ffffff;
+  --brand-text: #ffffff;
+  --brand-text-mid: #ffffff;
+  --signal-green: #7cfc7c;
+  --signal-yellow: #ffe066;
+  --signal-red: #ff8a8a;
+}
+
+/* Fallback to color-scheme:dark above: force high-contrast colors on every
+   <select> (the closed control AND the dropdown option list) so the current
+   value and items stay readable regardless of the GTK/OS theme. Fixes the
+   white-on-white / pale-text selects on Linux (Brice, Zorin). */
+select { color: var(--c-text); background-color: var(--c-bg); }
+select option { color: var(--c-text); background-color: var(--c-bg); }
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background: var(--c-bg);
+  color: var(--c-text);
+  min-height: 100vh;
+}
+
+/* ---------- Layout: the app column is centred, the donate rail overlays ---------- */
+
+.layout {
+  display: block;
+  position: relative;
+  min-height: 100vh;
+}
+.donate-side {
+  position: fixed;
+  left: 0.625rem;
+  top: 50%;
+  transform: translateY(-50%);
+  /* rem, not px: at a larger text size the same words need more room, and a
+     fixed 160px made the buttons spill out of the panel and over the column
+     (reported for "Large" and "Extra Large"). */
+  width: 10rem;
+  box-sizing: border-box;
+  padding: 14px 10px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 8px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-surface-2);
+  border-radius: 10px;
+  z-index: 1;
+}
+.donate-side .donate-icon { font-size: 30px; }
+.donate-side .donate-slogan {
+  font-size: 11px;
+  color: var(--brand-text);
+  line-height: 1.4;
+}
+/* Transition line between the donate buttons and the share trigger ("and if
+   you really like STM: share it"). Slightly set off from the buttons above. */
+.donate-side .donate-share-lead {
+  margin-top: 10px;
+}
+/* Three donate buttons, each branded per the provider's official
+   guidelines. Common shell: 130px wide, 32px tall, inline icon + text.
+   The brand-specific class overrides background / text / border. */
+.donate-side .donate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 130px;
+  padding: 7px 10px;
+  border-radius: 18px;
+  font-weight: 600;
+  font-size: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
+}
+.donate-side .donate-btn:hover { transform: translateY(-1px); }
+.donate-side .donate-btn-icon { display: inline-flex; align-items: center; }
+.donate-side .donate-btn-label { line-height: 1; }
+
+/* GitHub Sponsors — Mona Pink #bf3989 on white. */
+.donate-side .donate-gh {
+  background: #ffffff;
+  color: #24292f;
+  border-color: #bf3989;
+  box-shadow: 0 2px 6px rgba(191, 57, 137, 0.25);
+}
+.donate-side .donate-gh:hover {
+  background: #fff5fa;
+  box-shadow: 0 3px 10px rgba(191, 57, 137, 0.45);
+}
+.donate-side .donate-gh .donate-btn-icon { color: #bf3989; }
+
+/* PayPal — official yellow #FFC439, hover #F5B81F. Two-tone wordmark
+   "Pay" #003087 + "Pal" #009CDE in italic-bold (PayPal Sans isn't
+   licensed for free use; italic + bold is the closest free fallback
+   that still reads as the PayPal mark). */
+.donate-side .donate-paypal {
+  background: #ffc439;
+  box-shadow: 0 2px 6px rgba(255, 196, 57, 0.4);
+}
+.donate-side .donate-paypal:hover {
+  background: #f5b81f;
+  box-shadow: 0 3px 10px rgba(245, 184, 31, 0.55);
+}
+.donate-side .donate-paypal-wordmark {
+  font-style: italic;
+  font-weight: 800;
+  font-size: 14px;
+  letter-spacing: -0.3px;
+  font-family: Helvetica, Arial, sans-serif;
+}
+.donate-side .donate-paypal-wordmark .pay { color: #003087; }
+.donate-side .donate-paypal-wordmark .pal { color: #009cde; }
+
+/* Ko-fi — coral #FF5E5B with white text and icon. */
+.donate-side .donate-kofi {
+  background: #ff5e5b;
+  color: #ffffff;
+  box-shadow: 0 2px 6px rgba(255, 94, 91, 0.4);
+}
+.donate-side .donate-kofi:hover {
+  background: #e63946;
+  box-shadow: 0 3px 10px rgba(230, 57, 70, 0.55);
+}
+
+.donate-side small { color: var(--c-faint); font-size: 10px; }
+
+/* Share trigger under the donate buttons: the escalation from "you like it"
+   (donate) to "you love it" (share). Dashed + accent-tinted so it catches the
+   eye without competing with the branded donate buttons; opens the share modal,
+   so it is never a permanent wall of buttons. */
+.donate-side .share-trigger {
+  width: 130px;
+  margin-top: 4px;
+  padding: 7px 8px;
+  border-radius: 18px;
+  border: 1px dashed var(--brand);
+  background: color-mix(in srgb, var(--brand) 10%, transparent);
+  color: var(--brand-text);
+  font-weight: 600;
+  font-size: 11.5px;
+  line-height: 1.25;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+.donate-side .share-trigger:hover { transform: translateY(-1px); background: color-mix(in srgb, var(--brand) 18%, transparent); }
+.donate-side .share-trigger .share-heart { color: var(--brand); }
+
+/* The donate rail is an overlay: it is position: fixed and reserves no space,
+   so the centered app column runs straight under it as soon as the window is
+   not wide enough for both. It is therefore HIDDEN BY DEFAULT and shown only
+   where there is provably room, rather than shown by default and hidden when
+   the window looks narrow.
+
+   That inversion is the fix. The old rule hid it below 1080px, and the app
+   column needs 720px with 170px of rail beside it, so the arithmetic left ten
+   pixels of slack. A macOS window with permanent scrollbars eats more than
+   that on its own, and a Mac user's screenshot showed the preset tiles drawn
+   straight over the rail. Ten pixels was never a margin, it
+   was a coincidence.
+
+   1200px keeps a real gap: 720 for the column, 186 for the rail and its
+   margin on each side, and about a hundred left over for scrollbars, zoom and
+   whatever the platform adds. Below that the footer donate link carries it. */
+.donate-side { display: none; }
+/* The rail is an overlay, so nothing used to stop the centred column sliding
+   under it; the 1200px threshold was the margin that made that unlikely rather
+   than impossible. Now the layout RESERVES the rail's width, so an overlap
+   cannot happen and the rail fits a much smaller window. That matters because
+   it disappeared as soon as the window was pulled down to its minimum.
+   Threshold and widths are in em/rem, so both grow with the text size instead
+   of leaving the same pixels to hold larger words. */
+@media (min-width: 62em) {
+  .donate-side { display: flex; }
+  /* BOTH sides, not just the left. Reserving only the rail side pushed the
+     centred column half a rail to the right, and the window stopped looking
+     centred, which is how this was reported. Reserving the same width on
+     both keeps the column optically in the middle of the window AND clear of
+     the rail, which is what the two fixes were each trying to do alone. */
+  .layout { padding-left: 11.5rem; padding-right: 11.5rem; }
+}
+
+/* Share modal: one tile per platform. Each tile opens the browser share on this
+   PC and carries a QR that opens the same platform's post on a phone. */
+.share-modal { max-width: 560px; }
+.share-tiles {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+@media (max-width: 520px) { .share-tiles { grid-template-columns: repeat(2, 1fr); } }
+.share-tile {
+  border: 1px solid var(--c-surface);
+  background: var(--c-bg);
+  border-radius: 12px;
+  padding: 12px 8px 9px;
+  text-decoration: none;
+  color: var(--c-text);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  transition: transform 0.12s ease, border-color 0.12s ease;
+}
+.share-tile:hover { transform: translateY(-2px); border-color: var(--brand); }
+.share-tile .share-ic {
+  width: 30px; height: 30px; border-radius: 9px;
+  display: grid; place-items: center; color: #fff; background: var(--brand);
+}
+.share-tile .share-ic svg { width: 18px; height: 18px; }
+.share-tile .share-name { font-size: 12.5px; font-weight: 700; }
+.share-tile .share-qr {
+  width: 96px; height: 96px; background: #fff; border-radius: 9px;
+  padding: 7px; color: #0d1420;
+}
+.share-tile .share-qr svg { width: 100%; height: 100%; display: block; }
+.share-tile .share-scan { font-size: 10.5px; color: var(--c-muted); letter-spacing: 0.02em; }
+.share-foot { display: flex; gap: 8px; justify-content: flex-end; }
+
+#app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 10px 14px;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  z-index: 2;
+}
+.view { flex: 1; }
+.view.hidden { display: none; }
+
+/* ---------- App Header ---------- */
+.app-header {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 6px;
+  padding-bottom: 4px;
+}
+.app-header-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.app-logo {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  color: var(--c-text); /* drives the dots + horizontal lines via currentColor;
+                 the red heartbeat stays #cc0000 in the SVG itself */
+}
+.app-logo svg {
+  width: 100%;
+  height: 100%;
+}
+.app-brand {
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  color: var(--c-text);
+}
+.app-brand-accent {
+  color: var(--brand);
+  font-style: italic;
+}
+.app-locale {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.locale-dd {
+  position: relative;
+}
+.locale-dd-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--c-text);
+  transition: border-color 120ms ease, background-color 120ms ease,
+              box-shadow 120ms ease;
+}
+.locale-dd-caret {
+  font-size: 10px;
+  color: var(--c-muted);
+  margin-left: 2px;
+}
+.locale-flag-code {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: var(--c-text);
+}
+.locale-dd-trigger:hover {
+  border-color: var(--c-border-2);
+  background: var(--c-surface-2);
+}
+.locale-dd-trigger:focus-visible {
+  outline: none;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 2px rgba(204, 0, 0, 0.35);
+}
+.locale-dd-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 50;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  min-width: 170px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.locale-dd-menu[hidden] {
+  display: none;
+}
+.locale-dd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--c-text);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.locale-dd-item:hover {
+  background: var(--c-surface-2);
+}
+.locale-dd-item.active {
+  background: rgba(204, 0, 0, 0.18);
+  box-shadow: inset 0 0 0 1px var(--brand);
+  color: #fff;
+}
+.locale-dd-name {
+  font-weight: 500;
+}
+.locale-flag-emoji {
+  display: inline-flex;
+  align-items: center;
+  /* Used only as the emoji fallback for locales without an inline SVG
+     flag. Note: Windows ships NO country-flag emoji glyphs in any system
+     font, so the picker uses inline SVG (flagSvg) for its locales; this
+     emoji fallback renders as letters on Windows but a flag on macOS. */
+  font-family: "Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji",
+               "Twemoji Mozilla", system-ui, sans-serif;
+}
+/* Inline SVG flag in the language picker: renders identically on Windows
+   and macOS, unlike Unicode flag emoji. */
+.loc-flag-svg {
+  display: block;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.app-tagline {
+  font-size: 12px;
+  color: var(--c-muted);
+  margin-top: 2px;
+}
+.app-supported {
+  font-size: 10px;
+  color: var(--c-faint);
+  margin-top: 2px;
+}
+
+/* ---------- Tabs ---------- */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--c-surface-2); margin-bottom: 10px; }
+.tab-btn {
+  background: transparent;
+  color: var(--c-muted);
+  border: none;
+  padding: 10px 18px;
+  cursor: pointer;
+  font-size: 14px;
+  border-bottom: 2px solid transparent;
+  position: relative;
+}
+.tab-btn:hover { color: var(--c-text-2); }
+.tab-btn.active { color: var(--brand); border-bottom-color: var(--brand); }
+/* Blue dot indicator: a tab carries pending work (e.g. one of the
+   discovered boxes needs a software update). */
+.tab-btn.has-update::after {
+  content: '';
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2f80ed;
+  box-shadow: 0 0 0 2px var(--c-bg);
+}
+/* Count pill on the Multi-Room tab: how many groups (live zones + stored
+   permanent groups) exist right now. Brand-tinted like the group frames so it
+   reads as "state", not as an alert like the blue update dot; the tint rides
+   on --brand, which is retuned per theme, so it holds up in light and dark. */
+.tab-badge {
+  display: inline-block;
+  min-width: 16px;
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  text-align: center;
+  vertical-align: middle;
+  color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--brand) 55%, transparent);
+  white-space: nowrap;
+}
+/* A count made up only of SAVED groups takes the same muted, dashed treatment
+   those groups are drawn with (.box-group-stored), so the badge and the frame
+   it refers to read as one state. A single live group flips it back to brand,
+   which is what the solid frames use. */
+.tab-badge-stored {
+  color: var(--c-muted);
+  background: color-mix(in srgb, var(--c-muted) 14%, transparent);
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--c-muted) 55%, transparent);
+}
+.tab-badge[hidden] { display: none; }
+.view.hidden { display: none; }
+.hidden { display: none !important; }
+
+/* ---------- Topbar ---------- */
+.topbar { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.topbar-head { display: flex; align-items: center; gap: 10px; }
+.topbar-title { font-size: 14px; color: var(--c-muted); flex: 1; }
+.btn-icon { background: var(--brand-bg-soft); color: var(--brand-text); border: 1px solid var(--brand-border); border-radius: 4px; width: 34px; height: 34px; cursor: pointer; font-size: 16px; }
+.btn-icon:hover { background: #3a4a5a; }
+.refresh-icon { display: inline-block; transition: transform 0.2s ease; }
+.btn-icon.spinning .refresh-icon { animation: spin 0.9s linear infinite; }
+.btn-icon-sm.spinning { display: inline-block; animation: spin 0.9s linear infinite; }
+@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.box-select { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; background: var(--c-surface); border-radius: 6px; padding: 8px 10px; min-height: 38px; font-size: 13px; color: var(--c-muted); }
+.box-select .empty { color: var(--c-faint); padding: 4px 6px; }
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  width: 100%;
+  text-align: center;
+}
+.empty-state-title {
+  font-size: 14px;
+  color: var(--c-text);
+  font-weight: 500;
+}
+.empty-state-text {
+  font-size: 12px;
+  color: var(--c-muted);
+  line-height: 1.4;
+}
+.empty-state .btn-primary {
+  align-self: center;
+  margin-top: 4px;
+}
+.empty-state-buttons {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 4px;
+}
+/* Manual connect-by-IP, shown in the "no speaker found" state as the fallback
+   for networks where discovery is blocked (AP isolation, VPN, other subnet). */
+.manual-ip { margin-top: 16px; border-top: 1px solid var(--c-border); padding-top: 14px; }
+.manual-ip-row { display: flex; gap: 8px; justify-content: center; align-items: center; margin-top: 8px; }
+.manual-ip-input {
+  flex: 0 1 200px; min-width: 0; padding: 7px 10px; font-size: 13px;
+  background: var(--c-bg); color: var(--c-text);
+  border: 1px solid var(--c-border); border-radius: 6px;
+}
+.manual-ip-input:focus { border-color: var(--brand); outline: none; }
+
+/* "Add by IP" tile at the end of a populated speaker list: on a routed
+   network only the local subnet is discovered, and the empty state's address
+   field vanishes with the first speaker found. Dashed and muted so it reads as
+   an action, not as another speaker. */
+.box-btn.box-add-ip {
+  border-style: dashed;
+  opacity: 0.72;
+  /* A bare "+" needs to read as a button rather than a stray character, so it
+     is squared off and centred at the same height as a speaker pill instead of
+     inheriting the padding meant for a pill with a name in it. */
+  font-weight: 600;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0;
+  width: 32px;
+  min-width: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.box-btn.box-add-ip:hover { opacity: 1; }
+.box-add-ip-row { display: inline-flex; margin-top: 0; vertical-align: middle; }
+.box-add-ip-row .manual-ip-input { max-width: 190px; }
+.reconnect-banner {
+  background: var(--brand-bg);
+  border: 1px solid var(--brand-border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 13px;
+  color: var(--brand-text);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.reconnect-banner b { color: var(--brand-text); }
+.reconnect-banner small {
+  display: block;
+  color: var(--brand-text-mid);
+  font-size: 11px;
+  margin-top: 2px;
+}
+.box-btn {
+  background: var(--c-surface-2);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 5px 28px 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  position: relative;
+  display: inline-block;
+}
+.box-btn:hover { background: var(--c-border); }
+.box-btn.active { background: var(--brand-bg); border-color: var(--brand); color: var(--brand-text); }
+/* Solid muted colour, never opacity: opacity multiplies against the parent's
+   already-muted colour, and in the light theme that produced #999a9f on the
+   #f5f5f6 tile, a 2.6:1 contrast the reporter could not read. */
+.box-btn small { display: block; color: var(--c-muted); font-size: 10px; }
+.box-edit {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--c-faint);
+  cursor: pointer;
+  font-size: 13px;
+  border-radius: 3px;
+}
+.box-edit:hover { color: var(--brand); background: rgba(102, 187, 221, 0.12); }
+.box-ver { background: var(--c-surface-3); color: var(--c-muted); font-size: 10px; padding: 1px 5px; border-radius: 8px; margin-left: 6px; }
+/* Offline: die Version ist der letzte bestaetigte Stand, kein Live-Wert.
+   Any opacity here dims --c-muted below AA on the near-white light card, which
+   is why 0.55 and then 0.82 both still read as faded (twice). The "not a
+   live value" cue is carried by the italic alone now; the color stays at the
+   AA-compliant --c-muted so the version is actually readable. */
+.box-ver-stale { font-style: italic; color: var(--c-text-2); }
+.box-model { color: var(--c-muted); font-size: 11px; font-weight: 500; margin-left: 8px; }
+/* Multiroom group frame: speakers sharing a live zone are clustered and
+   wrapped in a colored border so the group reads as one block on the music tab.
+   Display only; grouping is done in the Multi-Room tab.
+
+   These four are IDENTITY colours, never signals. The first slot used to be
+   #d64545, a saturated red close enough to --signal-red to be read as one, and
+   because main.js hands the first group slot 1 and most homes have exactly one
+   group, that red frame with its matching red caption was what almost every
+   user saw around a perfectly healthy zone ("die
+   Umrahmungsfarbe der Gruppen ist rot und signalisiert Warnung"). It also
+   paired red with green, which collapses to one colour under deuteranopia and
+   protanopia, so the four "identity" colours were effectively two for a
+   red-green colour-blind user.
+
+   Slot 1 is now --brand itself: it is the app's own "this one is picked"
+   colour (.seg-btn.active, .zone-card.master, .box-group-master all use it), it
+   is defined per theme so it carries correct contrast into light and
+   high-contrast for free, and for the one-group case it makes the frame read as
+   chrome rather than as a code to decode. The other three are built on the
+   blue/yellow axis that survives dichromacy, ordered so the two most-used slots
+   sit furthest apart, and re-tuned per theme below because no single hex clears
+   AA on both a near-black and a near-white surface. Nothing here is within
+   reach of --signal-red or --signal-green in any theme. */
+.box-group { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 5px 7px; border: 2px solid var(--bg-color, var(--c-border-2)); border-radius: 8px; }
+.box-group-c1 { --bg-color: var(--brand); }
+.box-group-c2 { --bg-color: var(--group-c2); }
+.box-group-c3 { --bg-color: var(--group-c3); }
+.box-group-c4 { --bg-color: var(--group-c4); }
+/* Star on the group's master speaker pill. */
+.box-group-master { color: var(--brand); margin-right: 4px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+/* "permanent" chip on a group frame: this group re-forms by itself. */
+.box-group-perm { font-size: 10px; font-weight: 600; margin-left: 6px; padding: 0 6px; border-radius: 8px; border: 1px solid var(--bg-color, var(--c-border-2)); color: var(--bg-color, var(--c-muted)); white-space: nowrap; }
+/* Group name header on the multiroom frame — full width so the pills wrap
+   below it; coloured to match the frame so the zone is obvious at a glance. */
+/* No opacity here. Blending the caption 10% into the surface cost about half a
+   contrast point (the 11px label dropped from 4.15:1 to 3.62:1 on the dark
+   surface), and now that the palette is tuned per theme there is no reason to
+   pay for it twice. */
+.box-group-label { flex-basis: 100%; display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: var(--bg-color, var(--c-muted)); margin: 0 2px 1px; }
+.box-group-label svg { flex: 0 0 auto; }
+/* Per-frame dismiss (x): dissolve exactly this group/pair from where it is shown. */
+.zone-frames .box-group, .box-group.has-x { position: relative; padding-right: 22px; }
+.box-group-x { position: absolute; top: 3px; right: 4px; border: none; background: transparent; color: var(--c-muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 1px 4px; border-radius: 4px; }
+.box-group-x:hover { color: var(--c-text); background: var(--c-border); }
+/* A permanent group that is stored on its main speaker but not playing right
+   now: dashed, uncoloured, with a caption saying it forms when music starts.
+   Without a frame the group was invisible after creation, the user could not
+   tell whether it existed and had no x to remove it. */
+.box-group-stored { border-style: dashed; --bg-color: var(--c-muted); }
+.box-group-stored .zone-frame-chip { opacity: 0.8; }
+.zone-frame-note { flex-basis: 100%; font-size: 11px; color: var(--c-muted); margin: 0 2px; }
+/* Small speaker icon on a tile whose speaker is currently playing. */
+/* Green, matching the "playing" status bar (--signal-green), so the icon means
+   the same thing on a tile as in the status. */
+.box-playing { color: var(--signal-green); margin-right: 3px; display: inline-flex; vertical-align: middle; }
+.box-btn.active .box-playing { color: var(--signal-green); }
+/* Notification dot on a speaker button whose agent is out of date
+ Same blue as the settings-tab badge (.tab-btn.has-update) on
+   purpose: both mean "update available", so one colour, one meaning. Red
+   would read as an error, which an available update is not. Sits in the
+   top-right corner; the ring matches the surrounding panel so it reads as
+   a badge, not part of the text. */
+.box-update-dot {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #2f80ed;
+  box-shadow: 0 0 0 2px var(--c-surface);
+}
+.box-btn.needs-update.active .box-update-dot { box-shadow: 0 0 0 2px var(--brand-bg); }
+/* The readable replacement for the update dot: a small word chip. Same blue as
+   the settings-tab badge (one colour, one meaning); red would read as an error,
+   which an available update is not. Inline so it never overlaps the name. */
+.box-update-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: #2f80ed;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  vertical-align: middle;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.box-update-chip:hover { background: #1c62c4; }
+.box-update-chip:focus-visible { outline: 2px solid var(--c-text); outline-offset: 2px; }
+
+/* The once-per-start speaker-update card. Deliberately calm: it sits above the
+   content like the other banners, is never modal, and disappears for good once
+   the speakers are current. */
+.speaker-update-card {
+  background: #eaf2fe;
+  border-bottom: 1px solid #c7ddfb;
+  color: #10305c;
+  padding: 14px 18px;
+}
+.speaker-update-card .suc-body { max-width: 720px; margin: 0 auto; }
+.speaker-update-card .suc-title { font-weight: 700; margin-bottom: 4px; }
+.speaker-update-card .suc-text { font-size: 14px; line-height: 1.5; }
+.speaker-update-card .suc-list {
+  margin: 8px 0 10px;
+  padding-left: 20px;
+  font-size: 14px;
+}
+.speaker-update-card .suc-ver { color: #4a6591; font-size: 12px; }
+.speaker-update-card .suc-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+html.a11y-contrast .speaker-update-card {
+  background: #000;
+  color: #fff;
+  border-bottom-color: #fff;
+}
+html.a11y-contrast .speaker-update-card .suc-ver { color: #fff; }
+.box-btn.stock {
+  background: var(--c-surface);
+  border-style: dashed;
+  border-color: var(--c-border-2);
+  color: var(--c-muted);
+  padding-right: 10px;
+}
+.box-btn.stock:hover {
+  background: var(--c-surface-2);
+  border-color: var(--brand);
+  color: var(--c-text);
+}
+.box-stock-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  /* A red tint behind red-ish text was too low-contrast, worst on the muted
+     default palette. A neutral surface chip keeps the red "needs
+     install" cue legible in every theme (light, dark, high-contrast). */
+  background: var(--c-surface-3);
+  color: var(--signal-red);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+/* "STM not running": a box STM once ran on whose agent is gone while the stock
+   firmware still answers. Grey, not red: it is a repair hint, not an invite. */
+.box-stock-badge.box-stock-badge-gone {
+  color: var(--c-muted);
+}
+
+/* Announcement expert command: a wrappable, selectable monospace block. */
+.announce-curl {
+  flex: 1;
+  display: block;
+  padding: 8px 10px;
+  background: var(--c-bg);
+  border: 1px solid var(--c-surface-3);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--c-text-2);
+  word-break: break-all;
+  white-space: pre-wrap;
+  user-select: all;
+}
+
+/* Blue "new feature over here" dot on a nav tab: points the
+   user to a new STM-exclusive feature and clears once the tab is opened. The
+   gentle pulse draws the eye toward the hidden feature. */
+.nav-newdot { display:inline-block; width:7px; height:7px; margin-left:5px; border-radius:50%; background:#2f80ff; vertical-align:middle; animation:navDotPulse 2s ease-out infinite; }
+@keyframes navDotPulse {
+  0%   { box-shadow:0 0 0 0 rgba(47,128,255,.55); }
+  70%  { box-shadow:0 0 0 5px rgba(47,128,255,0); }
+  100% { box-shadow:0 0 0 0 rgba(47,128,255,0); }
+}
+
+/* ---------- Beta pill (used on the Library tab and elsewhere) ---------- */
+.beta-pill {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: rgba(255, 165, 0, 0.18);
+  color: var(--c-pill-beta);
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  vertical-align: middle;
+}
+/* STM-only badge: marks a feature the Bose app never had, added by SoundTouch Manager
+ Positive brand accent, not the amber/red of the status
+   pills, and a title that spells out what it means. */
+.stm-badge {
+  display: inline-block; margin-left: 8px; padding: 2px 7px; border-radius: 6px;
+  background: var(--brand-bg); color: var(--brand); border: 1px solid var(--brand);
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px;
+  vertical-align: middle; white-space: nowrap; cursor: help;
+}
+/* Alpha pill: same shape, redder accent to signal that this is more
+ * experimental than BETA and may not work at all yet. */
+/* The stage pills carried colours chosen against a dark page and never
+   adjusted, so on white they measured about 2 to 1. Each now has a
+   token, darkened for the light theme further down. */
+.alpha-pill {
+  background: rgba(244, 67, 54, 0.22);
+  color: var(--c-pill-alpha);
+}
+/* Planned pill: muted blue/grey to signal "not built yet, gathering
+ * feedback" — distinct from BETA (works, rough) and ALPHA (experimental). */
+.planned-pill {
+  background: rgba(120, 144, 156, 0.20);
+  color: var(--c-pill-planned);
+}
+
+/* ---------- Podcasts placeholder (feedback page) ---------- */
+.podcasts-intro {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 24px 16px;
+}
+.podcasts-title {
+  margin: 0 0 12px;
+}
+.podcasts-lead {
+  font-size: 15px;
+}
+.podcasts-ask {
+  margin-top: 16px;
+}
+.podcasts-actions {
+  margin: 18px 0 6px;
+}
+
+/* ---------- TuneIn directory ---------- */
+.tunein-view { max-width: 760px; margin: 0 auto; padding: 16px; }
+.tunein-title { margin: 0 0 6px; }
+.tunein-search { display: flex; gap: 8px; margin: 12px 0 4px; }
+.tunein-search input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--c-border, var(--c-surface-2));
+  background: var(--c-bg);
+  color: inherit;
+  font: inherit;
+}
+.tunein-share-hint { margin: 0 0 12px; }
+.tunein-nav { display: flex; align-items: center; gap: 8px; margin: 8px 0; min-height: 30px; }
+.tunein-crumb { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tunein-section { margin: 10px 0 14px; }
+.tunein-section-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--c-text-2);
+  margin: 0 0 4px;
+}
+.tunein-link {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--c-surface-2);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tunein-link:hover, .tunein-link:focus-visible { background: var(--c-surface-2); }
+.tunein-link-text { flex: 1; min-width: 0; }
+.tunein-chevron { color: var(--brand); font-size: 20px; line-height: 1; }
+.tunein-text { padding: 8px 6px; }
+.tunein-shared {
+  border: 1px solid var(--brand);
+  border-radius: 10px;
+  padding: 8px 10px;
+  margin: 0 0 12px;
+  box-shadow: var(--brand-glow, none);
+}
+.tunein-shared .result-row { border-bottom: 0; }
+.tunein-attrib { margin-top: 18px; }
+
+/* ---------- Alpha-stage placeholder pages (Spotify, Multi-room) ---------- */
+.alpha-stage {
+  max-width: 720px;
+  margin: 32px auto;
+  padding: 0 16px;
+  line-height: 1.55;
+  color: var(--c-text-2);
+}
+.alpha-stage h2 {
+  margin: 0 0 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.alpha-stage p { margin: 12px 0; }
+/* Same amber as the BETA pill, via its token: the literal was chosen against
+   the dark page and measured about 1.6:1 on white (follow-up report,
+   same defect class as). The token darkens for the light theme. */
+.alpha-stage a { color: var(--c-pill-beta); }
+.alpha-checklist {
+  margin: 16px 0;
+  padding-left: 22px;
+}
+/* Spotify "(STM)" entry hint: a small callout so the important "pick the
+   (STM) entry" instruction does not read as one more line of body text. */
+.spotify-stm-hint {
+  margin: 14px 0; padding: 10px 13px; border-radius: 8px;
+  border-left: 3px solid var(--brand); background: var(--c-surface-2);
+  font-size: 13px; line-height: 1.5;
+}
+
+/* Spotify page: card-chunked so the long info flow does not read as one wall
+ Primary steps in cards, the reference lists collapsed. */
+.spotify-page { max-width: 720px; margin: 24px auto; padding: 0 16px; display: flex; flex-direction: column; gap: 16px; color: var(--c-text); }
+.spotify-hero h2 { margin: 0 0 6px; }
+.spotify-lead { margin: 0; color: var(--c-text-2); font-size: 15px; line-height: 1.5; }
+.sp-card { background: var(--c-surface); border: 1px solid var(--c-border); border-radius: 12px; padding: 16px 18px; }
+.sp-card-title { margin: 0 0 10px; font-size: 15px; display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.sp-card > p { margin: 0 0 10px; line-height: 1.5; }
+.sp-steps { margin: 4px 0 0; padding-left: 20px; }
+.sp-steps li { margin: 7px 0; line-height: 1.5; }
+.sp-version { margin: 12px 0 0; }
+.sp-tools { display: flex; flex-direction: column; gap: 22px; }
+.sp-tool > *:last-child { margin-bottom: 0; }
+.sp-tool p { margin: 0 0 10px; }
+.sp-details { border: 1px solid var(--c-border); border-radius: 10px; padding: 2px 14px; background: var(--c-surface); }
+.sp-details > summary { cursor: pointer; padding: 11px 0; font-weight: 600; font-size: 14px; list-style-position: inside; }
+.sp-details .spotify-status { margin: 2px 0 12px; }
+.sp-foot { color: var(--c-text-2); font-size: 13px; line-height: 1.5; margin: 0; }
+.sp-feedback { margin-top: 2px; }
+.alpha-checklist li { margin: 6px 0; }
+
+/* Spotify per-speaker streaming quality */
+.quality-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0;
+  flex-wrap: wrap;
+}
+.quality-row > span:first-child { min-width: 160px; }
+
+/* ---------- Library view ---------- */
+.library-header h2 { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.library-sub { color: var(--c-muted); font-size: 13px; margin-bottom: 16px; }
+.library-loading { color: var(--c-muted); font-style: italic; padding: 12px 0; }
+.library-server-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.library-label { color: var(--c-text-2); font-size: 13px; }
+.library-select {
+  flex: 1;
+  background: var(--c-surface);
+  border: 1px solid var(--c-surface-3);
+  color: var(--c-text);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+/* A server the last scan heard nothing from, listed from memory. Quiet
+   on purpose: it is a fact about the network, not an error in the app, and the
+   entry stays usable for a NAS that wakes on access. */
+.library-server-dark {
+  flex: 0 0 auto;
+  font-size: 10px;
+  background: var(--c-surface-3);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  padding: 2px 6px;
+  border-radius: 10px;
+  white-space: nowrap;
+}
+.library-server-dark-note { color: var(--c-muted); font-size: 12px; margin: 0 0 12px; }
+.library-empty {
+  background: var(--c-surface);
+  border: 1px dashed var(--c-surface-3);
+  border-radius: 6px;
+  padding: 18px;
+  text-align: center;
+  color: var(--c-muted);
+}
+.library-empty p { margin-bottom: 10px; }
+.library-manual-add { margin: 4px 0 12px; font-size: 13px; }
+.library-manual-add summary { color: var(--c-muted); cursor: pointer; }
+.library-manual-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.library-manual-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--c-surface);
+  border: 1px solid var(--c-surface-3);
+  color: var(--c-text);
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.library-pick-server { color: var(--c-muted); font-style: italic; padding: 12px 0; }
+.library-crumbs {
+  background: var(--c-surface-2);
+  padding: 8px 12px;
+  border-radius: 4px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--c-muted);
+  overflow-wrap: anywhere;
+}
+.library-crumb { color: var(--brand); text-decoration: none; }
+.library-crumb:hover { text-decoration: underline; }
+.library-crumb-active { color: var(--c-text); font-weight: 600; }
+.library-crumb-sep { color: var(--c-border-2); padding: 0 4px; }
+.library-folder-actions { display: flex; align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap; }
+.library-search-row { display: flex; align-items: center; gap: 10px; margin: 8px 0; }
+.library-search { flex: 1 1 auto; min-width: 0; background: var(--brand-bg); color: var(--brand-text); border: 1px solid var(--brand-border); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+.library-count { flex: 0 0 auto; color: var(--brand-text-mid); font-size: 12px; font-variant-numeric: tabular-nums; }
+.library-loading-more { color: var(--brand-text-mid); font-size: 12px; padding: 6px 2px; }
+.library-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--c-surface-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.library-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--c-surface);
+  font-size: 13px;
+  cursor: default;
+}
+.library-row:last-child { border-bottom: none; }
+.library-row-folder { cursor: pointer; }
+.library-row-folder:hover { background: var(--c-surface); }
+.library-row-track:hover { background: var(--c-bg); }
+.library-icon { color: var(--c-muted); min-width: 18px; text-align: center; }
+.library-title { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.library-track-title { color: var(--c-text); }
+.library-track-meta { color: var(--c-muted); font-size: 11px; }
+.library-duration { color: var(--c-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+.library-meta { color: var(--c-faint); font-size: 11px; }
+.library-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.library-empty-folder { color: var(--c-muted); font-style: italic; padding: 12px 0; }
+
+/* ---------- Status Bar (Signal-Farben!) ---------- */
+.status-bar { background: var(--c-surface); padding: 8px 12px; border-radius: 6px; margin-bottom: 10px; min-height: 36px; display: flex; align-items: center; gap: 12px; font-size: 13px; }
+/* The status text and the playing time share the bar. The time used to sit
+   on its own row underneath, which cost a full line of the window for one
+   small clock, and for radio (no track length) that row held nothing but
+   the clock. */
+.status-main { display: flex; align-items: center; flex: 1 1 auto; min-width: 0; }
+.status-bar .now { color: var(--signal-green); font-weight: 600; }
+.status-bar small { margin-left: 8px; color: var(--c-muted); }
+.status-bar .muted { color: var(--c-faint); }
+.status-bar.status-play { border-left: 3px solid var(--signal-green); padding-left: 10px; }
+.status-bar.status-buf { border-left: 3px solid var(--signal-yellow); padding-left: 10px; }
+.status-bar.status-err { border-left: 3px solid var(--signal-red); padding-left: 10px; color: var(--signal-red); }
+.status-bar.status-idle { border-left: 3px solid var(--c-border); padding-left: 10px; }
+/* Battery indicator in the speaker tile (SoundTouch Portable only).
+   Drawn as a real battery: a body with a terminal nub, so it reads
+   unmistakably as a charge gauge. Right-aligned just left of the gear;
+   the fill scales red -> orange -> green by charge. */
+
+/* ---------- Controls ---------- */
+.controls { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+/* A soundbar brings five or six inputs into this row (TV, CBL-Sat, BD-DVD,
+   Game, Aux), where a one-piece speaker brought two, so it wraps now instead of
+   pushing the volume slider off the edge. */
+.source-buttons { display: flex; gap: 4px; margin-left: 8px; flex-wrap: wrap; }
+.source-inputs { display: flex; gap: 4px; flex-wrap: wrap; }
+.queue-controls { display: flex; gap: 4px; align-items: center; }
+.queue-controls.hidden { display: none; }
+.queue-pos { font-size: 12px; color: var(--c-muted); margin-left: 4px; white-space: nowrap; }
+.btn-source { padding: 6px 10px; font-size: 12px; background: var(--c-surface-3); color: var(--c-text); border: 1px solid var(--c-border-2); border-radius: 4px; cursor: pointer; }
+.btn-source:hover { background: var(--c-border); border-color: var(--brand); }
+.btn-source:active { background: var(--c-border-2); }
+.btn-source.active { background: linear-gradient(135deg, #1f2f1f 0%, #2a3a2a 100%); border-color: var(--signal-green); color: #cfc; box-shadow: 0 0 8px rgba(102, 204, 102, 0.3); }
+.btn-source-icon { display: inline-flex; align-items: center; justify-content: center; padding: 6px 8px; }
+.btn-source-icon svg { display: block; }
+.volume-control { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 1; min-width: 180px; max-width: 300px; }
+
+/* Stereo balance next to the volume. Read-only on purpose (the firmware takes
+   no write we could make work), so it is styled as a quiet label rather than a
+   control, and it is hidden entirely unless the speaker is the master of a
+   stereo pair. */
+.vol-balance {
+  font-size: 12px;
+  color: var(--c-muted);
+  white-space: nowrap;
+  margin-left: 10px;
+}
+.vol-balance.hidden { display: none; }
+.volume-control .vol-icon { font-size: 16px; opacity: 0.7; }
+/* Music tab volume slider: native control with accent-color so the
+   filled portion on the left renders in brand blue — matches the
+   slider in Box Einstellungen exactly. The previous custom -webkit
+   pseudo-elements drew their own gray track and blocked accent-color
+   from doing its job, leaving only the thumb visible in brand
+   colour. */
+.volume-control input[type=range] {
+  flex: 1;
+  accent-color: var(--brand);
+}
+.volume-control .vol-val { font-size: 12px; color: var(--c-muted); min-width: 28px; text-align: right; }
+/* Compact square +/- volume steppers: precise, accident-free adjustment that
+   also works on touch, flanking the slider. */
+.volume-control .vol-step { flex: 0 0 auto; padding: 4px 8px; min-width: 26px; line-height: 1; font-size: 15px; font-weight: 600; }
+.btn { background: var(--c-surface-2); color: var(--c-text); border: 1px solid var(--c-border); border-radius: 6px; padding: 8px 12px; cursor: pointer; font-size: 13px; }
+.btn:hover { background: var(--c-border); }
+.btn-mini { padding: 4px 10px; font-size: 13px; }
+/* A button is a label, never a status display.
+   Progress text used to be written INTO the update button. The messages are
+   whole sentences ("the speaker is restarting and reconnecting, usually 2-4
+   minutes"), so a btn-mini wrapped them over several lines, grew to match, and
+   pushed everything around it as the text changed from phase to phase.
+   Status now lives here instead: directly under the button, full width so a
+   short phase fits on one line, and with a reserved height so the panel does
+   not move every time the message does. Long enough for two lines because
+   German is the widest locale and some phases carry a countdown. */
+.op-status {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--c-muted);
+  margin-top: 6px;
+  min-height: calc(2 * 1.35 * 12px);
+  /* break-word, not anywhere: a narrow column used to be filled by splitting
+     words across lines, which is unreadable. A long unbroken token still
+     breaks, an ordinary sentence does not. */
+  overflow-wrap: break-word;
+}
+.op-status:empty { display: none; }
+/* Active state for ON/OFF toggle pairs (clock display, airplay opt): the
+   current state is shown by highlighting the active button, like the
+   source buttons, so no separate status line is needed. */
+.toggle-btn.active { background: linear-gradient(135deg, #1f2f1f 0%, #2a3a2a 100%); border-color: var(--signal-green); color: #cfc; box-shadow: 0 0 8px rgba(102, 204, 102, 0.3); }
+.btn-secondary { background: var(--c-border); }
+.btn-primary { background: linear-gradient(135deg, var(--brand-deep, #0b4fb3) 0%, var(--brand) 100%); color: var(--on-brand, #fff); border-color: var(--brand); }
+.btn-primary:hover { background: linear-gradient(135deg, var(--brand) 0%, var(--brand-hover) 100%); box-shadow: var(--brand-glow, none); }
+.btn-primary:disabled { background: var(--c-border); color: var(--c-faint); border-color: var(--c-border); cursor: not-allowed; }
+.btn-danger { background: var(--signal-red); color: white; border-color: var(--signal-red); }
+.btn-danger:hover { background: #d55; }
+.btn-warning { background: #d97a1d; color: white; border-color: #d97a1d; }
+.btn-warning:hover { background: #e68a30; }
+.btn-warning:disabled { background: #6a4a30; color: #aa8; border-color: #6a4a30; cursor: not-allowed; }
+
+/* High contrast: a disabled button must stay READABLE, because during a speaker
+   update the live status ("uploading 42%", "restarting", the countdown) is
+   written into the button itself while it is disabled. The generic rule above
+   resolves to --c-faint (#e6e6e6) on --c-border (#ffffff) in this theme, i.e.
+   near-white on white, so the whole progress reporting was invisible to exactly
+   the users who need contrast most (reported 2026-07-28). The
+   warning variant's hardcoded browns are just as unreadable here.
+   Disabled is still obvious: the cursor and the missing hover both say so. */
+html.a11y-contrast .btn:disabled,
+html.a11y-contrast .btn-primary:disabled,
+html.a11y-contrast .btn-warning:disabled {
+  background: #000000;
+  color: #ffffff;
+  border-color: #ffffff;
+  opacity: 1;
+  cursor: not-allowed;
+}
+
+/* ---------- Settings actions panel ---------- */
+.actions-grid { display: grid; grid-template-columns: max-content 1fr; gap: 12px 14px; align-items: center; margin-top: 10px; }
+.actions-grid > .btn { width: 100%; white-space: nowrap; }
+.actions-grid > p { margin: 0; line-height: 1.4; align-self: center; }
+.actions-divider { grid-column: 1 / -1; margin: 4px 0; border: 0; border-top: 1px solid var(--c-surface-3); }
+
+/* ---------- Preset Grid ---------- */
+/* Three columns, matching the hardware keys (1 2 3 / 4 5 6). Narrow windows
+   fall back to two. */
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
+@media (max-width: 560px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+/* Equal-height preset tiles: a 2-line station name otherwise grows only its
+   own row. grid-auto-rows: 1fr makes every row match the tallest, so all
+   buttons stay the same size. */
+#presets { grid-auto-rows: 1fr; }
+.preset {
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  padding: 10px;
+  cursor: pointer;
+  min-height: 76px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  transition: all 0.15s;
+  min-width: 0;
+  overflow: hidden;
+  position: relative;
+  user-select: none;
+}
+.preset:hover { background: var(--c-surface-3); }
+.preset:active { background: var(--c-surface-3); }
+.preset.empty { color: var(--c-faint); border-style: dashed; }
+/* preset.playing uses SIGNAL-GREEN: stays green as the "playing" marker */
+.preset.playing {
+  background: linear-gradient(135deg, #1f2f1f 0%, #2a3a2a 100%);
+  border-color: var(--signal-green);
+  box-shadow: 0 0 12px rgba(102, 204, 102, 0.25);
+}
+.preset.playing .name { color: #cfc; }
+.preset.error {
+  background: linear-gradient(135deg, #2f1f1f 0%, #3a2a2a 100%);
+  border-color: var(--signal-red);
+  box-shadow: 0 0 10px rgba(204, 102, 102, 0.25);
+}
+.preset.error .name { color: #fcc; }
+/* The playing/error tiles above hardcode DARK gradients. In the light theme
+   the sublabels (.num, bitrate, hint) switch to dark light-theme greys, which
+   vanished on those dark tiles; the tiles must flip with the theme. */
+html.a11y-light .preset.playing {
+  background: linear-gradient(135deg, #e4f2e4 0%, #d3e8d3 100%);
+}
+html.a11y-light .preset.playing .name { color: #0f5132; }
+html.a11y-light .preset.error {
+  background: linear-gradient(135deg, #f8e6e6 0%, #f0d8d8 100%);
+}
+html.a11y-light .preset.error .name { color: #991b1b; }
+.preset.long-press {
+  transform: scale(0.96);
+  box-shadow: 0 0 16px rgba(107, 221, 255, 0.4);
+}
+.preset .num { font-size: 11px; color: var(--c-muted); }
+.preset .name { font-size: 14px; font-weight: 600; margin-top: 2px; }
+.preset-bitrate { font-size: 10px; font-weight: 400; color: var(--c-muted); margin-top: 1px; line-height: 1.1; }
+.preset-account { font-size: 10px; font-weight: 400; color: #1ED760; margin-top: 1px; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.85; }
+/* DLNA preset: small muted "from <server>" badge, same shape as the Spotify account line. */
+.preset-source { font-size: 10px; font-weight: 400; margin-top: 1px; line-height: 1.1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: 0.6; }
+/* Box-native preset (one the box owns, e.g. Deezer): a subtly distinct tile and a
+   small hint that tapping recalls it on the speaker. */
+.preset.box-native { border-style: dashed; border-color: var(--c-border); }
+.preset.box-native.playing { border-style: solid; }
+.preset-box-hint { font-size: 10px; font-weight: 400; color: var(--c-muted); margin-top: 2px; line-height: 1.1; opacity: 0.75; }
+/* A key STM wrote that the store no longer backs (left over from before a
+   reinstall): shown, named, but not offered as playable. Same amber as
+   the loss banner above the grid, which explains it. */
+.preset.lost { border-style: dashed; border-color: var(--c-border); cursor: default; }
+.preset.lost .name { color: var(--c-muted); }
+.preset.lost .preset-box-hint { color: #e8c878; opacity: 1; }
+/* Banner above the preset grid warning that the box dropped account-linked
+   presets STM cannot carry over yet (e.g. Deezer). Amber accent, dismissible. */
+.loss-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid #6a5320;
+  border-left: 3px solid #d9a33a;
+  border-radius: 8px;
+  background: rgba(217, 163, 58, 0.08);
+}
+.loss-notice-body { flex: 1 1 auto; min-width: 0; }
+.loss-notice-body strong { font-size: 13px; color: #e8c878; }
+.loss-notice-body .small { font-size: 12px; color: var(--c-muted); margin-top: 3px; line-height: 1.35; }
+.loss-notice-dismiss {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--c-muted);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.loss-notice-dismiss:hover { color: var(--c-text); }
+/* There is deliberately no live-track rule for a preset tile. A .preset-track
+   line used to render the running ICY title on the playing key and marquee it;
+   a key is one third of the window wide, so it scrolled almost always, next to
+   the now-playing bar scrolling the same string ("why display the same
+   information in two places?", user report 2026-08-23). The key now shows only
+   what is saved on it, and .track-inner below belongs to that bar alone. */
+.track-inner { display: inline-block; position: relative; left: 0; }
+/* The now-playing status line marquees when it overflows. It sits in a flex row
+   with the state label + bitrate after it, so it shrinks (not those) and clips
+   its overflow. */
+.status-bar .now { flex: 0 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; }
+/* Marquee a status line too long for the window: pause at the start, scroll
+   left until the end shows, pause, then jump back to the start (the loop wrap).
+   The scroll distance and duration are set per line by applyTrackScroll. Lines
+   that fit never get the .scrolling class and stay still.
+   Animating `left` (not `transform`) on purpose: a transform animation puts the
+   text on a GPU layer that is rasterised once and sampled at sub-pixel offsets,
+   which looks blurry while moving; animating `left` re-renders the text crisply
+   each frame (cheap for one short line). */
+.track-inner.scrolling {
+  animation: track-marquee var(--track-dur, 6s) linear infinite;
+}
+@keyframes track-marquee {
+  /* Longer pause at the start (0-22%) so after the loop jumps back to the
+     beginning the user can read the start of the title/artist before it
+     scrolls again; hold at the end (78-100%) before the wrap. */
+  0%, 22%   { left: 0; }
+  78%, 100% { left: calc(-1 * var(--track-scroll, 0px)); }
+}
+.preset .url { font-size: 10px; color: var(--c-faint); margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.preset-head { display: flex; justify-content: space-between; }
+/* The two key icons share the right-hand end of the header, so adding the
+   rename pencil did not push the clear X away from the corner users know. */
+.preset-acts { display: flex; align-items: center; gap: 2px; }
+.preset .del { color: var(--c-faint); cursor: pointer; padding: 0 4px; font-size: 16px; }
+.preset .del:hover { color: var(--signal-red); }
+.preset .ren { color: var(--c-faint); cursor: pointer; padding: 0 4px; font-size: 13px; line-height: 1.2; }
+.preset .ren:hover { color: var(--c-text); }
+/* The name field in the shared modal: full width, because a station name is
+   longer than the box a browser gives an input by default. */
+.rename-input {
+  width: 100%; box-sizing: border-box; margin-top: 4px; padding: 8px 10px;
+  font: inherit; font-size: 14px; color: var(--c-text);
+  background: var(--c-bg); border: 1px solid var(--c-border); border-radius: 6px;
+}
+.rename-input:focus { outline: none; border-color: var(--brand); }
+.preset-state { font-size: 12px; margin-top: 4px; font-weight: 500; }
+.preset-state.state-play { color: var(--signal-green); }
+.preset-state.state-buf { color: var(--signal-yellow); animation: pulse 1.5s ease-in-out infinite; }
+.preset-state.state-pause { color: var(--c-muted); }
+.preset-state.state-err { color: var(--signal-red); }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+.preset-hint {
+  font-size: 10px;
+  /* --c-faint, not a border token: border colours are tuned to sit quietly
+     against the background and measured 2:1 as text in the light theme
+     (same class of bug as the footer, fixed 2026-08-17). */
+  color: var(--c-faint);
+  margin-top: 2px;
+}
+.long-press-bar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  width: 0;
+  background: var(--brand);
+  transition: width 0.05s linear;
+}
+
+/* ---------- Search ---------- */
+.search { background: var(--c-surface); padding: 8px 10px; border-radius: 6px; margin-top: 6px; }
+.search h3 { margin: 0 0 8px 0; font-size: 13px; color: var(--c-muted); font-weight: 500; }
+/* --c-border-2 is a BORDER colour. Used as text it fell below readable
+   contrast, which showed up first on macOS. */
+.search h3 small { color: var(--c-muted); font-weight: normal; font-size: 11px; }
+.search-input-row { display: flex; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.search-input-row input { flex: 1; min-width: 130px; background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text); border-radius: 4px; padding: 8px; font-size: 13px; }
+.search-input-row input:focus { outline: none; border-color: var(--brand); }
+/* Wenn Suchfeld nicht leer ist (aktiver Filter) — visuell hervorheben */
+.search-input-row input.has-query {
+  border-color: var(--brand);
+  background: var(--brand-bg);
+}
+.search-filters { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; font-size: 12px; color: var(--c-muted); }
+.search-filters select { background: var(--c-bg); color: var(--c-text); border: 1px solid var(--c-border); border-radius: 4px; padding: 4px 8px; font-size: 12px; }
+/* Aktive Filter visuell hervorheben — anders als der Default Wert */
+.search-filters select.has-filter {
+  border-color: var(--brand);
+  background: var(--brand-bg);
+  color: var(--brand-text);
+}
+.search-filters label { display: flex; gap: 4px; align-items: center; cursor: pointer; }
+.search-filters input[type=checkbox] { accent-color: var(--brand); }
+.search-results { max-height: 360px; overflow-y: auto; }
+.result-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 8px 6px;
+  border-bottom: 1px solid var(--c-surface-2);
+}
+.result-row:hover { background: var(--c-surface-2); }
+
+.result-logo { position: relative; width: 40px; height: 40px; flex-shrink: 0; margin-top: 2px; }
+.fav, .fav-empty {
+  width: 40px;
+  height: 40px;
+  border-radius: 5px;
+  background: var(--c-bg);
+  object-fit: cover;
+  display: block;
+}
+.fav-empty { background: var(--c-bg) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23555' stroke-width='1.4'><path d='M9 18V5l12-2v13'/><circle cx='6' cy='18' r='3'/><circle cx='18' cy='16' r='3'/></svg>") center/22px no-repeat; }
+.fav-flag {
+  position: absolute;
+  bottom: -3px;
+  right: -3px;
+  font-size: 14px;
+  line-height: 1;
+  background: var(--c-bg);
+  border-radius: 3px;
+  padding: 1px 2px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+}
+
+.result-text { flex: 1; overflow: hidden; }
+.result-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text);
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.result-name-text { overflow: hidden; text-overflow: ellipsis; }
+.result-meta {
+  font-size: 11px;
+  color: var(--c-muted);
+  margin-top: 2px;
+}
+/* Discreet website link in the meta line, not a button. */
+.result-site {
+  color: #6aa9e9;
+  text-decoration: none;
+  cursor: pointer;
+}
+.result-site:hover { text-decoration: underline; }
+.result-tag-chips {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+.tag-pill {
+  display: inline-block;
+  background: var(--brand-bg);
+  color: var(--brand-text-mid);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 10px;
+  font-weight: 500;
+}
+
+.result-online-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.result-online-dot.ok { background: var(--signal-green); }
+.result-online-dot.bad { background: var(--signal-red); }
+.result-trend { font-size: 11px; color: var(--signal-green); margin-left: 2px; }
+.result-trend.up-down { color: var(--signal-red); }
+
+.result-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.result-actions .btn { padding: 4px 8px; }
+.result-actions .play-now.is-playing { background: var(--brand); color: var(--on-brand, #fff); border-color: var(--brand); box-shadow: var(--brand-glow, none); }
+/* Favorite toggle: a filled gold star when saved, a quiet outline otherwise. */
+.fav-toggle.is-fav { color: #f5c518; }
+/* The "Favorites" mode entry sits next to Top/Search and is hidden until the
+   first station is starred (toggled via the .hidden class in JS). */
+#favModeBtn.hidden { display: none; }
+/* "Add a missing station": the guide used to be a whole
+   paragraph at 0.7 opacity below the load-more button, and the users who needed
+   it never saw it. Now one quiet line sits above the result list and unfolds
+   into the full text, so it is readable at a glance and still out of the way. */
+.search-addhint { margin: 0 0 6px; }
+.search-addhint > summary {
+  cursor: pointer;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--c-muted);
+}
+.search-addhint > summary:hover { color: var(--c-text-2); text-decoration: underline; }
+.search-addhint-body {
+  margin: 4px 0 2px;
+  padding: 6px 8px;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  background: var(--brand-bg);
+  color: var(--c-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.search-addhint-actions { margin-top: 6px; }
+
+/* Dismissible hint above the results when the quality filters had to be
+   relaxed: quiet, one line, an x to dismiss for the current result set. */
+.search-relaxed-hint {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0 0 6px;
+  padding: 5px 8px;
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  background: var(--brand-bg);
+  color: var(--c-muted);
+  font-size: 11px;
+}
+.search-relaxed-dismiss {
+  background: transparent;
+  border: 0;
+  color: var(--c-muted);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.search-relaxed-dismiss:hover { color: var(--c-text); }
+
+/* Genre Chips */
+.genre-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 10px;
+  max-height: 80px;
+  overflow-y: auto;
+}
+.genre-chips:empty { display: none; }
+.chip {
+  background: var(--c-surface);
+  border: 1px solid var(--c-surface-3);
+  color: var(--c-muted);
+  border-radius: 14px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chip:hover { background: var(--c-surface-2); color: var(--c-text); }
+.chip.active { background: var(--brand-bg); color: var(--brand-text); border-color: var(--brand); }
+/* Country-boost chips — bubbled up from GENRE_BY_COUNTRY because the
+   genre is locally relevant. Marked with a brand-coloured strip on
+   the left edge, but otherwise the same neutral fill as a regular
+   chip — must never visually resemble the .active state or the user
+   thinks these pills are permanently selected. */
+.chip--boost {
+  border-left: 3px solid var(--brand);
+  padding-left: 8px;
+}
+/* .chip--boost.active falls through to the regular .chip.active
+   rule, which provides the selected-state colours. The left strip
+   remains visible on top, marking the chip as both selected and
+   locally promoted. */
+/* "Mehr Genres" toggle — visually a chip but stylistically a button so
+   it does not look like another filter. */
+.chip--more {
+  background: transparent;
+  border-style: dashed;
+  color: var(--c-muted);
+}
+.chip--more:hover { color: var(--brand-text); border-color: var(--brand); }
+
+/* Mehr laden */
+.load-more-row { display: flex; justify-content: center; margin-top: 8px; }
+.load-more-row .btn { padding: 4px 16px; font-size: 12px; }
+.search-count { padding: 4px 2px 6px 2px; font-size: 11px; }
+.search-count.hidden { display: none; }
+
+/* Preset Body mit Logo */
+.preset-body { display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+.preset-text { flex: 1; min-width: 0; }
+.preset-logo {
+  width: 32px;
+  height: 32px;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--c-bg);
+  flex-shrink: 0;
+}
+.muted { color: var(--c-faint); padding: 10px; }
+
+/* ---------- Modal ---------- */
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
+.modal.hidden { display: none; }
+.modal-content { background: var(--c-surface-2); border-radius: 8px; padding: 20px; width: 90%; max-width: 480px; }
+.modal-content h3 { margin: 0 0 4px 0; color: var(--brand); }
+.modal-sub { margin: 0 0 16px 0; color: var(--c-muted); font-size: 13px; }
+
+/* "Update all speakers" multi-progress overlay (logical props so RTL mirrors) */
+.ua-modal { max-width: 560px; }
+.ua-list { max-height: 52vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; margin: 4px 0 14px 0; }
+.ua-row { background: var(--c-surface); border-radius: 6px; padding: 8px 10px; }
+.ua-row-head { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+.ua-name { font-weight: 600; }
+.ua-model { color: var(--c-muted); font-size: 11px; }
+.ua-status { margin-inline-start: auto; color: var(--c-muted); font-size: 12px; text-align: end; }
+.ua-bar { height: 6px; background: var(--c-surface-3); border-radius: 3px; margin-top: 6px; overflow: hidden; }
+.ua-bar-fill { height: 100%; width: 0; background: var(--brand); transition: width 0.2s linear; }
+.ua-row.ua-done .ua-bar-fill { background: #3a9b6c; }
+.ua-row.ua-defer .ua-bar-fill { background: #c9933a; }
+.ua-row.ua-failed .ua-bar-fill { background: #c44; width: 100%; }
+.ua-row.ua-wait .ua-bar-fill { width: 0; }
+.ua-row.ua-wait .ua-status { color: var(--c-faint); }
+.ua-row.ua-busy .ua-bar-fill { width: 100%; background: var(--brand); opacity: 0.3; animation: ua-breathe 3s ease-in-out infinite alternate; }
+@keyframes ua-breathe { from { opacity: 0.22; } to { opacity: 0.5; } }
+@media (prefers-reduced-motion: reduce) { .ua-row.ua-busy .ua-bar-fill { animation: none; opacity: 0.35; } }
+
+.credits-list { max-height: 50vh; overflow-y: auto; margin-bottom: 14px; }
+.credit-row { padding: 7px 0; border-bottom: 1px solid var(--c-border); font-size: 13px; }
+.credit-row:last-child { border-bottom: none; }
+.credit-name { font-weight: 600; }
+.credit-by { color: var(--c-muted); }
+.credit-license { color: var(--c-muted); font-size: 11px; margin-left: 6px; }
+.credit-role { color: var(--c-muted); font-size: 12px; margin-top: 1px; }
+.credit-section { font-size: 13px; font-weight: 600; margin: 18px 0 2px; }
+.credit-section-intro { color: var(--c-muted); font-size: 12px; margin: 0 0 6px; }
+.credit-donate { font-size: 11px; margin-left: 6px; }
+.pick-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.pick-slot { background: var(--c-bg); border: 1px solid var(--c-border); border-radius: 6px; padding: 12px; cursor: pointer; color: var(--c-text); min-height: 70px; }
+.pick-slot:hover { background: var(--c-surface-3); border-color: var(--brand); }
+.pick-slot.has { border-color: var(--c-border-2); }
+.pick-slot.box-native { border-style: dashed; }
+.pick-slot .ps-source { font-size: 12px; color: var(--c-text-2); margin-top: 2px; }
+.pick-slot.armed { border-color: #f5a623; border-style: solid; }
+.pick-slot.armed .ps-name { color: #f5a623; font-size: 13px; }
+.ps-num { font-size: 12px; color: var(--c-muted); }
+.ps-name { font-size: 13px; font-weight: 600; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; }
+
+.warn-title { color: var(--signal-red) !important; display: flex; align-items: center; gap: 8px; margin: 0 0 8px 0; }
+/* Routine confirmations (updating the speakers) reuse this modal but must not
+   look like an alarm: brand colour, no triangle, and the confirm button is a
+   primary CTA instead of the red "proceed anyway". */
+.warn-title.warn-title-calm { color: var(--brand) !important; }
+.warn-icon { font-size: 24px; }
+.warn-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* Structured confirmation body: a short lead sentence, then the speakers it
+   applies to as a real list. The plain-text bodies used to be pushed through
+   innerHTML with "
+" separators, which HTML collapses into whitespace, so a
+   four-speaker prompt arrived as one unbroken wall of text. */
+.warn-body-rich { max-height: 46vh; overflow-y: auto; }
+.warn-body-rich p { margin: 0 0 6px 0; font-size: 14px; line-height: 1.45; }
+/* Logical properties, never left/right: the app ships Arabic and sets dir=rtl on
+   the document, so a physical padding-left with a left-positioned marker puts
+   the bullet on the wrong side of its own text for those users. */
+.warn-body-rich ul { margin: 0 0 14px 0; padding: 0; list-style: none; }
+.warn-body-rich ul:last-child { margin-bottom: 0; }
+.warn-body-rich li {
+  font-size: 14px; font-weight: 600; padding: 5px 10px; margin-bottom: 4px;
+  border-radius: 6px; background: var(--c-surface-3, rgba(255,255,255,.05));
+}
+.warn-body-rich .warn-notes { margin-top: 2px; }
+.warn-body-rich .warn-notes li {
+  font-weight: 400; font-size: 13px; color: var(--c-muted);
+  background: none; padding: 0; padding-inline-start: 14px; position: relative;
+}
+.warn-body-rich .warn-notes li::before { content: '\2022'; position: absolute; inset-inline-start: 2px; }
+/* Error detail text. The message itself is normal text colour, NOT the signal
+   red: red on the near-black surface measures about 3.5:1, under the 4.5:1 that
+   small text needs, and a user photographed exactly this and called it hard to
+   read (2026-08-12). The red moves to the frame, where a thick saturated
+   line carries the "something failed" meaning without having to be legible as
+   letters, and the modal's own warning title says it in words anyway. */
+.error-text { width: 100%; min-height: 110px; background: var(--c-bg); color: var(--c-text); border: 1px solid var(--c-border-2); border-left: 3px solid var(--signal-red); border-radius: 4px; padding: 8px; font-family: ui-monospace, "Consolas", monospace; font-size: 12px; resize: vertical; }
+
+.box-hint { background: var(--c-surface); padding: 24px; border-radius: 8px; text-align: center; color: var(--c-muted); margin-top: 8px; font-size: 13px; }
+.box-hint p { margin: 0; }
+
+/* ---------- Toast (Erfolg) ---------- */
+.toast {
+  position: fixed; bottom: 60px; left: 50%; transform: translateX(-50%) translateY(20px);
+  background: #1f2a1f; color: #cfc; padding: 10px 18px; border-radius: 20px; font-size: 13px;
+  opacity: 0; pointer-events: none; transition: all 0.25s ease; z-index: 200;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  border: 1px solid var(--signal-green);
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---------- Box Einstellungen View ---------- */
+#view-settings h2 { margin: 0 0 8px 0; color: var(--brand); font-size: 18px; }
+/* The library tab acts on one speaker (play, and presets are stored on it), so
+   it carries the same speaker picker as speaker settings and shares its look. */
+.library-box-switcher,
+.settings-box-switcher {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  background: var(--brand-bg);
+  border: 1px solid var(--brand-border);
+  border-radius: 6px;
+}
+.library-box-switcher select,
+.settings-box-switcher select {
+  flex: 1;
+  background: var(--c-bg);
+  color: var(--brand-text);
+  border: 1px solid var(--brand-border);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.combobox {
+  flex: 1;
+  position: relative;
+}
+.combobox input {
+  width: 100%;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 6px 28px 6px 8px;
+  font-size: 13px;
+}
+.combobox input:focus { outline: none; border-color: var(--brand); }
+.combo-toggle {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  color: var(--c-muted);
+  border: none;
+  cursor: pointer;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.combo-toggle:hover { color: var(--brand); }
+.combo-list {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  right: 0;
+  background: var(--c-surface);
+  border: 1px solid var(--brand-border);
+  border-radius: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 4px 0;
+  list-style: none;
+  z-index: 10;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+.combo-list li {
+  padding: 5px 10px;
+  font-size: 13px;
+  color: var(--c-text);
+  cursor: pointer;
+}
+.combo-list li:hover { background: var(--brand-bg); color: var(--brand-text); }
+.combo-list .combo-empty {
+  color: var(--c-faint);
+  cursor: default;
+  font-style: italic;
+}
+.combo-list .combo-empty:hover { background: transparent; color: var(--c-faint); }
+.settings-section {
+  background: var(--c-surface);
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-bottom: 10px;
+}
+.settings-section h3 {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  color: var(--c-text-2);
+  font-weight: 500;
+}
+/* Expert / advanced settings: collapsed by default, visually toned down so
+   normal users are not distracted by them. */
+.settings-expert {
+  border: 1px dashed var(--c-border);
+  background: var(--c-surface);
+}
+.settings-expert > summary.settings-expert-summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--c-muted);
+  list-style: revert;
+  user-select: none;
+}
+.settings-expert > summary.settings-expert-summary:hover { color: var(--c-text-2); }
+.settings-expert[open] > summary.settings-expert-summary { margin-bottom: 8px; }
+.expert-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #d8a24a;
+  border: 1px solid #6b5326;
+  background: #2a2316;
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.expert-intro { display: block; margin: 0 0 8px 0; }
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.setting-row input[type=text] {
+  flex: 1;
+  background: var(--c-bg);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.setting-row input[type=text]:focus { outline: none; border-color: var(--brand); }
+.setting-row input[type=range] {
+  flex: 1;
+  accent-color: var(--brand);
+}
+.setting-row select {
+  flex: 1;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+.setting-row select:focus { outline: none; border-color: var(--brand); }
+#setupRegion, #setupLang {
+  width: 100%;
+  background: var(--c-bg);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 13px;
+}
+#setupRegion:focus, #setupLang:focus { outline: none; border-color: var(--brand); }
+.setup-sublabel { display: block; margin: 10px 0 4px; font-size: 12px; color: var(--c-muted); }
+.setting-value {
+  min-width: 32px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: var(--brand-text);
+}
+.kv-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  padding: 3px 0;
+  border-bottom: 1px dotted var(--c-surface-2);
+}
+.kv-row:last-child { border-bottom: none; }
+.kv-key { color: var(--c-muted); }
+.kv-val { color: var(--c-text); }
+.sources-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 8px 0 10px;
+}
+/* Every source is a neutral chip led by a status dot, so the list reads at a
+   glance without a wall of filled colour: green = active/available, the brand
+   colour = revived by STM, grey = not available. */
+.source-pill {
+  font-size: 11.5px;
+  padding: 5px 11px;
+  border-radius: 20px;
+  background: var(--c-surface-2);
+  border: 1px solid var(--c-border);
+  color: var(--c-text);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.source-pill::before {
+  content: ""; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--c-faint); flex: 0 0 auto;
+}
+.source-pill small { color: var(--c-text-2); font-size: 10px; margin-left: 2px; }
+.source-pill.src-ok::before { background: #3fb950; }
+.source-pill.src-via-str::before { background: var(--brand); }
+.source-pill.src-unav { color: var(--c-muted); }
+.source-pill.src-unav::before { background: var(--c-faint); }
+
+/* ---------- Setup View ---------- */
+#view-setup h2 { margin: 0 0 8px 0; color: var(--brand); }
+.setup-intro { color: var(--c-muted); font-size: 13px; margin-bottom: 18px; }
+.setup-stay-on-wifi-note {
+  background: #1a2a1f;
+  border-left: 3px solid #4caf50;
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 0 0 10px 0;
+  color: #c8e6c9;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.setup-section { background: var(--c-surface); padding: 12px; border-radius: 6px; margin-bottom: 10px; }
+.setup-section h3 { margin: 0 0 10px 0; font-size: 14px; color: var(--c-text-2); font-weight: 500; }
+.setup-section-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.setup-section-head h3 { margin: 0; }
+.setup-target-section { border-left: 3px solid var(--brand, #58a); }
+.setup-target-cards { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; }
+.setup-target-card { background: var(--c-bg); border: 1px solid var(--c-surface-3); border-radius: 6px; padding: 10px 12px; cursor: pointer; text-align: left; width: 100%; color: var(--c-text); font: inherit; transition: background .15s, border-color .15s; }
+.setup-target-card:hover { background: var(--c-surface-2); border-color: var(--c-border); }
+.setup-target-card.selected { border-color: var(--brand, #58a); background: var(--brand-bg, #1f2c3a); }
+.stc-row1 { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.stc-left { display: flex; align-items: center; gap: 9px; min-width: 0; }
+/* Radio dot: an empty ring that fills in when its card is selected, so
+   the cards read as a single-choice selector rather than info rows. */
+.stc-radio { flex: 0 0 auto; width: 15px; height: 15px; border-radius: 50%; border: 2px solid var(--c-faint); box-sizing: border-box; position: relative; }
+.setup-target-card:hover .stc-radio { border-color: var(--c-muted); }
+.setup-target-card.selected .stc-radio { border-color: var(--brand, #58a); }
+.setup-target-card.selected .stc-radio::after { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: var(--brand, #58a); }
+.stc-label { font-size: 14px; color: var(--c-text); }
+.stc-badge { font-size: 10px; background: var(--c-surface-3); color: var(--c-text); border: 1px solid var(--c-border); padding: 2px 6px; border-radius: 10px; white-space: nowrap; }
+/* Fixed text colours, independent of the theme's --c-text: the orange chip
+   needs DARK text (white/#eee measures ~2.9:1 on it), the green chip needs
+   WHITE text (dark theme text passes, the light theme's near-black is 3.3:1). */
+/* Black, not near-black, and semibold: 10px regular on this amber measured
+   5.4:1 and a reporter still could not read it. */
+.stc-badge.badge-warn { background: #d97706; color: #000; font-weight: 600; }
+.stc-badge.badge-ok { background: #2a7f3f; color: #fff; }
+.stc-sublabel { font-size: 11px; color: var(--c-muted); margin-top: 3px; }
+.setup-target-empty { padding: 8px 4px; }
+.setup-target-factory-help { background: var(--c-bg); border: 1px dashed var(--c-border); border-radius: 4px; padding: 8px 10px; margin-top: 6px; }
+.setup-factory-boseapp-links { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; }
+.setup-factory-boseapp-links .btn { font-size: 12px; }
+.boseapp-store { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+/* Small but scannable; white quiet zone so the phone camera locks on. Hidden
+   until the locally generated QR data URI arrives. */
+.boseapp-qr { width: 110px; height: 110px; background: #fff; border-radius: 6px; padding: 5px; display: none; }
+.boseapp-qr.ready { display: block; }
+.setup-target-factory-mac { background: #2f1f0f; border-left: 3px solid #d97706; border-radius: 4px; padding: 8px 10px; margin-top: 6px; color: #e5d4b8; font-size: 12px; }
+.setup-target-st30-warn { background: #2f1f0f; border-left: 3px solid #d97706; border-radius: 4px; padding: 8px 10px; margin-top: 6px; color: #e5d4b8; font-size: 12px; }
+.worldmap-invite { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%) translateY(20px) scale(.96); display: flex; align-items: flex-start; gap: 12px; background: var(--c-surface); border: 1px solid var(--brand); border-radius: 10px; padding: 12px 30px 12px 14px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); opacity: 0; transition: opacity .3s ease, transform .35s cubic-bezier(.2,1.5,.4,1); z-index: 2000; max-width: 92vw; overflow: visible; }
+.worldmap-invite.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
+.worldmap-invite .wmi-body { display: flex; flex-direction: column; gap: 6px; }
+.worldmap-invite .wmi-text { color: var(--c-text); font-size: 13px; font-weight: 600; }
+.worldmap-invite .wmi-count { color: var(--brand); font-size: 12px; }
+.worldmap-invite .wmi-count.hidden { display: none; }
+.worldmap-invite .wmi-share { align-self: flex-start; }
+.worldmap-invite .wmi-map { position: relative; flex: 0 0 auto; width: 132px; height: 66px; padding: 0; border: 1px solid #2a4a5a; border-radius: 8px; background: #11202b; cursor: pointer; overflow: hidden; transition: transform .15s ease, box-shadow .15s ease; }
+.worldmap-invite .wmi-map:hover { transform: scale(1.03); box-shadow: 0 0 0 2px var(--brand); }
+.worldmap-invite .wmi-map:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--brand); }
+.worldmap-invite .wmi-map-svg { display: block; width: 100%; height: 100%; }
+.worldmap-invite .wmi-map-badge { position: absolute; top: -7px; left: -5px; font-size: 17px; pointer-events: none; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); animation: wmiBounce 1.1s ease infinite; }
+.worldmap-invite .wmi-close { position: absolute; top: 4px; right: 6px; background: none; border: none; color: var(--c-muted); font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.worldmap-invite .wmi-close:hover { color: var(--c-text-2); }
+@keyframes wmiBounce { 0%,100% { transform: translateY(0) rotate(-7deg); } 50% { transform: translateY(-6px) rotate(7deg); } }
+.worldmap-invite .wmi-confetti { position: absolute; left: 0; right: 0; top: -10px; height: 0; pointer-events: none; }
+.worldmap-invite .wmi-confetti span { position: absolute; top: 0; font-size: 16px; opacity: 0; animation: wmiConfetti 2.2s ease-out forwards; }
+@keyframes wmiConfetti { 0% { opacity: 0; transform: translateY(0) rotate(0); } 10% { opacity: 1; } 100% { opacity: 0; transform: translateY(72px) rotate(220deg); } }
+
+/* Recently played: cross-source source cards with their tracks below. */
+.recent-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+.recent-title { margin: 0; font-size: 20px; }
+.recent-sub { font-size: 13px; margin-bottom: 14px; }
+.recent-scope { display: flex; gap: 6px; }
+.recent-scope .chip { background: var(--brand-bg); color: var(--brand-text-mid); border: 1px solid var(--brand-border); border-radius: 14px; padding: 4px 12px; font-size: 12px; cursor: pointer; }
+.recent-scope .chip.active { background: var(--brand); color: var(--c-bg); border-color: var(--brand); font-weight: 600; }
+/* Speaker picker: replaces the old "this speaker / all" chips. */
+.recent-box-select { background: var(--brand-bg); color: var(--brand-text-mid); border: 1px solid var(--brand-border); border-radius: 14px; padding: 4px 28px 4px 12px; font-size: 12px; cursor: pointer; max-width: 220px; }
+.recent-box-select:hover { border-color: var(--brand); }
+.recent-list { display: flex; flex-direction: column; gap: 12px; }
+.recent-empty, .recent-loading { color: var(--brand-text-mid); padding: 24px 4px; text-align: center; }
+.recent-card { background: var(--c-surface); border: 1px solid var(--brand-border); border-radius: 10px; overflow: hidden; }
+.recent-card .rc-head { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+.rc-logo { width: 40px; height: 40px; border-radius: 6px; object-fit: cover; flex: 0 0 auto; background: var(--c-surface-3); }
+.rc-logo-ph { background: linear-gradient(135deg, #2a3a4a, #1f2a35); }
+.rc-meta { flex: 1 1 auto; min-width: 0; }
+.rc-name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rc-sub { font-size: 12px; color: var(--brand-text-mid); margin-top: 2px; }
+.rc-box { color: var(--brand-text); }
+.rc-site { color: #6aa9e9; text-decoration: none; cursor: pointer; }
+.rc-site:hover { text-decoration: underline; }
+.rc-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.rc-actions .rc-fav.is-fav { color: #f5c518; border-color: #f5c518; }
+.rc-tracks { border-top: 1px solid var(--c-surface-2); padding: 4px 12px 8px 64px; }
+.rc-track { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; padding: 3px 0; }
+.rc-tr-main { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* The artist line was near white, which is invisible on a light card
+ Both of these now follow the theme. */
+.rc-tr-lead { color: var(--c-text); }
+.rc-tr-sub { color: var(--c-muted); margin-left: 8px; }
+.rc-tr-time { color: var(--c-muted); flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+.recent-card.rc-now { border-color: var(--signal-green); box-shadow: 0 0 12px rgba(102, 204, 102, 0.25); }
+.rc-now-badge { color: var(--signal-green); font-size: 11px; font-weight: 600; white-space: nowrap; margin-left: 6px; }
+.setup-target-pill { margin-top: 10px; padding: 8px 12px; background: var(--c-bg); border: 1px solid var(--c-surface-3); border-radius: 4px; font-size: 13px; }
+.setup-target-pill b { color: var(--c-text); }
+.small { font-size: 12px; }
+code { background: var(--c-bg); padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+.drive-row { background: var(--c-bg); border: 1px solid var(--c-surface-3); border-radius: 6px; padding: 10px 12px; margin-bottom: 6px; cursor: pointer; }
+.drive-row:hover { background: var(--c-surface-2); }
+.drive-row.active { border-color: var(--brand); background: var(--brand-bg); }
+.drive-info { display: flex; flex-direction: column; gap: 2px; }
+.drive-path { font-size: 14px; color: var(--c-text); }
+.drive-meta { font-size: 11px; color: var(--c-muted); }
+.badge { font-size: 10px; background: var(--brand); color: var(--on-brand, #fff); padding: 2px 6px; border-radius: 10px; margin-left: 6px; vertical-align: middle; }
+.badge-warn { background: #d97706; color: #000; font-weight: 600; }
+/* Hard-demote notice on the Wi-Fi-only (no-stick) onboarding panel. */
+.setup-ap-push-warn { margin: 6px 0 8px; padding: 8px 10px; background: #2f1f0f; border-left: 3px solid #d97706; border-radius: 4px; color: #fbbf24; font-size: 12px; }
+.security-warn { margin-top: 10px; padding: 10px 12px; background: linear-gradient(135deg, #2f1f0f 0%, #3a2a1a 100%); border-left: 3px solid #d97706; border-radius: 4px; }
+.security-warn-title { color: #fbbf24; font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.security-warn-text { color: #e5d4b8; font-size: 12px; line-height: 1.4; margin-bottom: 8px; }
+.security-warn button { background: #d97706; color: #fff; border: none; }
+.security-warn button:hover { background: #b45309; }
+/* Informational variant: SSH deliberately left open (persistent marker). Neutral
+   blue, no call-to-action, so it does not read as a problem to fix. */
+.security-warn.security-info { background: linear-gradient(135deg, #0f2030 0%, #1a2a3a 100%); border-left-color: #3b82f6; }
+.security-warn.security-info .security-warn-text { color: #c7d8ec; margin-bottom: 0; }
+.global-security-banner { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: linear-gradient(90deg, #3a2a1a 0%, #2f1f0f 100%); border-bottom: 2px solid #d97706; color: #fbbf24; font-size: 13px; }
+.global-security-banner.hidden { display: none; }
+.global-security-text { flex: 1; color: #e5d4b8; }
+.global-security-text b { color: #fbbf24; }
+.global-security-banner button { background: #d97706; color: #fff; border: none; }
+.global-security-banner button:hover { background: #b45309; }
+
+#wlanSection input, #wlanSection select,
+#wlanSwitchForm input, #wlanSwitchForm select { width: 100%; background: var(--c-bg); border: 1px solid var(--c-border); color: var(--c-text); border-radius: 4px; padding: 8px; font-size: 13px; margin-bottom: 6px; }
+#wlanSwitchForm input:focus, #wlanSwitchForm select:focus { outline: none; border-color: var(--brand); }
+.wlan-row { display: flex; gap: 6px; align-items: stretch; margin-bottom: 6px; }
+.wlan-row select, .wlan-row input { flex: 1; margin-bottom: 0 !important; }
+.wlan-row .btn-mini, .wlan-row .btn-icon-sm { flex-shrink: 0; }
+.btn-icon-sm { background: var(--brand-bg-soft); color: var(--brand-text); border: 1px solid var(--brand-border); border-radius: 4px; width: 36px; padding: 0; cursor: pointer; font-size: 14px; }
+#wlanSection input:focus, #wlanSection select:focus { outline: none; border-color: var(--brand); }
+#wlanSection h3 small { color: var(--c-muted); font-weight: normal; font-size: 11px; }
+.setup-result { margin-top: 12px; font-size: 13px; }
+
+/* OTA-first setup: the network-install hero is the prominent primary action for
+   a reachable speaker; the USB-stick wizard is demoted into a collapsed
+   <details> that reads as a fallback. */
+.setup-primary-action { margin: 4px 0 12px; }
+.setup-hero { background: var(--brand-bg, #1f2c3a); border: 1px solid var(--brand, #58a); border-radius: 8px; padding: 16px; }
+.setup-hero h3 { margin: 0 0 6px 0; font-size: 16px; color: var(--c-text); font-weight: 600; }
+.setup-hero-body { color: var(--c-muted); font-size: 13px; margin: 0 0 12px 0; }
+.setup-stick-details { margin-bottom: 10px; }
+.setup-stick-details > summary { cursor: pointer; padding: 10px 12px; background: var(--c-surface); border-radius: 6px; color: var(--c-text-2); font-size: 13px; }
+.setup-stick-details > summary:hover { background: var(--c-surface-2); }
+.setup-stick-details[open] > summary { margin-bottom: 8px; }
+.setup-stick-summary-label { font-weight: 500; }
+.setup-stick-summary-hint { display: block; margin-top: 3px; }
+
+/* Live install checklist: phase rows + an independent timer so the long silent
+   install stretches always read as alive. */
+.setup-checklist { padding: 4px 0; }
+.chk-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; font-weight: 500; color: var(--c-text-2); }
+.chk-timer { font-variant-numeric: tabular-nums; color: var(--c-muted); font-size: 13px; }
+.chk-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; color: var(--c-muted); font-size: 13px; }
+/* Preset transfer row (music view): copy on the left, paste on the right,
+   clipboard state in between. Icon buttons with tooltip labels. */
+.preset-copy-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 8px; margin: 6px 2px 0; }
+/* Group control: chips to add/remove the other speakers to a group led by the
+   selected one, plus one volume slider for the whole group. Own line under the
+   Transfer button so it never crowds it. */
+.group-control { flex-basis: 100%; display: flex; flex-direction: column; gap: 4px; margin: 0 0 10px; }
+.group-control:empty { display: none; margin: 0; }
+/* The label + notes use the .muted utility, which carries a global 10px padding
+   (for empty-state blocks). Here that indented the label and pushed it off its
+   chips, so reset it: the label then aligns flush left and sits tight (4px, the
+   flex gap) above the buttons it labels. */
+.group-control .muted { padding: 0; }
+.group-label { line-height: 1.2; }
+.group-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+
+/* A chip whose click has been accepted but whose group edit has not run yet.
+   The clicks are collected for a moment so several speakers join together
+   instead of one zone form per click, and without this the chip would look
+   unchanged and invite a second click. */
+.group-chip.pending { outline: 2px solid var(--brand); outline-offset: 1px; opacity: .85; }.group-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; font-size: 12px; line-height: 1.5; border: 1px solid var(--c-border); border-radius: 14px; background: var(--c-surface); color: var(--c-text); cursor: pointer; }
+.group-chip:hover { border-color: var(--brand); }
+/* Membership is a SELECTION, not a success and not a status. --signal-green is
+   reserved for "playing / online ok / success", and on this very tab
+   .box-playing already uses it to mean "this speaker is playing right now", so
+   green here said two different things at once. It also made a chip flip from
+   brand blue (.group-chip.pending, one rule below) to green as the click
+   landed, which reads as a state change that never happened. Brand, like every
+   other "this one is picked" in the app. */
+.group-chip.in-group { border-color: var(--brand); background: var(--brand-bg); color: var(--brand); }
+.group-chip-mark { font-weight: 700; opacity: 0.85; }
+/* The group volume is a separate control, so set it apart from the chips above. */
+.group-vol-row { display: flex; align-items: center; gap: 8px; max-width: 360px; margin-top: 6px; }
+.group-vol-row input[type=range] { flex: 1; min-width: 120px; }
+.preset-transfer-btn { display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
+.preset-transfer-btn svg { flex: 0 0 auto; }
+.preset-xfer-select { margin-top: 8px; padding: 6px 8px; }
+.chk-eta { margin-left: auto; font-weight: 400; white-space: nowrap; }
+.chk-row.chk-run { color: var(--c-text); font-weight: 500; }
+.chk-row.chk-done { color: var(--c-text-2); }
+.chk-ico { flex: 0 0 16px; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; }
+.chk-ico.chk-done { color: var(--signal-green); }
+.chk-ico.chk-pend::before { content: ''; width: 11px; height: 11px; border: 2px solid var(--c-surface-3); border-radius: 50%; }
+.chk-ico.chk-spin::before { content: ''; width: 11px; height: 11px; border: 2px solid var(--c-surface-3); border-top-color: var(--brand, #58a); border-radius: 50%; animation: chk-spin 0.8s linear infinite; }
+.chk-row.chk-fail { color: var(--c-text-2); }
+.chk-ico.chk-fail { color: var(--signal-red); }
+@keyframes chk-spin { to { transform: rotate(360deg); } }
+.chk-detail { margin: 2px 0 4px 24px; }
+.chk-reassure { margin-top: 12px; }
+/* Post-install provisioning checklist (name / language / time zone / Wi-Fi). */
+.setup-provision { margin-top: 10px; }
+/* Coprocessor power-cycle troubleshooting note on the done / failure screens. */
+.setup-powercycle { margin-top: 14px; max-width: 40rem; line-height: 1.4; }
+
+/* OTA card Wi-Fi block + safe-to-unplug line */
+.setup-hero-wifi { margin: 12px 0 14px; padding-top: 12px; border-top: 1px solid var(--c-surface-3); }
+.setup-hero-wifi-label { display: block; font-weight: 500; margin-bottom: 2px; }
+.setup-hero-wifi input[type="text"], .setup-hero-wifi input[type="password"] { width: 100%; margin-top: 6px; }
+.setup-hero-wifi .wlan-row select { flex: 1; min-width: 0; }
+.setup-hero-field { margin: 10px 0; }
+.setup-hero-field input, .setup-hero-field select { width: 100%; margin-top: 6px; }
+.setup-unplug { color: var(--signal-green); margin: 6px 0; font-size: 13px; }
+.setup-ok { color: var(--signal-green); }
+.setup-err { color: var(--signal-red); }
+.setup-warn { color: var(--signal-red); }
+.setup-ok-actions { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.setup-ok-actions .muted { max-width: 38rem; }
+.setup-help { margin-top: 12px; max-width: 40rem; font-size: 0.92em; }
+.setup-help ul { margin: 6px 0 0; padding-left: 1.2rem; }
+.setup-help li { margin: 4px 0; line-height: 1.4; }
+.zone-controls { max-width: 40rem; display: flex; flex-direction: column; gap: 12px; }
+.zone-field { display: flex; flex-direction: column; gap: 6px; }
+
+/* Multi-room intro: a plain confident header, no beta pill. */
+.zone-intro { max-width: 44rem; margin-bottom: 16px; }
+.zone-intro h2 { margin: 0 0 6px; }
+.zone-intro p { margin: 0 0 8px; color: var(--c-text-2); line-height: 1.5; }
+
+/* Permanent-group card: the headline multi-room feature, given a real panel
+   instead of a checkbox buried in the controls. It highlights
+   with the same --brand accent the selected zone cards use, so "on" reads at a
+   glance. The whole panel is the label, so a click anywhere toggles it. */
+.zone-permanent-card {
+  display: flex; gap: 12px; align-items: flex-start;
+  padding: 13px 15px; border: 1px solid var(--c-border); border-radius: 10px;
+  background: var(--c-surface-2); cursor: pointer;
+  transition: border-color .12s, background .12s, box-shadow .12s;
+}
+.zone-permanent-card:hover { border-color: var(--c-border-2); }
+.zone-permanent-card.on { border-color: var(--brand); background: var(--brand-bg); box-shadow: 0 0 0 1px var(--brand) inset; }
+.zone-permanent-card input[type="checkbox"] { margin-top: 2px; flex: 0 0 auto; width: 17px; height: 17px; cursor: pointer; }
+.zone-permanent-body { display: flex; flex-direction: column; gap: 3px; }
+.zone-permanent-title { font-weight: 600; display: flex; align-items: center; gap: 7px; }
+.zone-permanent-icon { font-size: 15px; }
+
+/* Live groups and stereo pairs, framed in the same colours the Music-tab
+   speaker picker uses (.box-group / .box-group-cN), so an existing group reads
+   the same on both pages. Read-only status strip. */
+.zone-frames { display: flex; flex-wrap: wrap; gap: 10px; margin: 0 0 16px; }
+.zone-frames .box-group { align-items: center; }
+.zone-frame-chip {
+  display: inline-block; padding: 4px 9px; border-radius: 6px;
+  background: var(--c-surface-2); color: var(--c-text); font-size: 12px; font-weight: 500;
+}
+
+/* Stereo pair as two channel cards that fill with the speaker names once the
+   pair exists. Filled + highlighted when the selected pair is
+   actually live; a dash while a new pair is still being picked. */
+.stereo-cards { display: flex; gap: 12px; margin: 4px 0 6px; }
+.stereo-card {
+  flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 4px;
+  padding: 12px 14px; border: 1px solid var(--c-border); border-radius: 8px;
+  background: var(--c-surface-2);
+}
+.stereo-card.on { border-color: var(--brand); background: var(--brand-bg); box-shadow: 0 0 0 1px var(--brand) inset; }
+.stereo-card-ch {
+  align-self: flex-start; font-weight: 700; font-size: 11px; line-height: 1;
+  padding: 3px 6px; border-radius: 5px; background: var(--c-surface-3); color: var(--c-text-2);
+}
+.stereo-card.on .stereo-card-ch { background: var(--brand); color: var(--brand-text); }
+.stereo-card-label { font-size: 11px; color: var(--c-text-2); text-transform: uppercase; letter-spacing: 0.4px; }
+.stereo-card-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stereo-card-name.empty { color: var(--c-faint); font-weight: 400; }
+
+.zone-field > span { font-weight: 600; }
+.zone-actions { display: flex; gap: 8px; align-items: center; margin-top: 4px; }
+.zone-pick-hint { margin: 0 0 10px; padding: 0; }
+.zone-cards { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+.zone-card { position: relative; min-width: 150px; max-width: 230px; padding: 12px 14px; border: 1px solid var(--c-border); border-radius: 8px; background: var(--c-surface-2); color: var(--c-text); cursor: pointer; transition: border-color .12s, background .12s, box-shadow .12s; }
+.zone-card:hover { background: var(--c-border); }
+.zone-card.master { background: var(--brand-bg); border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand) inset; }
+/* Was hard-coded Material green #4caf50: an ok/success colour used for a pure
+   selection state, in the same grid where .zone-card.master marks itself with
+   --brand, so one card grid spoke two selection languages. It also ignored the
+   themes entirely and measured 2.55:1 on the light surface, i.e. the selected
+   border was all but invisible in light mode. */
+.zone-card.selected { border-color: var(--brand); box-shadow: 0 0 0 1px var(--brand) inset; }
+.zone-card-name { font-weight: 600; font-size: 13px; }
+.zone-card-host { display: block; opacity: 0.6; font-size: 10px; margin-top: 2px; }
+.zone-card-tick { position: absolute; top: 8px; right: 10px; font-size: 14px; line-height: 1; }
+.zone-card.master .zone-card-tick { color: var(--brand); }
+.zone-card.selected .zone-card-tick { color: var(--brand); }
+.zone-card-foot { margin-top: 10px; }
+.zone-badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 999px; background: var(--brand); color: var(--c-bg); font-weight: 600; }
+.zone-makemain { font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--c-border-2); background: transparent; color: var(--c-muted); cursor: pointer; }
+.zone-makemain:hover { border-color: var(--brand); color: var(--c-text); }
+.seg { display: inline-flex; border: 1px solid var(--c-border); border-radius: 6px; overflow: hidden; width: fit-content; }
+.seg-btn { padding: 6px 12px; background: transparent; border: none; color: var(--c-text); cursor: pointer; font-size: 12px; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--c-border); }
+.seg-btn.active { background: var(--brand-bg); color: var(--brand-text); }
+.zone-topbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.zone-live { font-size: 11px; margin-top: 6px; color: var(--c-muted); }
+/* "In a live zone" IS a status, so green is right here — but through the token,
+   so the light and high-contrast themes get their tuned values instead of the
+   2.55:1 the raw #4caf50 measured on white. */
+.zone-live.in { color: var(--signal-green); }
+.zone-update-badge { display: inline-block; margin-left: 6px; font-size: 10px; padding: 2px 8px; border-radius: 999px; background: #5a3a1a; color: #f8c66c; }
+.zone-card.outdated { border-style: dashed; }
+/* Linux/GTK fix (reported on Zorin 18.1): native <select> and especially the
+   <option> popup do not inherit the app's dark theme on Linux/WebKitGTK, so
+   they render white text on a white background. Force readable colors on every
+   select and its options regardless of the system GTK theme. Section-specific
+   select rules above are more specific and keep their own look; this is the
+   safety net that also covers the <option> popup nothing else styles. */
+select { background-color: var(--c-bg); color: var(--c-text); }
+select option { background-color: var(--c-bg); color: var(--c-text); }
+.fw-stale {
+  display: inline-block;
+  background: #3a2a1a;
+  color: #f8c66c;
+  border-radius: 3px;
+  padding: 1px 6px;
+  font-size: 10px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+.fw-ok {
+  color: var(--signal-green);
+  font-weight: 500;
+}
+.fw-old {
+  color: var(--signal-red);
+  font-weight: 500;
+}
+.fw-pending {
+  color: var(--signal-yellow);
+  font-weight: 500;
+}
+#fwUpdateBtn {
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.fw-version-line {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fw-update-banner {
+  background: #2a2a1a;
+  border: 1px solid #5a5a3a;
+  color: #dda;
+  padding: 10px 12px;
+  border-radius: 4px;
+  margin: 8px 0;
+  font-size: 12px;
+}
+.fw-update-banner b { color: #f8c66c; }
+.fw-update-banner ol {
+  margin: 6px 0 4px 18px;
+  padding: 0;
+  line-height: 1.5;
+}
+.fw-update-banner li { margin-bottom: 3px; }
+.fw-update-howto { margin-top: 6px; }
+.update-info { background: var(--brand-bg); border: 1px solid var(--brand-border); color: var(--brand-text); padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; }
+.update-info small { color: var(--brand-text-mid); }
+/* The row holds a message, one or two buttons and a progress line. Without
+   wrapping, the progress line was the last item in a space-between row and got
+   whatever width was left: "Wird hochgeladen (ca. 1 Min.)..." came out one
+   syllable per line, four words tall (screenshot 2026-08-16). It now takes a
+   line of its own instead of a column of leftovers. */
+.update-banner { background: var(--brand-bg); border: 1px solid var(--brand-border); padding: 8px 12px; border-radius: 4px; margin-bottom: 10px; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; }
+.update-banner .op-status { flex: 1 0 100%; margin-top: 0; }
+.update-banner b { color: var(--brand-text); }
+.update-banner small { color: var(--brand-text-mid); margin-left: 6px; }
+/* OTA status prose (setStatus) lands in these buttons. Bound their width and
+   let the sentence wrap in readable lines: unbounded, a long status either
+   collapsed to one character per line or pushed the banner off the page
+   (speaker settings after an update). */
+.update-banner .btn { flex-shrink: 0; max-width: 55%; white-space: normal; }
+/* The text column must take the row's free width and wrap normally. As a bare
+   flex item it defaulted to min-content and collapsed to a ~50px column (one word
+   per line) while the update/Spotify-finishing status sat beside it. */
+.update-msg { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+/* Pinned to the very top window edge: full width, flush, no rounding.
+   Lives at body level (index.html), above the centered #app column, so
+   it spans the whole window regardless of the 720px content width. */
+/* Update banner: a bright amber attention bar that stands out against both the
+   dark and light themes (older builds used a muted dark-olive strip that some
+   users missed entirely, and that turned unreadable in the light theme because
+   the body text colour went dark on a dark bar). It also sticks to the top so
+   it does not scroll out of view. High contrast gets its own black/yellow
+   override below. */
+.app-update-banner {
+  position: sticky; top: 0; z-index: 60;
+  /* A soft warm gradient instead of the flat highlighter yellow, with a
+     hairline bottom edge rather than a heavy rule: this is good news, not a
+     warning. Slides in once instead of appearing abruptly. */
+  background: linear-gradient(180deg, #fef3c7 0%, #fde68a 100%);
+  color: #3a2c00;
+  border: none; border-bottom: 1px solid rgba(180, 120, 10, 0.35);
+  box-shadow: 0 1px 6px rgba(120, 80, 0, 0.10);
+  padding: 12px 18px; margin: 0; border-radius: 0; width: 100%;
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  font-size: 14px;
+  animation: app-update-in 320ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes app-update-in {
+  from { opacity: 0; transform: translateY(-100%); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.app-update-banner b { color: #3a2c00; }
+/* Wedged-speaker hint: same sticky banner slot, urgent orange - the one case
+   where the user must physically pull the plug. */
+.box-wedge-banner { background: #fdba74; color: #431407; }
+.box-wedge-banner b { color: #431407; }
+.app-update-text { display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* The quiet state of the same slot: no banner, just a way back to the update
+   notice for anyone who dismissed it or moved back to an older build. It has
+   to be findable and must not compete with the speaker list, so it keeps the
+   page background and footer-link sizing. */
+.app-update-banner.app-update-quiet {
+  /* Not sticky. The banner floats above the page because an available update
+     has to stay visible while you scroll; the quiet line is a footnote and
+     floating made it sit on top of the content underneath (reported for both
+     the scrolled page and a narrow window). */
+  position: static;
+  background: none;
+  color: var(--c-muted);
+  border: none;
+  box-shadow: none;
+  animation: none;
+  /* Aligned with the content column rather than flush against the window
+     edge, where it read as a stray line above the page. */
+  padding: 6px 18px;
+  max-width: 720px;
+  margin: 0 auto;
+  justify-content: flex-start;
+  gap: 8px;
+  font-size: 12px;
+}
+.app-update-banner.app-update-quiet .footer-link { font-size: 12px; }
+.app-update-quiet-note { color: var(--c-muted); }
+.app-update-icon { font-size: 18px; font-weight: 700; line-height: 1; flex: 0 0 auto; }
+/* Dismiss control: a plain close cross at the far end of the banner, sized to
+   be an easy target without competing with the install button next to it. */
+.banner-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: 0;
+  color: inherit;
+  opacity: 0.55;
+  font-size: 20px;
+  line-height: 1;
+  padding: 2px 6px;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.banner-close:hover { opacity: 1; background: rgba(120, 80, 0, 0.12); }
+.banner-close:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+html.a11y-contrast .banner-close:hover { background: rgba(255, 224, 102, 0.2); }
+.app-update-banner .footer-link { color: #7a5300; text-decoration: underline; }
+.app-update-banner .footer-link:hover { color: #5a3d00; }
+html.a11y-contrast .app-update-banner { background: #000; color: #ffe066; border-bottom-color: #fff; }
+html.a11y-contrast .app-update-banner b,
+html.a11y-contrast .app-update-banner .footer-link { color: #ffe066; }
+
+/* The download button is the call to action: make it large, bold and gently
+   pulsing so it draws the eye. The leading arrow marks it as a download. The
+   pulse is a transform (no reflow) and is disabled by the reduced-motion rule. */
+.app-update-btn {
+  position: relative;
+  overflow: hidden;
+  flex: 0 0 auto;
+  white-space: nowrap;
+  font-weight: 700;
+  font-size: 14px;
+  padding: 10px 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 6px rgba(120, 80, 0, 0.22);
+  transition: transform 140ms ease, box-shadow 140ms ease, filter 140ms ease;
+}
+/* A slow sheen sweeping across the button replaces the old scale pulse, which
+   read as restless and cheap next to otherwise calm UI. Pure transform, so it
+   never triggers layout, and it rests off-screen between passes. */
+.app-update-btn::after {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0; left: -60%;
+  width: 45%;
+  background: linear-gradient(100deg, transparent 0%, rgba(255, 255, 255, 0.55) 50%, transparent 100%);
+  transform: skewX(-18deg);
+  animation: app-update-sheen 4.5s ease-in-out infinite;
+  pointer-events: none;
+}
+.app-update-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(120, 80, 0, 0.30);
+  filter: brightness(1.04);
+}
+.app-update-btn:active { transform: translateY(0); box-shadow: 0 1px 4px rgba(120, 80, 0, 0.25); }
+@keyframes app-update-sheen {
+  0%   { left: -60%; }
+  55%  { left: 130%; }
+  100% { left: 130%; }
+}
+.app-update-btn::before { content: "\2193"; margin-right: 7px; font-weight: 700; }
+/* The macOS hand-off button reopens an already-downloaded file: no download
+   arrow, and no sheen either, because nothing is urgent once the download is
+   done and the instruction beside it is what deserves the attention. */
+#appUpdateReveal::before { content: none; }
+#appUpdateReveal::after { animation: none; display: none; }
+
+.format-toggle {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-top: 10px;
+  padding: 8px 10px;
+  background: var(--c-bg);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--c-muted);
+  cursor: pointer;
+}
+.format-toggle input { accent-color: var(--brand); margin-top: 2px; }
+.format-warn { background: #3a1a1a; border: 1px solid #8a3a3a; color: #f88; padding: 10px 12px; border-radius: 4px; margin-bottom: 10px; font-size: 13px; display: flex; gap: 10px; align-items: center; }
+.format-warn b { color: #fcc; }
+/* Both of these hardcoded their dark-theme colours, so in the light theme the
+   warning sat as a near-black box and the Playground pill as a dark chip on a
+   white page: legible only barely, and visibly foreign (field screenshots,
+   2026-08-29). Light equivalents keep the same meaning at readable contrast. */
+html.a11y-light .format-warn { background: #fdecec; border-color: #e0a3a3; color: #a03232; }
+html.a11y-light .format-warn b { color: #7c2020; }
+html.a11y-light .warn-icon-inline { color: #c05050; }
+html.a11y-light .expert-badge { color: #7a5a10; border-color: #d5bc7d; background: #faf3df; }
+.warn-icon-inline { font-size: 22px; color: #f88; }
+
+/* ---------- Footer ---------- */
+.app-footer { margin-top: 14px; padding: 10px 16px; border-top: 1px solid var(--c-surface-2); display: flex; justify-content: space-between; align-items: center; font-size: 11px; color: var(--c-faint); flex-wrap: wrap; gap: 6px; }
+.footer-left b { color: var(--c-muted); font-weight: 500; }
+/* These two used a BORDER colour as a text colour, which is what made them
+   unreadable: border tokens are picked to sit quietly against a background,
+   not to be read. At 10px on the page that measured 2.33:1 in the dark theme
+   and 2.04:1 in the light one, against a 4.5:1 minimum. */
+.footer-fine { color: var(--c-faint); font-size: 10px; margin-top: 2px; }
+.footer-left .build-stamp { color: var(--c-faint); }
+.footer-right a { color: var(--c-muted); text-decoration: none; cursor: pointer; }
+.footer-right a:hover { color: var(--brand); text-decoration: underline; }
+
+/* Settings groups (#declutter): fold the long settings list into a few
+   collapsible accordions so the default view is not a wall of sections.
+   Basics is open by default, the rest collapsed. */
+.settings-group {
+  background: var(--c-surface);
+  border: 1px solid var(--c-surface-3);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.settings-group > summary.settings-group-summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--c-text);
+  padding: 12px 14px;
+  user-select: none;
+  list-style: revert;
+}
+/* Not #fff: on a light background that is white on white, and the label
+   vanished under the pointer. */
+.settings-group > summary.settings-group-summary:hover { color: var(--c-text); }
+.settings-group[open] > summary.settings-group-summary { border-bottom: 1px solid #2c2c2c; margin-bottom: 8px; }
+.settings-group > .settings-section,
+.settings-group > .settings-expert { margin: 8px; }
+
+/* Phone-control QR card (Open on your phone) */
+.phone-card { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.phone-qr { width: 160px; height: 160px; background: #fff; border-radius: 8px; padding: 6px; }
+.phone-url-row { display: flex; gap: 8px; align-items: center; flex: 1; min-width: 200px; }
+.phone-url { font-size: 12px; color: var(--c-text); background: var(--c-surface-2); border: 1px solid var(--c-border); padding: 6px 8px; border-radius: 5px; word-break: break-all; flex: 1; }
+
+/* "Put it on the home screen": the two click paths plus two home-screen
+   sketches, folded away behind a summary so the card stays a QR code for
+   everyone who only wants to scan it. */
+.phone-howto { margin-top: 10px; }
+.phone-howto > summary {
+  cursor: pointer; font-size: 12px; color: var(--brand-text);
+  padding: 4px 0; list-style: revert;
+}
+.phone-howto > summary:hover { text-decoration: underline; }
+.phone-howto-body { display: flex; flex-direction: column; gap: 14px; margin-top: 10px; }
+.phone-paths { display: flex; gap: 12px; flex-wrap: wrap; }
+.phone-path {
+  flex: 1 1 260px; min-width: 240px;
+  background: var(--c-surface-2); border: 1px solid var(--c-border);
+  border-radius: 8px; padding: 10px 12px;
+}
+.phone-path-ios { border-top: 2px solid #5b9ad6; }
+.phone-path-and { border-top: 2px solid #66b183; }
+.phone-path-head {
+  font-size: 12.5px; font-weight: 600; color: var(--c-text);
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.phone-chip {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 6px; border-radius: 10px;
+  background: var(--c-surface); border: 1px solid var(--c-border); color: var(--c-muted);
+}
+.phone-path ol { margin: 8px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+.phone-path li { font-size: 12px; color: var(--c-text); line-height: 1.4; }
+.phone-path-note { margin: 8px 0 0; font-size: 11.5px; color: var(--c-muted); line-height: 1.4; }
+/* Home-screen sketches. Deliberately small and flat: they exist to show that
+   the icon lands among ordinary apps, not to imitate a phone. */
+.phone-shots { display: flex; gap: 12px; flex-wrap: wrap; }
+.phone-shot { margin: 12px auto 0; width: 132px; display: flex; flex-direction: column; gap: 6px; }
+.phone-shot figcaption { font-size: 11px; color: var(--c-muted); line-height: 1.35; text-align: center; }
+/* The sketch should read as a phone at a glance, not as a coloured box: a tall
+   portrait shape, a dark bezel around a rounded screen, and the one detail
+   each platform is known by, a notch on the iPhone and a punch hole on the
+   Android. Everything here is drawn in CSS, so it costs no image and follows
+   the theme. */
+.hs {
+  position: relative;
+  aspect-ratio: 9 / 17;
+  border-radius: 20px; padding: 16px 10px 10px; min-height: 190px;
+  display: flex; flex-direction: column; gap: 10px;
+  border: 3px solid #0d0d0f;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .16), 0 4px 10px rgba(0, 0, 0, .35);
+}
+/* The notch, and the punch hole for the other one. */
+.hs::before {
+  content: ""; position: absolute; top: 3px; left: 50%; transform: translateX(-50%);
+  width: 42%; height: 9px; background: #0d0d0f; border-radius: 0 0 8px 8px;
+}
+.hs-and::before {
+  width: 7px; height: 7px; top: 5px; border-radius: 50%;
+}
+.hs-ios { background: linear-gradient(165deg, #5b6b8c, #2d3550 62%, #1d2236); }
+.hs-and { background: linear-gradient(165deg, #3f5a4b, #233528 60%, #18241b); }
+.hs-time { color: rgba(255, 255, 255, .92); font-size: 9px; font-weight: 600; text-align: center; }
+.hs-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px 6px; flex: 1; align-content: start; padding: 0 6px; }
+.hs-app { display: block; position: relative; }
+/* The ring wraps a box around the icon ALONE, so it frames the icon at any
+   size and never reaches down into the name beneath it. */
+.hs-icobox { display: block; position: relative; }
+.hs-ico {
+  display: block; width: 100%; height: auto; aspect-ratio: 1; max-width: 26px;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, .16); border: 1px solid rgba(255, 255, 255, .18);
+  object-fit: cover;
+}
+.hs-ico.rnd { border-radius: 50%; }
+.hs-real { background: none; border-color: rgba(255, 255, 255, .35); }
+.hs-ico-missing { background: rgba(255, 255, 255, .16); }
+.hs-name {
+  display: block; margin-top: 5px; font-size: 7px; line-height: 1.1;
+  color: rgba(255, 255, 255, .9); text-align: center; white-space: nowrap;
+}
+/* The name is centered under its icon and free to spill into the empty gaps on
+   either side (the neighbours are blank tiles), so it shows in full without
+   being clipped to the narrow cell. */
+.hs-app { overflow: visible; }
+/* The one tile that is the point of the picture gets a ring around it. The
+   ring is pinned to the icon's own height so it does not swallow the name
+   underneath, which is half of what the sketch is showing. */
+.hs-icobox.hs-ring::after {
+  content: ""; position: absolute; inset: -3px;
+  border-radius: 9px; outline: 2px solid #ffd9a0;
+}
+.hs-icobox.hs-ring.rnd::after { border-radius: 50%; }
+.hs-dock {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px;
+  background: rgba(255, 255, 255, .14); border-radius: 12px; padding: 6px;
+}
+.hs-pill { height: 3px; width: 52px; border-radius: 99px; background: rgba(255, 255, 255, .55); margin: 0 auto; }
+
+/* Phone-control: a prominent, always-visible feature card (not buried in a
+   group) since the phone remote is a headline feature. */
+.phone-feature {
+  border: 1px solid var(--brand, #6bd);
+  background: var(--brand-bg);
+}
+.phone-feature h3 {
+  font-size: 14px;
+  color: var(--brand-text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.phone-feature-icon { font-size: 16px; }
+
+/* ===========================================================================
+   Accessibility: text size, theme, focus. Driven by the "Aa" menu in the
+   header; classes live on <html> and are applied very early in main.js
+   (a11y.js). Themes themselves are defined as token overrides near the top
+   of this file (html.a11y-light / html.a11y-contrast).
+   =========================================================================== */
+
+/* Text size. The UI uses pixel sizes throughout, so scaling root font-size
+   would not reach them. zoom scales the whole rendered app (text, icons,
+   artwork and hit targets) uniformly and is supported by WebView2 (Windows),
+   WKWebView (macOS) and WebKitGTK (Linux) alike. */
+html.a11y-scale-l  body { zoom: 1.15; }
+html.a11y-scale-xl body { zoom: 1.30; }
+
+/* Always-visible keyboard focus. Many controls reset their outline, so force
+   a strong, theme-aware ring for keyboard and low-vision users. */
+*:focus-visible {
+  outline: 3px solid var(--brand) !important;
+  outline-offset: 2px !important;
+  border-radius: 3px;
+}
+html.a11y-contrast *:focus-visible { outline-color: #fff !important; }
+
+/* Comfortable minimum hit targets for the small icon controls. */
+.btn-mini, .btn-icon, .combo-toggle, .vol-icon { min-height: 30px; }
+
+/* Respect the OS "reduce motion" setting: drop animations and transitions. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Header "Aa" accessibility menu, mirrors the locale dropdown. */
+.app-a11y { margin-left: auto; }
+.app-header-row .app-locale { margin-left: 6px; }
+.a11y-dd { position: relative; }
+.a11y-dd-trigger {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--c-surface); border: 1px solid var(--c-border);
+  border-radius: 6px; padding: 4px 9px; cursor: pointer;
+  font-size: 14px; line-height: 1; color: var(--c-text);
+}
+.a11y-dd-trigger:hover { border-color: var(--c-border-2); }
+.a11y-dd-icon { font-weight: 700; letter-spacing: -1px; }
+.a11y-dd-menu {
+  position: absolute; top: calc(100% + 4px); right: 0; z-index: 50;
+  margin: 0; padding: 10px; min-width: 210px;
+  background: var(--c-surface); border: 1px solid var(--c-border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.a11y-dd-menu[hidden] { display: none; }
+.a11y-group + .a11y-group { margin-top: 10px; }
+.a11y-group-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--c-muted); margin-bottom: 5px;
+}
+.a11y-seg { display: flex; gap: 4px; flex-wrap: wrap; }
+.a11y-seg button {
+  flex: 1 1 auto; min-width: 56px; padding: 7px 8px; cursor: pointer;
+  background: var(--c-bg); color: var(--c-text);
+  border: 1px solid var(--c-border); border-radius: 6px;
+  font-size: 12px; line-height: 1.15;
+}
+.a11y-seg button:hover { border-color: var(--c-border-2); }
+.a11y-seg button[aria-pressed="true"] {
+  background: var(--brand-bg); border-color: var(--brand);
+  color: var(--brand-text); font-weight: 600;
+}
+
+/* Sticky offline speaker tiles (2026-07-26): a speaker once sighted stays
+   listed when scans miss it, clearly greyed out with a disconnect mark and a
+   "last seen ..." tooltip, until it answers again. */
+.box-btn.offline {
+  /* .45 faded the whole tile, version chip included, to near-nothing on the
+     light theme (still on v0.9.72: the chip's own opacity fix could not
+     win against the tile's). The greyscale and the disconnect mark carry the
+     "offline" cue; the fade only needs to be a hint. */
+  opacity: .78;
+  filter: grayscale(.85);
+  cursor: default;
+}
+.box-btn.offline:hover { opacity: .9; }
+.box-offline-mark {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  color: var(--err, #c66);
+}
+
+/* Track progress bar. Shown under the status line while a speaker is
+   playing. Radio has no end, so the bar hides itself and only the elapsed time
+   remains. */
+.track-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Inside the status bar now: no margins of its own, and it never grows at
+     the expense of the station name (which marquees when it runs out of
+     room). */
+  margin: 0;
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+/* A fixed, modest width so the bar stays readable without pushing the track
+   line out. Radio has no length, so the bar is hidden and only the clock is
+   left, which is then just a few characters wide. */
+.track-progress .track-bar { flex: 0 0 96px; width: 96px; }
+.track-progress .track-bar.hidden { display: none; }
+.track-time { font-size: 12px; color: var(--c-text-dim, #888); white-space: nowrap; }
+/* No min-width: the clock is right next to the station name now, and 34px
+   of reserved space left a visible gap for a radio stream, which shows
+   only the elapsed time and an empty total. */
+.track-time:empty { display: none; }
+.track-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--c-border, #d8d8d8);
+  overflow: hidden;
+}
+.track-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--brand);
+  transition: width 0.9s linear;
+}
+
+/* Per-speaker volume inside a group. The group slider above moves these
+   together; each one sets a single speaker so a mixed group (say a Wave next to
+   an ST 20) can be balanced once and then adjusted as a whole. */
+.group-member-vols { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 2px 26px; }
+.group-member-vol { display: flex; align-items: center; gap: 8px; }
+.group-member-name {
+  flex: 0 0 auto;
+  min-width: 90px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--c-text-dim, #888);
+}
+.group-member-vol input[type=range] { flex: 1; }
+.group-member-vol .vol-val { min-width: 26px; text-align: right; font-size: 12px; }
+
+/* Copyable report for an update that could not reach the state it was meant to.
+   Deliberately large and readable rather than a toast: the user is expected to
+   read it, then copy or mail it. */
+.failreport {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 24px;
+}
+.failreport-inner {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border);
+  border-radius: 10px;
+  padding: 18px 20px;
+  max-width: 760px;
+  width: 100%;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.failreport-title { font-weight: 600; margin-bottom: 6px; }
+.failreport-text {
+  width: 100%;
+  margin: 10px 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  background: var(--c-surface-2);
+  color: var(--c-text);
+  border: 1px solid var(--c-border);
+  border-radius: 6px;
+  padding: 10px;
+  resize: vertical;
+}
+.failreport-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Two classes the parallel work introduced without a rule, so they inherited
+   whatever was nearby. */
+.help-more > summary { list-style: none; padding: 2px 0; }
+.help-more > summary::-webkit-details-marker { display: none; }
+.help-more > summary::before { content: "B8 "; }
+.help-more[open] > summary::before { content: "BE "; }
+/* A speaker that is not answering reads differently from one that is simply
+   not in the group: the first is a fault, the second is a state. */
+.zone-live.zone-live-noanswer { color: var(--c-faint); font-style: italic; }
+
+/* A button mid-write (withButtonPending): dimmed and gently pulsing, so the
+   press visibly took even while a slow speaker keeps the request waiting. */
+.btn.working { opacity: 0.65; cursor: progress; animation: btn-working 1.1s ease-in-out infinite; }
+@keyframes btn-working { 50% { opacity: 0.35; } }
+
+/* The failure report's own "what to try" verdict, shown above the report text
+   so the steps are the first thing the user sees, not the mail address. */
+.setup-tips { margin: 8px 0 10px; padding: 10px 12px; border: 1px solid var(--brand-border); border-radius: 8px; background: var(--brand-bg); color: var(--c-text); font-size: 13px; }
+.setup-tips p { margin: 6px 0 0; }
+
+/* Webhook section: the clickable remote key map (settings.js remoteSvg). The
+   physical remote is black, so the drawing keeps its own dark palette in both
+   themes; only the state colours matter. */
+.rc-wrap { display: flex; gap: 14px; align-items: flex-start; margin: 4px 0 12px; }
+.rc-svg { width: 150px; flex: 0 0 auto; }
+.rc-side { display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.rc-body { fill: #151517; stroke: #2c2c30; stroke-width: 1; }
+.rc-key { fill: #2a2a2e; stroke: #3d3d44; stroke-width: 1; cursor: pointer; transition: fill .12s, stroke .12s; }
+.rc-keyg:hover .rc-key:not(.rc-off) { fill: #3a3a40; }
+.rc-key.rc-on { stroke: #4caf50; stroke-width: 2.5; }
+.rc-key.rc-sel { fill: #1f5f8f; stroke: #7cc0ff; stroke-width: 2.5; }
+.rc-key.rc-off { cursor: default; opacity: .4; }
+.rc-label { fill: #e8e8e8; font-size: 13px; font-family: system-ui, sans-serif; pointer-events: none; text-anchor: middle; dominant-baseline: middle; }
+.rc-legend { line-height: 1.7; }
+.rc-legend-on, .rc-legend-sel { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: middle; margin-right: 4px; background: #2a2a2e; box-sizing: border-box; }
+.rc-legend-on { border: 2px solid #4caf50; }
+.rc-legend-sel { background: #1f5f8f; border: 2px solid #7cc0ff; }
+
+/* A thumbs key that carries a saved group: amber dashed frame and a
+   small "G" in the corner, distinct from the green webhook frame. */
+.rc-key.rc-group { stroke: #e0a326; stroke-width: 2.5; stroke-dasharray: 5 3; }
+.rc-gmark { fill: #e0a326; font-size: 11px; font-weight: 700; pointer-events: none; }
+.rc-legend-group { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: middle; margin-right: 4px; background: #2a2a2e; box-sizing: border-box; border: 2px dashed #e0a326; }
+
+/* Group keys section on the Multi-Room tab. */
+.gk-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.gk-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 8px 10px; border: 1px solid var(--c-border); border-radius: 8px; }
+.gk-row-name { font-weight: 600; }
+.gk-row-members { flex: 1 1 200px; }
+.gk-row select { min-width: 140px; }
+.gk-warn { flex-basis: 100%; }
+
+/* Donate dialog: the same three branded buttons as the rail, reachable from the
+   footer at any window size. The rail is display:none below 62em and that
+   threshold moves with the text size, so on a narrow window or a large font it
+   was the only donate affordance and it was not there. */
+.donate-modal { max-width: 340px; }
+.donate-modal-btns { display: flex; flex-direction: column; gap: 8px; margin: 12px 0 16px; }
+.donate-modal-btns .donate-btn {
+  width: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.donate-modal-btns .donate-btn:hover { transform: translateY(-1px); }
+.donate-modal-btns .donate-btn-icon { display: inline-flex; align-items: center; }
+.donate-modal-btns .donate-btn-label { line-height: 1; }
+.donate-modal-btns .donate-gh { background: #fff; color: #24292f; border-color: #bf3989; }
+.donate-modal-btns .donate-gh .donate-btn-icon { color: #bf3989; }
+.donate-modal-btns .donate-paypal { background: #ffc439; }
+.donate-modal-btns .donate-paypal-wordmark { font-weight: 700; font-style: italic; }
+.donate-modal-btns .donate-paypal-wordmark .pay { color: #003087; }
+.donate-modal-btns .donate-paypal-wordmark .pal { color: #009cde; }
+.donate-modal-btns .donate-kofi { background: #ff5e5b; color: #fff; }
+.donate-btn.donate-play {
+  background: var(--brand);
+  color: #fff;
+  justify-content: space-between;
+}
+.donate-play-price { font-variant-numeric: tabular-nums; }
+.donate-play-note { margin: 0 0 12px; color: var(--c-muted); }
+
+/* The x on a single member chip of a saved group. Smaller and quieter than the
+   frame's own x, because it does less: it takes one speaker out rather than
+   deleting the group. */
+.zone-frame-chip { position: relative; }
+.zone-chip-x {
+  margin-left: 6px;
+  border: none;
+  background: none;
+  color: inherit;
+  opacity: .45;
+  font-size: 1.05em;
+  line-height: 1;
+  padding: 0 1px;
+  cursor: pointer;
+}
+.zone-chip-x:hover, .zone-chip-x:focus-visible { opacity: 1; }
+
+/* The two conditions a Spotify preset needs. Set apart from the steps below
+   it, because somebody who does not meet them cannot follow the steps at all
+   and the whole point is that they find this out here rather than after a
+   silent preset key. */
+.sp-prereq {
+  border-left: 3px solid var(--accent, #8a2318);
+  padding: .55rem .85rem;
+  margin: .6rem 0 1rem;
+  background: rgba(127, 127, 127, .07);
+  border-radius: 0 6px 6px 0;
+}
+.sp-prereq-title { font-weight: 600; margin-bottom: .3rem; }
+.sp-prereq ul { margin: 0; padding-left: 1.1rem; }
+.sp-prereq li { margin: .25rem 0; }

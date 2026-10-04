@@ -1,0 +1,497 @@
+// Group: the stereo-pair (L/R) group record store, its persistence, and the
+// marge-side group CRUD the firmware runs during /addGroup and /removeGroup.
+
+package marge
+
+import (
+	"encoding/json"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// groupRole is one <groupRole> entry inside a stereo-pair group descriptor.
+type groupRole struct {
+	DeviceID string `xml:"deviceId"`
+	Role     string `xml:"role"`
+	IP       string `xml:"ipAddress"`
+}
+
+// groupRecord mirrors the <group> descriptor the ST10 firmware POSTs to marge
+// to create the L/R stereo pair, and the shape the box's own /getGroup returns:
+// id as an attribute, name/masterDeviceId as child elements, and the members as
+// <roles><groupRole>. Live captured 2026-07-10 from EC24B8B790CC.
+type groupRecord struct {
+	XMLName        xml.Name    `xml:"group"`
+	ID             string      `xml:"id,attr"`
+	Name           string      `xml:"name"`
+	MasterDeviceID string      `xml:"masterDeviceId"`
+	Roles          []groupRole `xml:"roles>groupRole"`
+}
+
+// groupCreateFormat selects the shape of the group-create acknowledgement, so
+// the response the firmware accepts can be swept on hardware the same way
+// addDeviceFormat sweeps the AddDevice reply. Values: "bare201" (default: HTTP
+// 201 Created + a bare <group id=...>), "bare200", "wrap201"/"wrap200" (the
+// <response status="OK"> envelope the AddDevice path uses). Empty falls back to
+// the default.
+func groupCreateFormat() string {
+	if v := strings.TrimSpace(os.Getenv("STICK_GROUP_CREATE_FORMAT")); v != "" {
+		return v
+	}
+	return "bare201"
+}
+
+// margeGroupID derives a stable, non-empty group id from the master device id
+// so a create and the follow-up poll echo the same id. The box treats the
+// marge group id as opaque (its own /getGroup returns a firmware-assigned id).
+func margeGroupID(master string) string {
+	m := strings.TrimSpace(master)
+	if m == "" {
+		m = "stereo"
+	}
+	return "stm-grp-" + m
+}
+
+// renderGroupXML renders a group record in the <group id=...> shape the box's
+// /getGroup parses, echoing the posted roles back (with ipAddress only when the
+// firmware supplied one).
+func renderGroupXML(g *groupRecord) string {
+	var b strings.Builder
+	b.WriteString(`<group id="`)
+	b.WriteString(xmlEscapeText(g.ID))
+	b.WriteString(`"><name>`)
+	b.WriteString(xmlEscapeText(g.Name))
+	b.WriteString(`</name><masterDeviceId>`)
+	b.WriteString(xmlEscapeText(g.MasterDeviceID))
+	b.WriteString(`</masterDeviceId><roles>`)
+	for _, role := range g.Roles {
+		b.WriteString(`<groupRole><deviceId>`)
+		b.WriteString(xmlEscapeText(role.DeviceID))
+		b.WriteString(`</deviceId><role>`)
+		b.WriteString(xmlEscapeText(role.Role))
+		b.WriteString(`</role>`)
+		if strings.TrimSpace(role.IP) != "" {
+			b.WriteString(`<ipAddress>`)
+			b.WriteString(xmlEscapeText(role.IP))
+			b.WriteString(`</ipAddress>`)
+		}
+		b.WriteString(`</groupRole>`)
+	}
+	b.WriteString(`</roles></group>`)
+	return b.String()
+}
+
+// persistedGroup is the on-NAND shape of the stored stereo-pair record: the
+// group document itself plus whether it is canonical (STM-installed) rather
+// than a firmware self-report.
+type persistedGroup struct {
+	Canonical bool   `json:"canonical"`
+	XML       string `json:"xml"`
+}
+
+// loadGroup restores the persisted group record at startup. Best-effort: a
+// missing or unreadable file simply means no pair.
+func (s *Server) loadGroup() {
+	if s.groupPath == "" {
+		return
+	}
+	data, err := os.ReadFile(s.groupPath)
+	if err != nil {
+		return
+	}
+	var pg persistedGroup
+	if err := json.Unmarshal(data, &pg); err != nil {
+		s.logger.Warn("marge group: persisted record unreadable, ignoring",
+			slog.String("comp", "marge"), slog.String("err", err.Error()))
+		return
+	}
+	var g groupRecord
+	if err := xml.Unmarshal([]byte(pg.XML), &g); err != nil {
+		s.logger.Warn("marge group: persisted record XML unreadable, ignoring",
+			slog.String("comp", "marge"), slog.String("err", err.Error()))
+		return
+	}
+	s.mu.Lock()
+	s.group = &g
+	s.groupCanonical = pg.Canonical
+	s.groupRestored = true
+	s.mu.Unlock()
+	s.logger.Info("marge group: restored persisted record",
+		slog.String("comp", "marge"), slog.String("groupId", g.ID),
+		slog.String("master", g.MasterDeviceID), slog.Bool("canonical", pg.Canonical))
+	// The record is restored whatever the answer: a partner that is rebooting
+	// or briefly off the network must never cost somebody their pair. But a
+	// partner that is GONE makes the firmware refuse every source activation
+	// with EVT_SYSTEM_GROUP_STATE_IN_ERROR, and the speaker is then unusable
+	// with nothing anywhere saying why (measured 2026-09-29: eighteen days
+	// absent, the owner saw only "box_not_ready"). One probe, in the
+	// background, so a slow or absent partner cannot delay the agent start.
+	go s.notePartnerReachability(&g)
+}
+
+// PartnerUnreachable reports the pair partner STM could not reach at startup,
+// empty when the partner answered or when there is no pair. Read by the zone
+// endpoint so the app can name the real reason a speaker will not play.
+func (s *Server) PartnerUnreachable() (ip, deviceID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.partnerGoneIP, s.partnerGoneID
+}
+
+// notePartnerReachability asks the OTHER half of a restored pair whether it is
+// there. It is a single, short-lived probe per agent start: no timer and no
+// polling, because this runs on every speaker and NAND and CPU are finite.
+//
+// A failure is recorded, never acted on. Dissolving a pair because one probe
+// missed would take a working stereo setup away from somebody whose partner
+// was merely restarting, which is far worse than the silence this replaces.
+func (s *Server) notePartnerReachability(g *groupRecord) {
+	self := strings.TrimSpace(s.deviceID)
+	var ip, id string
+	for _, r := range g.Roles {
+		if strings.TrimSpace(r.IP) == "" {
+			continue
+		}
+		if self != "" && strings.EqualFold(strings.TrimSpace(r.DeviceID), self) {
+			continue // this half is us
+		}
+		ip, id = strings.TrimSpace(r.IP), strings.TrimSpace(r.DeviceID)
+	}
+	if ip == "" {
+		return
+	}
+	c := &http.Client{Timeout: 4 * time.Second}
+	resp, err := c.Get("http://" + ip + ":8090/info")
+	if err == nil {
+		resp.Body.Close()
+		s.mu.Lock()
+		s.partnerGoneIP, s.partnerGoneID = "", ""
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	s.partnerGoneIP, s.partnerGoneID = ip, id
+	s.mu.Unlock()
+	s.logger.Warn("marge group: the other half of the stereo pair did not answer; the firmware refuses to play while a pair is incomplete",
+		slog.String("comp", "marge"), slog.String("partner", ip),
+		slog.String("partnerDeviceId", id), slog.String("err", err.Error()))
+}
+
+// persistGroupLocked writes (or removes) the on-NAND copy of the current
+// record. Callers hold s.mu. Best-effort: a write failure only costs the
+// record an agent restart, so it is logged and swallowed.
+func (s *Server) persistGroupLocked() {
+	if s.groupPath == "" {
+		return
+	}
+	if s.group == nil {
+		if err := os.Remove(s.groupPath); err != nil && !os.IsNotExist(err) {
+			s.logger.Warn("marge group: could not remove persisted record",
+				slog.String("comp", "marge"), slog.String("err", err.Error()))
+		}
+		return
+	}
+	pg := persistedGroup{Canonical: s.groupCanonical, XML: renderGroupXML(s.group)}
+	data, err := json.Marshal(pg)
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(s.groupPath, data, 0o644); err != nil {
+		s.logger.Warn("marge group: persist failed",
+			slog.String("comp", "marge"), slog.String("err", err.Error()))
+	}
+}
+
+// RenameGroup updates the stored stereo pair's display name and persists it.
+// The Bose app shows and edits exactly this record (its own rename arrives
+// here through the firmware), so writing STM's pair name here is what makes
+// one name appear in both apps instead of a bare "Stereo pair (L+R)"
+// (field report, 2026-08-30). The canonical flag is untouched: a rename does
+// not change who authored the pair document.
+func (s *Server) RenameGroup(name string) error {
+	name = strings.TrimSpace(name)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.group == nil {
+		return fmt.Errorf("no stereo pair stored")
+	}
+	s.group.Name = name
+	s.persistGroupLocked()
+	s.logger.Info("marge group: renamed", slog.String("comp", "marge"),
+		slog.String("groupId", s.group.ID), slog.String("name", name))
+	return nil
+}
+
+// GroupSnapshot returns the current group document and whether it is the
+// canonical (STM-installed) record. ok is false when no pair is stored.
+func (s *Server) GroupSnapshot() (xmlDoc string, canonical bool, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.group == nil {
+		return "", false, false
+	}
+	return renderGroupXML(s.group), s.groupCanonical, true
+}
+
+// GroupName returns the stored stereo pair's display name, or "" if no pair is
+// stored. The phone remote reads this (via the agent's zone-volume endpoint) to
+// show a pair under its own name instead of a member box name.
+func (s *Server) GroupName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.group == nil {
+		return ""
+	}
+	return s.group.Name
+}
+
+// SetCanonicalGroup installs the canonical pair document (from the pairing
+// flow on this box, or relayed from the master's agent via the desktop app for
+// the partner). From now on firmware posts that disagree on the master are
+// answered with this document instead of stored (see createMargeGroup).
+// describesPair reports whether a record can be a stereo pair at all: a master
+// and exactly two roles.
+//
+// This rule already existed, inline in SetCanonicalGroup, which meant it applied
+// to documents STM installs and to nothing else. Every document the FIRMWARE
+// posts went straight into the store unchecked, and the firmware posts one on
+// every boot-time re-register, from its own point of view. A six-speaker bundle
+// on 2026-09-27 caught the result: both halves of one pair holding a record that
+// named ITSELF as master with zero roles, with different group ids, for about
+// twenty minutes.
+//
+// A record like that is not a pair, and every reader downstream believed it was
+// one. GroupPair answered yes to both halves, so both told Spotify they were the
+// master of the pair and neither stood down, which is exactly the two-entries
+// symptom was about.
+//
+// Two comments in this tree claimed a validateGroup function enforced this. No
+// such function exists; the claim was mine and it was wrong. This is the
+// function those comments described.
+func describesPair(g *groupRecord) bool {
+	return g != nil && strings.TrimSpace(g.MasterDeviceID) != "" && len(g.Roles) == 2
+}
+
+func (s *Server) SetCanonicalGroup(xmlDoc string) error {
+	var g groupRecord
+	if err := xml.Unmarshal([]byte(xmlDoc), &g); err != nil {
+		return fmt.Errorf("parse group document: %w", err)
+	}
+	if !describesPair(&g) {
+		return fmt.Errorf("group document needs a masterDeviceId and exactly two roles (got master=%q roles=%d)", g.MasterDeviceID, len(g.Roles))
+	}
+	if strings.TrimSpace(g.ID) == "" {
+		g.ID = margeGroupID(g.MasterDeviceID)
+	}
+	s.mu.Lock()
+	s.group = &g
+	s.groupCanonical = true
+	s.groupRestored = false
+	s.persistGroupLocked()
+	s.mu.Unlock()
+	s.logger.Info("marge group: canonical pair document installed",
+		slog.String("comp", "marge"), slog.String("groupId", g.ID),
+		slog.String("master", g.MasterDeviceID))
+	return nil
+}
+
+// ClearGroup drops the stored pair record (dissolve, from this box's own flow
+// or relayed for the partner). No-op when nothing is stored.
+func (s *Server) ClearGroup(reason string) {
+	s.mu.Lock()
+	existed := s.group != nil
+	s.group = nil
+	s.groupCanonical = false
+	s.groupRestored = false
+	s.persistGroupLocked()
+	s.mu.Unlock()
+	if existed {
+		s.logger.Info("marge group: cleared", slog.String("comp", "marge"), slog.String("reason", reason))
+	}
+}
+
+// GroupRestoredUnconfirmed reports whether the stored record came from NAND
+// and no live signal (firmware post, canonical install) has confirmed it this
+// run. The agent's post-startup check clears such a record when the firmware
+// reports no group: a Bose factory reset wipes the box's own pairing but not
+// /mnt/nv/stmanager, and a phantom record must not keep answering the group
+// poll with a pair that no longer exists.
+func (s *Server) GroupRestoredUnconfirmed() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.group != nil && s.groupRestored
+}
+
+// CanonicalGroupXML renders the canonical stereo-pair document the pairing
+// flow installs on BOTH members' marges: master = LEFT, partner = RIGHT, the
+// group id derived from the master so every copy agrees.
+func CanonicalGroupXML(name, masterID, masterIP, partnerID, partnerIP string) string {
+	g := &groupRecord{
+		ID:             margeGroupID(masterID),
+		Name:           name,
+		MasterDeviceID: masterID,
+		Roles: []groupRole{
+			{DeviceID: masterID, Role: "LEFT", IP: masterIP},
+			{DeviceID: partnerID, Role: "RIGHT", IP: partnerIP},
+		},
+	}
+	return renderGroupXML(g)
+}
+
+// handleMargeGroup dispatches the stereo-pair group CRUD the firmware runs
+// against marge as the cloud half of /addGroup and /removeGroup.
+func (s *Server) handleMargeGroup(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut:
+		s.createMargeGroup(w, r)
+	case http.MethodDelete:
+		s.deleteMargeGroup(w, r)
+	default: // GET/HEAD: the box's "is this device in a group?" poll.
+		s.readMargeGroup(w, r)
+	}
+}
+
+// createMargeGroup answers the firmware's "create this group on marge" POST.
+// It stores the record and echoes it back with a server-assigned id, which is
+// what unblocks the box's /addGroup (previously HTTP 500 / error 5580).
+func (s *Server) createMargeGroup(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<16))
+	var g groupRecord
+	if err := xml.Unmarshal(body, &g); err != nil {
+		s.logger.Warn("marge group create: could not parse body",
+			slog.String("comp", "marge"), slog.String("err", err.Error()))
+	}
+	if strings.TrimSpace(g.ID) == "" {
+		g.ID = margeGroupID(g.MasterDeviceID)
+	}
+	stored := &g
+	s.mu.Lock()
+	// While a canonical pair document is installed, NO firmware post replaces
+	// it — the record only changes via SetCanonicalGroup/ClearGroup. A post
+	// naming a DIFFERENT master is the known self-centered re-create of the
+	// RIGHT box (each firmware reports the pair from its own point of view;
+	// the real Bose cloud had one shared document); an agreeing post must not
+	// replace the record either, or the firmware's own shape would silently
+	// become "canonical". Echo the canonical document back in both cases so
+	// the firmware adopts the shared view.
+	// Any firmware post is live proof a pair still exists on the box side, so
+	// a restored record is confirmed either way.
+	s.groupRestored = false
+	if s.groupCanonical && s.group != nil {
+		stored = s.group
+		selfCentered := !strings.EqualFold(strings.TrimSpace(g.MasterDeviceID), strings.TrimSpace(stored.MasterDeviceID))
+		s.mu.Unlock()
+		if selfCentered {
+			s.logger.Warn("marge group create: firmware posted a self-centered pair document, answering with the canonical one",
+				slog.String("comp", "marge"),
+				slog.String("postedMaster", g.MasterDeviceID),
+				slog.String("canonicalMaster", stored.MasterDeviceID))
+		} else {
+			s.logger.Info("marge group create: firmware re-created the pair, keeping the canonical document",
+				slog.String("comp", "marge"), slog.String("master", stored.MasterDeviceID))
+		}
+	} else if !describesPair(stored) {
+		// Echo it back below, because that reply is what makes the firmware adopt
+		// a shared view and must not change, but do not keep it. A document with
+		// no roles is the firmware re-registering itself at boot, not a pair, and
+		// storing it is how both halves of a real pair ended up each believing it
+		// led a group of one.
+		prev := s.group
+		s.mu.Unlock()
+		if prev == nil {
+			s.logger.Warn("marge group create: the firmware posted a document that is not a pair, not storing it",
+				slog.String("comp", "marge"),
+				slog.String("postedMaster", g.MasterDeviceID),
+				slog.Int("roles", len(g.Roles)))
+		}
+	} else {
+		s.group = stored
+		s.persistGroupLocked()
+		s.mu.Unlock()
+	}
+
+	roles := make([]string, 0, len(stored.Roles))
+	for _, role := range stored.Roles {
+		roles = append(roles, role.Role+"="+role.DeviceID)
+	}
+	s.logger.Info("marge group created",
+		slog.String("comp", "marge"),
+		slog.String("groupId", stored.ID),
+		slog.String("master", stored.MasterDeviceID),
+		slog.String("roles", strings.Join(roles, ",")),
+	)
+
+	status := http.StatusCreated
+	if strings.HasSuffix(groupCreateFormat(), "200") {
+		status = http.StatusOK
+	}
+	body = []byte(`<?xml version="1.0" encoding="UTF-8" ?>` + renderGroupXML(stored))
+	if strings.HasPrefix(groupCreateFormat(), "wrap") {
+		body = []byte(`<?xml version="1.0" encoding="UTF-8" ?><response status="OK">` + renderGroupXML(stored) + `</response>`)
+	}
+	w.Header().Set("Content-Type", "application/vnd.bose.streaming-v1.2+xml")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+// readMargeGroup answers the periodic group poll. When a pair exists we return
+// it so the box keeps the pair; otherwise we preserve the historical standalone
+// behaviour (the box tolerates the account response as "not grouped").
+func (s *Server) readMargeGroup(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	g := s.group
+	s.mu.RUnlock()
+	if g == nil {
+		s.respondMargeAccountFull(w, r)
+		return
+	}
+	s.logger.Debug("marge group poll answered from store",
+		slog.String("comp", "marge"), slog.String("groupId", g.ID))
+	w.Header().Set("Content-Type", "application/vnd.bose.streaming-v1.2+xml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8" ?>` + renderGroupXML(g)))
+}
+
+// deleteMargeGroup drops the stored pair when the box dissolves it (/removeGroup
+// -> the firmware's group DELETE on marge).
+func (s *Server) deleteMargeGroup(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	existed := s.group != nil
+	s.group = nil
+	s.groupCanonical = false
+	s.persistGroupLocked()
+	s.mu.Unlock()
+	s.logger.Info("marge group deleted",
+		slog.String("comp", "marge"), slog.Bool("existed", existed))
+	w.Header().Set("Content-Type", "application/vnd.bose.streaming-v1.2+xml")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8" ?><response status="OK"/>`))
+}
+
+// GroupPair reports the stored stereo pair: the deviceID of its master and its
+// display name. ok is false when no pair is stored.
+//
+// A marge group record IS a stereo pair, not a multiroom zone: describesPair
+// refuses a document that does not carry a masterDeviceId and exactly two
+// roles, and nothing that fails it is stored or answered with.
+// That makes this the one honest answer to "is this speaker half of a pair", and
+// the zone store is not: a pair formed through STM leaves zones.json empty and
+// lives only here. Measured on two ST10s on 2026-09-27, where reading the zone
+// store instead would have reported no pair at all.
+func (s *Server) GroupPair() (masterDeviceID, name string, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	// describesPair, not just non-nil. A record naming itself master with no
+	// roles is not a pair, and answering yes to one made BOTH halves of a split
+	// pair claim they led it.
+	if !describesPair(s.group) {
+		return "", "", false
+	}
+	return s.group.MasterDeviceID, s.group.Name, true
+}

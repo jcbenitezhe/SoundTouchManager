@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="9 9 90 90">
+  <!-- Same glyph as the Android launcher icon (android/.../ic_launcher_foreground.xml). -->
+  <rect x="9" y="9" width="90" height="90" fill="#1668D9"/>
+  <path fill="#FFFFFF" d="M42,28h24a6,6 0 0 1 6,6v40a6,6 0 0 1 -6,6h-24a6,6 0 0 1 -6,-6v-40a6,6 0 0 1 6,-6z"/>
+  <path fill="#1668D9" d="M54,51a11,11 0 1 1 0,22a11,11 0 1 1 0,-22z"/>
+  <path fill="#FFFFFF" d="M54,59a3,3 0 1 1 0,6a3,3 0 1 1 0,-6z"/>
+  <path fill="#1668D9" d="M54,35.5a4.5,4.5 0 1 1 0,9a4.5,4.5 0 1 1 0,-9z"/>
+</svg>

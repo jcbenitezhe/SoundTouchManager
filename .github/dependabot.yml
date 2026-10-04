@@ -1,0 +1,96 @@
+# Dependabot configuration. Opens PRs for security issues and version updates.
+# Docs: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  # Main Go module
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    # Major updates stay separate on purpose: reviewed manually, not auto-merged.
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Desktop-app Go module. It is a SEPARATE module from the main one and shares
+  # transitive deps (golang.org/x/...) with it. Without watching it here, a
+  # Dependabot bump of the main module left the desktop-app go.mod stale and the
+  # build workflow's "go vet ./..." failed with "updates to go.mod needed"
+  # (2026-07-15). Watch it too so both modules move together.
+  - package-ecosystem: "gomod"
+    directory: "/desktop-app"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "go"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      go-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # Website npm dependencies have moved to a separate repository.
+  # When the /website folder is removed from this repo, drop nothing
+  # else here - this section already does not exist.
+
+  # The desktop app frontend: build and test tooling only (vite, vitest,
+  # eslint, stylelint), no runtime dependency ships to a user. It went
+  # unwatched until 2026-09-26, when a review of what Dependabot can and
+  # cannot see turned it up. Monthly and grouped, because dev tooling that
+  # opens four PRs a week gets ignored, and ignored PRs are how a real one
+  # goes unnoticed.
+  - package-ecosystem: "npm"
+    directory: "/desktop-app/frontend"
+    schedule:
+      interval: "monthly"
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "frontend"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      frontend-tooling:
+        update-types: ["minor", "patch"]
+
+  # Keep GitHub Actions themselves up to date.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "Europe/Berlin"
+    labels:
+      - "dependencies"
+      - "actions"
+    commit-message:
+      prefix: "ci"
+    groups:
+      # codeql-action ships init/autobuild/analyze/upload-sarif as separate
+      # sub-actions from a single repo. They must move in lockstep: a run
+      # fails with "Loaded a configuration file for version X, but running
+      # version Y" if init and analyze land on different releases. Bumping
+      # them in one atomic PR prevents that split-brain.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"

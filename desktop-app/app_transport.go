@@ -1,0 +1,501 @@
+package main
+
+// This file was split out of app.go (wave-1 move-only refactor):
+// agent HTTP transport: base URLs, the per-host port cache, and boxDo with port fallback.
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+)
+
+func (a *App) baseURL(host string, port int) string {
+	// Default to the chipset-whitelisted hijack port. Classic frontend
+	// callers that pre-discovery hard-coded 8888 still work because
+	// they pass port=8888 explicitly; this fallback only kicks in for
+	// freshly-resolved boxes where port was left zero.
+	if port == 0 {
+		port = 17008
+	}
+	if cp, ok := a.cachedPort(host); ok {
+		port = cp
+	}
+	return fmt.Sprintf("http://%s:%d", host, port)
+}
+
+func (a *App) cachedPort(host string) (int, bool) {
+	a.portMu.Lock()
+	defer a.portMu.Unlock()
+	p, ok := a.portCache[host]
+	return p, ok
+}
+
+func (a *App) rememberPort(host string, port int) {
+	a.portMu.Lock()
+	defer a.portMu.Unlock()
+	if a.portCache == nil {
+		a.portCache = map[string]int{}
+	}
+	a.portCache[host] = port
+}
+
+func (a *App) forgetPort(host string) {
+	a.portMu.Lock()
+	defer a.portMu.Unlock()
+	delete(a.portCache, host)
+}
+
+// altAgentPort returns the other agent port. The two are the STM agent's
+// direct :8888 and the BCO chipset-whitelisted redirect :17008.
+func altAgentPort(p int) int {
+	if p == 8888 {
+		return 17008
+	}
+	return 8888
+}
+
+// altAgentPortFor is a seam. The two agent ports are fixed numbers, so a test
+// that wants to exercise the fallback across two servers cannot use httptest,
+// which hands out a random loopback port. Tests replace this to name a port
+// they control; nothing in the app ever assigns to it.
+var altAgentPortFor = altAgentPort
+
+// notTheAgent reports whether a response plainly did not come from the STM
+// agent, so the port that produced it must not be cached or trusted.
+//
+// This only ever fires on /api/ paths, which are ours alone: any other path may
+// legitimately be served by whatever else is on the box.
+//
+// Two shapes are recognised, both observed in the field:
+//
+//   - 404. The Bose firmware on :8090 answers unknown /api/ paths with it, and
+//     caching that port made a post-OTA name/Wi-Fi write silently fail.
+//   - A 4xx with no body at all. Every refusal the agent itself produces goes
+//     through http.Error and therefore carries a reason; a bare status line
+//     with an empty body is a minimal firmware listener, not us. Field report
+//     2026-08-07: a speaker answered `status 400 ... body=""` to every request
+//     for two days across three app versions, because the first such 400 was
+//     cached as the agent's port and boxDo then returned it immediately
+//     without ever trying the other candidate. The agent was on the other one.
+//
+// A 5xx is deliberately NOT included: the agent does return bodiless 5xx in
+// places, and a struggling agent is still the agent. Treating it as a stranger
+// would send the app to the wrong port at exactly the wrong moment.
+func notTheAgent(resp *http.Response, path string) bool {
+	if resp == nil || !strings.HasPrefix(path, "/api/") {
+		return false
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return true
+	}
+	return resp.StatusCode >= 400 && resp.StatusCode < 500 && bodyIsEmpty(resp)
+}
+
+// bodyIsEmpty reports whether resp has no body, without consuming it: the
+// response may still be handed back to the caller as the best answer we got.
+// A body of unknown length is peeked one byte deep and the byte is put back.
+func bodyIsEmpty(resp *http.Response) bool {
+	if resp.ContentLength == 0 {
+		return true
+	}
+	if resp.ContentLength > 0 || resp.Body == nil {
+		return false
+	}
+	br := bufio.NewReader(resp.Body)
+	_, err := br.Peek(1)
+	resp.Body = readCloser{Reader: br, Closer: resp.Body}
+	return err == io.EOF
+}
+
+// readCloser rejoins a buffered reader to the original body's Closer, so the
+// peeked byte is still delivered and the connection is still released.
+type readCloser struct {
+	io.Reader
+	io.Closer
+}
+
+// The speaker's own Bose ports. Neither one ever runs the STM agent: :8090 is
+// the Bose web API (it answers /api/* with a 404, which is worse than silence
+// because a caller can mistake it for a live answer) and :8091 is its UPnP
+// renderer.
+const (
+	bosePort     = 8090
+	boseUPnPPort = 8091
+)
+
+// candidatePorts is the ordered, deduped list of agent ports to try for a
+// host: the cached working port first (if any), then the caller's port,
+// then the alternate. So the common case is one direct hit; a wrong/stale
+// port costs one extra fast attempt and then self-corrects via the cache.
+func (a *App) candidatePorts(host string, port int) []int {
+	// A BOSE port is never an agent candidate. probeStock stamps a pre-install
+	// box record with :8090, and a caller that passes that record on used to get
+	// [8090, 8888]: :17008 unreachable, so a BCO/whitelisted chassis could not be
+	// found at all, and :8090 in front answering /api/* with a 404 that the
+	// caller then has to interpret. The install's verify step did exactly that
+	// and reported a fully successful install as failed (field report
+	// 2026-08-22, whose own header line read "speaker : <ip>:8090").
+	//
+	// Named ports only, not "anything that is not 8888/17008": the caller's port
+	// is a deliberate seam (see altAgentPortFor) that the transport tests drive
+	// with an httptest listener, and swallowing it would silence them.
+	if port == bosePort || port == boseUPnPPort {
+		port = 0
+	}
+	if port == 0 {
+		port = 17008
+	}
+	order := make([]int, 0, 3)
+	if cp, ok := a.cachedPort(host); ok {
+		order = append(order, cp)
+	}
+	order = append(order, port, altAgentPortFor(port))
+	seen := map[int]bool{}
+	out := order[:0]
+	for _, p := range order {
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// zoneCallTimeout is the budget for forming or dissolving a zone. The agent
+// wakes every member first (up to 8 s each) and only then talks to the Bose
+// firmware, so the shared 6 s client cut the call off before the work started.
+// Generous on purpose: a zone call is a deliberate user action that happens
+// rarely, and a slow success beats a fast lie.
+const zoneCallTimeout = 45 * time.Second
+
+// boxDo performs an HTTP request against the agent with transparent port
+// fallback. It tries each candidate port in turn; the first that connects
+// is cached for the host and its response returned. A transport-level
+// failure (connection refused, timeout, reset) drops the cached port and
+// moves to the next candidate, so a box that changed which port it answers
+// on (reboot, freeze, OTA) self-heals on the very next call. A non-
+// transport error (a real HTTP response the caller must see) is returned
+// immediately without flailing across ports. Caller closes resp.Body.
+func (a *App) boxDo(host string, port int, method, path, contentType, body string) (*http.Response, error) {
+	return a.boxDoTimeout(host, port, method, path, contentType, body, 0)
+}
+
+// boxDoTimeout is boxDo with a per-call deadline. A timeout of 0 uses the shared
+// client's 6 s, which is right for the reads and small writes that make up
+// nearly every call.
+//
+// It exists because a few agent endpoints are legitimately slower than that, and
+// silently failing them is worse than waiting. Forming a zone is the case that
+// exposed it: handleZoneForm calls ensureBoxReady first, which alone may spend
+// 8 s waking a speaker out of standby before the firmware call even starts. The
+// app gave up at 6 s and told the user the group could not be formed, while the
+// box went on to form it. The user then tried again and got
+// GROUP_ALREADY_EXISTS from a group that had been created by the attempt they
+// were told had failed (and the zone timeouts in the 2026-07-28 ST10
+// bundle).
+func (a *App) boxDoTimeout(host string, port int, method, path, contentType, body string, timeout time.Duration) (*http.Response, error) {
+	client := a.httpClient
+	if timeout > 0 {
+		c := *a.httpClient
+		c.Timeout = timeout
+		client = &c
+	}
+	// failed collects every port that did not answer, in the order they were
+	// tried. The error handed back leads with the FIRST of them (the cached
+	// port, else the caller's: the one the caller actually means) and only
+	// summarises the rest. Returning whichever port happened to be tried last
+	// is what made a post-OTA verdict quote :17008 for a SoundTouch 10 whose
+	// update had gone through :8888 and whose firewall drops :17008 by design.
+	var failed []portFailure
+	// stranger holds the best answer from a port that is NOT the STM agent (see
+	// notTheAgent). It is kept only as a fallback, so a genuine agent 404 or 400
+	// is still surfaced when no other port answers at all, and it is never
+	// cached: caching it is what let one bare 400 capture a host for two days.
+	var stranger *http.Response
+	cands := a.candidatePorts(host, port)
+	for _, p := range cands {
+		url := fmt.Sprintf("http://%s:%d%s", host, p, path)
+		var rdr io.Reader
+		if body != "" {
+			rdr = strings.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(a.appCtx(), method, url, rdr)
+		if err != nil {
+			if stranger != nil {
+				stranger.Body.Close()
+			}
+			return nil, err
+		}
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		resp, err := client.Do(req)
+		if err == nil {
+			// Something answered, but not necessarily us. A port that is
+			// demonstrably not the agent must neither be cached nor end the
+			// search, or the real agent on the other port is never reached.
+			// Keep the reply as a fallback and carry on.
+			if notTheAgent(resp, path) {
+				if stranger != nil {
+					stranger.Body.Close()
+				}
+				stranger = resp
+				a.forgetPort(host)
+				continue
+			}
+			a.rememberPort(host, p)
+			if stranger != nil {
+				stranger.Body.Close()
+			}
+			return resp, nil
+		}
+		failed = append(failed, portFailure{port: p, err: err})
+		if !isTransportNotReady(err) {
+			if stranger != nil {
+				return stranger, nil
+			}
+			return nil, err
+		}
+		a.forgetPort(host)
+	}
+	if stranger != nil {
+		return stranger, nil
+	}
+	return nil, reachabilityHint(allPortsError(failed))
+}
+
+// portFailure is one agent port and why it did not answer.
+type portFailure struct {
+	port int
+	err  error
+}
+
+// allPortsErr is boxDo's error when no candidate port answered. It reads as
+// the first port's own error (so every caller that inspects the text or
+// unwraps it sees the port that matters) with the other ports summarised in
+// one clause each, e.g. "(also tried :17008: timed out)". With a single
+// candidate it is exactly that candidate's error.
+type allPortsErr struct {
+	first portFailure
+	rest  []portFailure
+}
+
+func allPortsError(failed []portFailure) error {
+	if len(failed) == 0 {
+		return nil
+	}
+	if len(failed) == 1 {
+		return failed[0].err
+	}
+	return &allPortsErr{first: failed[0], rest: failed[1:]}
+}
+
+func (e *allPortsErr) Error() string {
+	var b strings.Builder
+	b.WriteString(e.first.err.Error())
+	for _, f := range e.rest {
+		fmt.Fprintf(&b, " (also tried :%d: %s)", f.port, briefTransportErr(f.err))
+	}
+	return b.String()
+}
+
+func (e *allPortsErr) Unwrap() error { return e.first.err }
+
+// briefTransportErr names a connection failure in two or three words, for
+// the "also tried" clause: the full Go error repeats the URL and the OS text
+// and would double the length of a message the user reads under a failed
+// update.
+func briefTransportErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	var nerr net.Error
+	msg := strings.ToLower(err.Error())
+	switch {
+	case (errors.As(err, &nerr) && nerr.Timeout()) || strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded"):
+		return "timed out"
+	case strings.Contains(msg, "refused"):
+		return "connection refused"
+	case strings.Contains(msg, "reset"):
+		return "connection reset"
+	case strings.Contains(msg, "no route to host"):
+		return "no route to host"
+	}
+	return shortErr(err)
+}
+
+// reachabilityHint turns a bare "cannot reach the speaker" connection error
+// (every candidate port timed out or refused) into an actionable one by naming
+// the two things that most often cause it: a firewall or antivirus blocking ST
+// Manager's own network access, or this PC and the speaker being on different
+// Wi-Fi networks. A user (2026-07-11) hit exactly this - the app timed out to
+// BOTH github.com and every speaker port while their browser downloaded fine,
+// i.e. a security suite was filtering the app, not the network. Wrapped with %w so
+// errors.Is and callers that match the original text still work; a cancelled
+// context (app shutdown) is returned unchanged so it never shows the hint.
+func reachabilityHint(err error) error {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return err
+	}
+	// A speaker that ANSWERED cannot be behind a firewall that blocks this app,
+	// and the hint below then sends the user hunting through antivirus settings
+	// for nothing. Field report 2026-08-06: an update failed with
+	// `status 400 ... body=""` on every attempt over two days, and the advice
+	// under it talked about firewalls and separate Wi-Fi networks while the
+	// speaker was replying to each request. That is the same wrong-blame the
+	// install path already had to fix.
+	//
+	// An HTTP status means the connection was made and something answered. What
+	// answered was not STM: on a speaker whose agent is not up, the firmware's
+	// own listener replies with a bare status. So say that instead.
+	if answeredNotSTM(err) {
+		return fmt.Errorf("%w\n\n%s", err, answeredNotSTMAdvice)
+	}
+	// EADDRNOTAVAIL ("can't assign requested address") is the PC failing to open a
+	// LOCAL socket for the connection, not the speaker refusing it, so the
+	// firewall/same-Wi-Fi advice sends the user hunting in the wrong place. It
+	// shows up when a VPN has captured the routing table or the adapter STM is
+	// using has no address on the speaker's network, and it fails identically for
+	// EVERY host (field 2026-09-05: a Mac hit it against the speaker, the router
+	// and a media server alike, while it still received their multicast).
+	if noLocalRoute(err) {
+		return fmt.Errorf("%w\n\n%s", err, noLocalRouteAdvice)
+	}
+	// ENETUNREACH is the operating system saying the request never left this
+	// machine: there is no route to that network, which is what a laptop with
+	// its Wi-Fi off or its adapter gone looks like from in here. A firewall
+	// cannot produce it and neither can the speaker, so the firewall paragraph
+	// is wrong twice over. Eileen Wilson pulled her Mac's Wi-Fi mid-update on
+	// 2026-09-10 and got it anyway, on all three speakers at once and on SSH
+	// port 22, followed by advice to unplug a speaker that was fine.
+	if noNetworkHere(err) {
+		return fmt.Errorf("%w\n\n%s", err, noNetworkAdvice)
+	}
+	return fmt.Errorf("%w\n\n%s", err, firewallAdvice)
+}
+
+// noLocalRoute reports the EADDRNOTAVAIL family: the OS could not assign a local
+// source address for the outbound connection. macOS/Linux phrase it "can't/cannot
+// assign requested address"; Windows (WSAEADDRNOTAVAIL) as "requested address is
+// not valid in its context".
+func noLocalRoute(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "assign requested address") ||
+		strings.Contains(msg, "address is not valid in its context")
+}
+
+// noNetworkHere reports the ENETUNREACH family: this machine has no route to
+// the speaker's network at all, so the connection attempt failed locally and
+// nothing was ever put on the wire.
+//
+// Deliberately NOT matching "no route to host" (EHOSTUNREACH), which is the
+// neighbouring error and means something different: there a route exists and
+// the host at the end of it did not answer, which is mostly a speaker that is
+// switched off. Blaming the user's network for that would be the same mistake
+// pointed the other way.
+//
+// macOS and Linux phrase it "connect: network is unreachable"; Windows
+// (WSAENETUNREACH) as "A socket operation was attempted to an unreachable
+// network". String matching rather than errors.Is because these errors reach
+// here already flattened into text by the layers in between, which is also how
+// noLocalRoute above has to do it.
+func noNetworkHere(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "unreachable network")
+}
+
+// The two closing paragraphs a user reads under a failed update. They are
+// constants because the update report has to be able to recognise the wrong one
+// and swap it for the right one (see stripWrongBlame): a copy of the text in
+// two places would drift and the swap would quietly stop working.
+const (
+	firewallAdvice = "The app could not reach the speaker. This is usually a firewall or antivirus blocking SoundTouch Manager, or this PC and the speaker being on different Wi-Fi networks. Allow SoundTouch Manager through your firewall/antivirus (or turn it off briefly to test), and make sure both are on the same Wi-Fi network"
+
+	answeredNotSTMAdvice = "The speaker answered, so this is not your firewall and not a Wi-Fi problem: something on the speaker replied to every request. What answered was not SoundTouch Manager, which is what a speaker looks like while it is still starting up, or when its SoundTouch Manager software did not come up at all. Unplug the speaker for ten seconds, plug it back in, wait about three minutes until it is fully up, and try the update again"
+
+	noNetworkAdvice = "This computer has no network connection right now, so the request never left it: the system reports the speaker's network as unreachable. That is not the speaker and not a firewall, and nothing needs to be unplugged. Reconnect this computer's Wi-Fi (or its network cable) and try again; the speakers come back on their own once they can be reached."
+
+	noLocalRouteAdvice = "This PC could not open a network connection to the speaker's address, and it failed the same way for every device on the network, so this is your PC's own networking, not the speaker and not its firewall. The usual cause is a VPN capturing all your traffic, or the network adapter SoundTouch Manager is using having no address on the speaker's network. Disconnect the VPN (or exclude your local network from it), make sure this PC is on the same Wi-Fi as the speaker with a normal address, then try again"
+)
+
+// The advice paragraphs the install preflight can end on. They used to be
+// written inline, run together with the sentence of fact above them into one
+// block of prose. The failure report has to lift the advice out of the middle
+// of the text and reprint it under the measured facts (the report a user
+// mailed in on 2026-08-23 was advice at the top, one timeout string, and
+// nothing measurable at all), and it can only do that against constants it can
+// recognise, so each one lives here next to the two the transport layer uses,
+// under the same rule: one definition, never a second copy that drifts.
+//
+// The fact half stays at the call site because it names the address; only the
+// advice, which is the same sentence for every speaker, is shared.
+const (
+	notReachableAdvice = "Most often this is a firewall or antivirus blocking SoundTouch Manager, or this PC and the speaker being on different Wi-Fi networks: allow SoundTouch Manager through your firewall/antivirus (or turn it off briefly to test), and make sure both are on the same Wi-Fi (not a guest network). If it still fails, bring the speaker onto Wi-Fi with the Bose SoundTouch app, then reboot it with the STM stick plugged in and try again."
+	// isolationAdvice replaces the generic one when the facts show the speaker is
+	// on THIS PC's subnet yet answers nothing and does not even reply to a ping.
+	// A PC firewall cannot stop an outbound ping, so that pattern is not a
+	// firewall at all but a Wi-Fi that keeps its clients apart (a guest network,
+	// or client/AP isolation in the router). Leading with the firewall sent
+	// users chasing the wrong thing (Jens).
+	isolationAdvice = "The speaker shows up in the list because it announces itself, but it answers on no port and your PC cannot even reach it with a ping while both are on the same network. That is the fingerprint of a Wi-Fi that keeps devices apart from each other, not a firewall on your PC: usually a guest network, or client isolation (sometimes called AP isolation) switched on in the router. Put the PC and the speaker on the same normal Wi-Fi, not a guest network, turn off client/AP isolation in the router, then refresh the speaker list and try again."
+	// agentNotUpAdvice replaces the network-blame advice when the app's own log
+	// proves it reached the speaker this run (an SSH login, a staged install):
+	// none of that survives a firewall, a wrong subnet or client isolation, so
+	// the network is fine and blaming it sends the user chasing a problem that is
+	// not theirs (Klaus, 2026-09-03: the app SSH'd in and ran the installer, then
+	// the report told him to change his Wi-Fi). What went wrong is the speaker not
+	// coming back after the install rebooted it.
+	agentNotUpAdvice = "SoundTouch Manager reached your speaker and ran the install over the network, so your Wi-Fi, firewall and network are fine. The speaker just did not come back on the network after the install rebooted it. First pull any USB stick out of the speaker: a stick left in can keep an ST30 or Portable off the network even while it still plays. Then power-cycle the speaker, unplug it for about 30 seconds, plug it back in, and wait about 3 minutes before you refresh the speaker list. If it still does not appear, use \"Save diagnostic logs\" and send the file in."
+
+	// boxInSetupAdvice replaces the network blame when the speaker's own
+	// records show it was running Bose's out-of-box setup. That state takes
+	// the speaker off the network for minutes at a time, which from this PC
+	// is indistinguishable from a firewall, and two reporters were sent after
+	// their firewalls for it (2026-09-06).
+	boxInSetupAdvice = "Your speaker was busy with its own setup while this ran: in that state its Wi-Fi light blinks fast and it leaves the network for a few minutes at a time, so nothing on this PC can reach it. That is not your firewall and not your Wi-Fi. SoundTouch Manager is on the speaker either way. Wait about fifteen minutes and press Refresh in the speaker list; if the speaker appears with an SoundTouch Manager version, everything worked. If the light is still blinking after that, unplug the speaker for ten seconds and plug it back in. Do not run the install again while the light is blinking: it cannot help, and it produced a second, worse failure for the person who tried."
+
+	installWindowClosedAdvice = "Bose only opens the install access while the speaker boots with the STM stick plugged in. Power the speaker off, insert the STM stick, power it back on, then install."
+
+	controlUnresponsiveAdvice = "Power the speaker fully off and back on with the STM stick plugged in, then refresh the speaker list and try again."
+
+	// The stick leads, because the stick is the only thing that has actually
+	// brought a speaker back from this state. STM unlocks the speaker over its
+	// service port and restarts it; when the speaker does not come back, the
+	// advice that follows is the one that worked on 2026-09-13 (an owner whose
+	// SoundTouch 20 went dark here: "Stick angesteckt und dann mit dem Strom
+	// verbunden, nach ein paar Minuten war das Display mit Uhrzeit und Wlan
+	// Anzeige sichtbar"). The stick boot also rewrites the speaker's cloud
+	// addresses back to Bose's own, which is the other half of the repair, and
+	// the second Install press is called out because that is what turned one
+	// failure into two for the same owner.
+	restartingAfterUnlockAdvice = "Give the speaker about two minutes, then refresh the speaker list and try again. If it stays dark or missing: power it off, plug the STM stick in, power it back on, and then leave it alone for five minutes. That is what brought another speaker in exactly this state back, with the clock and the Wi-Fi symbol on its display again. Do not press Install while the stick is still working, a second attempt on top of the first one made it worse for the owner who tried."
+
+	alreadyInstalledAdvice = "Refresh the speaker list. If you meant to reinstall, reboot the speaker with the STM stick plugged in first."
+)
+
+// answeredNotSTM reports whether the failure carries evidence that the speaker
+// replied: an HTTP status line rather than a connection that never completed.
+// Matched on the shapes this project's own errors carry ("status 400 on <ip>",
+// "status 404", "unexpected status"), because those are the ones that reach a
+// user, and deliberately NOT on timeouts or refusals, which really can be a
+// firewall.
+// A status anywhere in the chain wins even when the run also contains a
+// timeout. The field report ends in an SSH timeout, but the preflight before it
+// got a 400: the speaker demonstrably answered, so the firewall advice is wrong
+// regardless of how the attempt finished.
+func answeredNotSTM(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "status 4") ||
+		strings.Contains(msg, "status 5") ||
+		strings.Contains(msg, "unexpected status")
+}

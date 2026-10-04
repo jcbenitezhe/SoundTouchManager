@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fakebox: simulated SoundTouch</title>
+<style>
+  :root { color-scheme: light dark; --accent: #1f6feb; --ok: #1a7f37; --muted: #6e7781; }
+  body { font: 15px/1.4 -apple-system, system-ui, sans-serif; margin: 0; padding: 24px; background: #eef1f5; color: #1f2328; }
+  @media (prefers-color-scheme: dark) { body { background: #0d1117; color: #e6edf3; } .box, .log { background: #161b22 !important; } }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  .banner { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+  .box { background: #fff; border-radius: 18px; padding: 20px; box-shadow: 0 4px 18px rgba(0,0,0,.08); }
+  .head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  h1 { font-size: 20px; margin: 0; }
+  .model { color: var(--muted); font-size: 13px; }
+  .screen { margin: 16px 0; padding: 14px; border-radius: 10px; background: #111; color: #e6edf3; min-height: 44px; font-family: ui-monospace, Menlo, monospace; }
+  .screen .src { color: #8b949e; font-size: 12px; }
+  .screen .now { font-size: 16px; margin-top: 4px; word-break: break-word; }
+  .screen.playing .now { color: #3fb950; }
+  .screen.standby { opacity: .55; }
+  .keys { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .key { border: 1px solid #d0d7de; border-radius: 12px; padding: 12px 8px; background: #f6f8fa; cursor: pointer; text-align: left; min-height: 70px; font: inherit; color: inherit; }
+  @media (prefers-color-scheme: dark) { .key { background: #21262d; border-color: #30363d; } }
+  .key b { display: block; font-size: 22px; }
+  .key span { display: block; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .key.active { border-color: var(--ok); box-shadow: 0 0 0 2px var(--ok) inset; }
+  .key.empty b { opacity: .45; }
+  .row { display: flex; align-items: center; gap: 10px; margin-top: 16px; flex-wrap: wrap; }
+  .row button { border: 1px solid #d0d7de; border-radius: 10px; padding: 8px 14px; background: #f6f8fa; cursor: pointer; font: inherit; color: inherit; }
+  @media (prefers-color-scheme: dark) { .row button { background: #21262d; border-color: #30363d; } }
+  .row input[type=range] { flex: 1; min-width: 120px; }
+  .unlock { display: none; margin-top: 12px; padding: 10px; border-radius: 10px; background: #fff8c5; color: #4d2d00; cursor: pointer; text-align: center; }
+  .unlock.show { display: block; }
+  .log { margin-top: 18px; background: #fff; border-radius: 12px; padding: 12px; font: 12px/1.5 ui-monospace, Menlo, monospace; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="banner">fakebox: a simulated speaker for development. Not a Bose product; SoundTouch and Bose are trademarks of Bose Corporation.</div>
+  <div class="box">
+    <div class="head"><h1 id="name">SoundTouch</h1><span class="model" id="model"></span></div>
+    <div class="screen" id="screen"><div class="src" id="src"></div><div class="now" id="now"></div></div>
+    <div class="keys" id="keys"></div>
+    <div class="row">
+      <button id="power" type="button">Power</button>
+      <button id="stop" type="button">Stop</button>
+      <span>Vol</span><input id="vol" type="range" min="0" max="100"><span id="volv"></span>
+    </div>
+    <div class="unlock" id="unlock">The browser blocked autoplay. Click here to hear the speaker.</div>
+    <div class="hint">Keys 1-6 act like the buttons on the speaker. Audio plays here, through this page.</div>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+<audio id="audio" preload="none"></audio>
+<script>
+const $ = (id) => document.getElementById(id);
+const audio = $('audio');
+let volDrag = false;
+
+const post = (path) => fetch(path, { method: 'POST' });
+
+function keyEl(i) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'key';
+  b.onclick = () => post('/ui/press/' + (i + 1));
+  b.innerHTML = '<b></b><span></span>';
+  return b;
+}
+const keys = Array.from({ length: 6 }, (_, i) => { const k = keyEl(i); $('keys').appendChild(k); return k; });
+
+function tryPlay() {
+  const p = audio.play();
+  if (p && p.catch) p.catch((e) => { if (e.name === 'NotAllowedError') $('unlock').classList.add('show'); });
+}
+$('unlock').onclick = () => { $('unlock').classList.remove('show'); tryPlay(); };
+$('power').onclick = () => post('/ui/power');
+$('stop').onclick = () => post('/ui/stop');
+$('vol').oninput = () => { volDrag = true; $('volv').textContent = $('vol').value; audio.volume = $('vol').value / 100; };
+$('vol').onchange = () => { volDrag = false; post('/ui/volume?v=' + $('vol').value); };
+
+function render(s) {
+  $('name').textContent = s.name;
+  $('model').textContent = s.model;
+  const pb = s.playback;
+  const screen = $('screen');
+  screen.className = 'screen' + (pb.state === 'PLAY_STATE' ? ' playing' : '') + (pb.source === 'STANDBY' ? ' standby' : '');
+  $('src').textContent = pb.source === 'STANDBY' ? 'STANDBY' : pb.source + ' · ' + pb.state.replace('_STATE', '') + (pb.slot ? ' · preset ' + pb.slot : '');
+  $('now').textContent = pb.source === 'STANDBY' ? '' : (pb.name || pb.location || 'Ready');
+  s.presets.forEach((p, i) => {
+    const k = keys[i];
+    k.querySelector('b').textContent = i + 1;
+    k.querySelector('span').textContent = p ? p.name : 'empty';
+    k.title = p ? p.location : 'No preset stored';
+    k.classList.toggle('empty', !p);
+    k.classList.toggle('active', pb.slot === i + 1 && pb.source !== 'STANDBY');
+  });
+  if (!volDrag) { $('vol').value = s.volume; $('volv').textContent = s.volume; audio.volume = s.volume / 100; }
+  $('log').textContent = (s.log || []).slice().reverse().join('\n');
+
+  const want = pb.state === 'PLAY_STATE' ? pb.location : '';
+  if (want && audio.dataset.src !== want) {
+    audio.dataset.src = want;
+    audio.src = want;
+    tryPlay();
+  } else if (want && audio.paused) {
+    tryPlay();
+  } else if (!want && audio.dataset.src) {
+    audio.pause();
+    if (pb.state !== 'PAUSE_STATE') { audio.removeAttribute('src'); audio.dataset.src = ''; audio.load(); }
+  }
+}
+
+const es = new EventSource('/ui/events');
+es.onmessage = (e) => render(JSON.parse(e.data));
+</script>
+</body>
+</html>

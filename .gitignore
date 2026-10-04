@@ -1,0 +1,96 @@
+# Build Output
+/bin/
+/dist/
+*.exe
+*.dmg
+*.tar.gz
+*.zip
+
+# Wails App Build Output. Ignore everything under build/ EXCEPT
+# appicon.png: that is the icon source Wails rasterises into the window /
+# exe / taskbar icon at build time, so CI needs it in the repo. (bin/,
+# windows/icon.ico, etc. stay ignored and are regenerated each build.)
+# darwin/Info.plist is a tracked TEMPLATE (adds the macOS local-network
+# privacy keys); Wails only generates a default when it is absent.
+/desktop-app/build/*
+!/desktop-app/build/appicon.png
+!/desktop-app/build/darwin/
+/desktop-app/build/darwin/*
+!/desktop-app/build/darwin/Info.plist
+# The Windows icon and manifest are sources too, not build output: the resource
+# generator reads them, and it runs BEFORE wails, so nothing recreates them on a
+# clean checkout. Missing them is what broke the first release that used the
+# generator, in CI only, where the build directory does not exist.
+!/desktop-app/build/windows/
+/desktop-app/build/windows/*
+!/desktop-app/build/windows/icon.ico
+!/desktop-app/build/windows/wails.exe.manifest
+/desktop-app/frontend/dist/
+/desktop-app/frontend/node_modules/
+/desktop-app/desktop-app/
+/desktop-app/agentbin/stmanager-*
+/desktop-app/agentbin/go-librespot-*
+/desktop-app/agentbin/*.bin
+/sticksetup/embedded/
+
+# Empty stubs that must remain tracked so go:embed succeeds on a fresh
+# clone. CI overwrites them with the real binaries during release.
+!/desktop-app/agentbin/stmanager-armv7l
+!/desktop-app/agentbin/go-librespot-armv7l
+!/sticksetup/embedded/
+!/sticksetup/embedded/winformat.exe
+# Same idea for desktop-app/main.go's //go:embed all:frontend/dist —
+# track only the stub, ignore everything wails/vite drops in there.
+!/desktop-app/frontend/dist/
+/desktop-app/frontend/dist/*
+!/desktop-app/frontend/dist/.gitkeep
+
+# Astro Webseite Build
+/website/dist/
+/website/node_modules/
+/website/.astro/
+
+# Node
+node_modules/
+
+# Env
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Go Build
+/agent.exe
+*.test
+*.out
+
+# Tmp
+*.tmp
+*.bak
+.cache/
+
+# Play Store app. Built and uploaded from the Play Console flow, not
+# from this repository.
+/android/
+
+# Local on-box test scratch. Holds throwaway scripts run against the
+# maintainer's own test speaker that may contain real Wi-Fi credentials
+# or device IDs. MUST NEVER be committed.
+/agent/
+
+# Claude Code working directory. Holds sensitive, non-project material
+# (network captures, Bose firmware binaries, API docs, local settings,
+# agent memory/notes). MUST NEVER be committed.
+.claude/
+.gotmp/
+testbuilds/
+.engine-build/
+
+# Generated Windows resource (icon, manifest and version block), written by
+# `make winres` and by CI. Never committed, like the other embed artefacts.
+desktop-app/rsrc_windows_amd64.syso

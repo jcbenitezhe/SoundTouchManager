@@ -1,0 +1,800 @@
+package main
+
+// In-app self-update, phase 1: download the matching release asset for the
+// host OS, verify its SHA256 against the release manifest, then install it.
+//
+// Install capability differs by OS, driven by how the app is shipped (a
+// portable binary or image per platform, code-signed since v0.9.20 on Windows
+// and v0.9.33 on macOS):
+//   - Linux  : the asset is a .tar.gz with the binary inside. A running binary
+//              can be replaced on Linux, so STM swaps itself and relaunches.
+//   - Windows: the asset is the portable .exe. A running .exe cannot be
+//              overwritten but CAN be renamed, so STM renames itself to .old,
+//              drops the new .exe in place and relaunches; the .old is removed on
+//              the next start.
+//   - macOS  : the asset is a .zip of the signed and stapled .app, and STM
+//              swaps the running bundle for it (see update_macos.go). The .dmg
+//              stays published for first installs and is the fallback whenever
+//              the swap is not possible: an app started from the mounted image,
+//              a folder the user cannot write, or a release from before the zip
+//              existed. Then it behaves as it always did and just opens the
+//              image for the user to drag the app in.
+//
+// The check itself (CheckAppUpdate) is unchanged; this adds the download/verify/
+// apply half the banner previously delegated to "open the website".
+
+import (
+	"archive/tar"
+	"compress/gzip"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
+	"time"
+)
+
+// versionFromFilenameRE pulls a vX.Y.Z out of a release asset filename, e.g.
+// "STM-Windows-v0.7.42.exe" -> "v0.7.42".
+var versionFromFilenameRE = regexp.MustCompile(`v\d+\.\d+\.\d+`)
+
+// resolveSecondInstanceExe turns the SingleInstanceLock second-instance args +
+// working dir into the absolute path of the binary the user just launched.
+func resolveSecondInstanceExe(args []string, wd string) string {
+	if len(args) == 0 || args[0] == "" {
+		return ""
+	}
+	p := args[0]
+	if !filepath.IsAbs(p) && wd != "" {
+		p = filepath.Join(wd, p)
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	if abs, err := filepath.Abs(p); err == nil {
+		p = abs
+	}
+	return p
+}
+
+// pathsEqual compares two file paths, case-insensitively on Windows.
+func pathsEqual(a, b string) bool {
+	ca, _ := filepath.Abs(filepath.Clean(a))
+	cb, _ := filepath.Abs(filepath.Clean(b))
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(ca, cb)
+	}
+	return ca == cb
+}
+
+// tryHandOffTo handles the case where the user double-clicks a freshly downloaded
+// NEWER build while this (older) one is running: the SingleInstanceLock would
+// otherwise just raise this old window and the new binary would exit, leaving the
+// user stuck on the old version. If the second instance is a different file whose
+// filename version is strictly newer than ours, quit this one and start that one
+// (via the same wait-for-our-pid helper), so the new version actually comes up.
+// Returns true when it took over (caller then skips the raise-to-front).
+//
+// Guard rails: the same binary path just raises the window (no-op handoff); an
+// unparseable or not-newer filename is NOT handed off, so a re-launch of the same
+// or an older copy never downgrades silently.
+func (a *App) tryHandOffTo(other string) bool {
+	if other == "" {
+		return false
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	if r, e := filepath.EvalSymlinks(self); e == nil {
+		self = r
+	}
+	if pathsEqual(self, other) {
+		return false
+	}
+	ov := versionFromFilenameRE.FindString(filepath.Base(other))
+	if ov == "" || !versionLess(appVersion, ov) {
+		return false
+	}
+	a.logger.Info("second instance is a newer build; handing off instead of just focusing",
+		"self", appVersion, "newVersion", ov, "path", other)
+	a.relaunchAndQuit(other)
+	return true
+}
+
+// newGETRequest builds a GET with STM's identifiable update user-agent, used for
+// the manifest and asset downloads through updateHTTPClient (the pure-Go TLS
+// client, see update_tls.go).
+func newGETRequest(ctx context.Context, url string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "STManager-Desktop ("+runtime.GOOS+"; "+runtime.GOARCH+")")
+	return req, nil
+}
+
+// updateAssetKey maps the host OS to the manifest.json artifact key.
+func updateAssetKey() string {
+	keys := updateAssetKeys()
+	if len(keys) == 0 {
+		return ""
+	}
+	return keys[0]
+}
+
+// updateAssetKeys lists the manifest artifact keys for the host OS in order of
+// preference. Only macOS has more than one: the .zip carries the same signed and
+// stapled app as the .dmg but can be swapped in place, so it is preferred, while
+// the .dmg stays the fallback for releases built before the zip existed and for
+// installations that cannot self-replace anyway.
+func updateAssetKeys() []string {
+	switch runtime.GOOS {
+	case "windows":
+		return []string{"desktop_windows"}
+	case "darwin":
+		if canSelfReplaceDarwin() {
+			return []string{"desktop_macos_zip", "desktop_macos"}
+		}
+		// The decision that costs the user the drag step is made HERE, before
+		// anything is downloaded, and it used to leave no trace at all.
+		return []string{"desktop_macos"}
+	case "linux":
+		return []string{"desktop_linux"}
+	}
+	return nil
+}
+
+// canSelfReplace reports whether STM can install an update in place on this OS.
+//
+// The answer is per INSTALLATION, not per platform. Windows ships a portable
+// .exe that users keep somewhere of their own, and its rename trick reports a
+// clear error if that place is protected. Linux and macOS are asked properly:
+// the swap needs a writable directory, and on macOS one that is not the mounted
+// disk image, so an app launched straight out of the DMG keeps the assisted
+// flow and is told to drag it into Applications once.
+func canSelfReplace() bool {
+	switch runtime.GOOS {
+	case "windows":
+		return true
+	case "linux":
+		// Same question macOS asks, for the same reason: a binary installed
+		// into /opt or /usr/local by root cannot be swapped by the user running
+		// it, and finding that out only when the rename fails means the user
+		// has already sat through a download and pressed Install.
+		exe, err := os.Executable()
+		if err != nil {
+			return false
+		}
+		if r, e := filepath.EvalSymlinks(exe); e == nil {
+			exe = r
+		}
+		return dirWritable(filepath.Dir(exe))
+	case "darwin":
+		return canSelfReplaceDarwin()
+	}
+	return false
+}
+
+// UpdateAsset is the resolved download for the host OS, returned to the frontend
+// so it can show the size/version and decide between "Install now" (self-replace)
+// and "Download & open" (assisted, macOS).
+type UpdateAsset struct {
+	Version     string `json:"version"`
+	SHA256      string `json:"sha256"`
+	URL         string `json:"url"`
+	Filename    string `json:"filename"`
+	AutoInstall bool   `json:"autoInstall"`
+}
+
+// releaseManifestURL is the GitHub release manifest.json for a version tag. The
+// manifest carries the per-OS asset url + sha256; reading it after the update
+// check (which only tells us the version) keeps the download self-contained and
+// independent of the website endpoint.
+func releaseManifestURL(version string) string {
+	return projectURL + "/releases/download/" + version + "/manifest.json"
+}
+
+// releaseManifestLatestURL is the stable /releases/latest manifest. GitHub
+// resolves /latest to the newest PUBLISHED release, so this never 404s on a tag
+// that is still a draft or whose case differs from the manifest's version
+// string. Used as the fallback when the version-pinned manifest is unreachable
+// (the most likely cause of the "page not found" a user hit right after an
+// update banner appeared).
+func releaseManifestLatestURL() string {
+	return projectURL + "/releases/latest/download/manifest.json"
+}
+
+// ResolveUpdateAsset fetches the release manifest for version and returns the
+// download for the host OS. Errors when the OS is unsupported or the manifest
+// lacks the asset (a malformed/old release).
+func (a *App) ResolveUpdateAsset(version string) (UpdateAsset, error) {
+	keys := updateAssetKeys()
+	if len(keys) == 0 {
+		return UpdateAsset{}, fmt.Errorf("unsupported OS %q", runtime.GOOS)
+	}
+	fetch := func(url string) (UpdateAsset, error) {
+		ctx, cancel := context.WithTimeout(a.appCtx(), 15*time.Second)
+		defer cancel()
+		req, err := newGETRequest(ctx, url)
+		if err != nil {
+			return UpdateAsset{}, err
+		}
+		// Download client (no 6 s total cap): a slow link could otherwise time the
+		// manifest fetch out too; the 15 s context still bounds it.
+		resp, err := updateDownloadHTTPClient().Do(req)
+		if err != nil {
+			return UpdateAsset{}, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			return UpdateAsset{}, fmt.Errorf("manifest status %d", resp.StatusCode)
+		}
+		var m struct {
+			Version   string `json:"version"`
+			Artifacts map[string]struct {
+				URL      string `json:"url"`
+				SHA256   string `json:"sha256"`
+				Filename string `json:"filename"`
+			} `json:"artifacts"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m); err != nil {
+			return UpdateAsset{}, err
+		}
+		// First key that the release actually carries wins, so a macOS app
+		// asking for the swappable .zip still updates from a release that only
+		// published the .dmg.
+		var art struct {
+			URL      string `json:"url"`
+			SHA256   string `json:"sha256"`
+			Filename string `json:"filename"`
+		}
+		var picked string
+		for _, k := range keys {
+			if a, ok := m.Artifacts[k]; ok && a.URL != "" && a.SHA256 != "" {
+				art, picked = a, k
+				break
+			}
+		}
+		if picked == "" {
+			return UpdateAsset{}, fmt.Errorf("release %s has no %s asset", m.Version, keys[0])
+		}
+		return UpdateAsset{
+			Version:     m.Version,
+			SHA256:      strings.ToLower(strings.TrimSpace(art.SHA256)),
+			URL:         art.URL,
+			Filename:    art.Filename,
+			AutoInstall: canSelfReplace(),
+		}, nil
+	}
+	// Try the version-pinned manifest first; if it is unreachable (a draft tag, a
+	// case mismatch, or a publish still propagating), fall back to /releases/latest
+	// so the one-click update never dead-ends on "page not found".
+	asset, err := fetch(releaseManifestURL(version))
+	if err != nil {
+		if asset2, err2 := fetch(releaseManifestLatestURL()); err2 == nil {
+			return asset2, nil
+		}
+		return UpdateAsset{}, err
+	}
+	return asset, nil
+}
+
+// updateDir is the per-user cache dir STM downloads updates into.
+func updateDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		base = os.TempDir()
+	}
+	d := filepath.Join(base, "STManager", "updates")
+	if err := os.MkdirAll(d, 0o755); err != nil {
+		return "", err
+	}
+	return d, nil
+}
+
+// DownloadUpdate downloads the host-OS asset for version, verifies its SHA256
+// against the release manifest, and returns the local file path. It streams the
+// body to <updateDir>/<filename>.part, emitting "app:update:progress" (0-100)
+// for a progress bar, then renames to the final name only after the hash checks
+// out, so a partial/corrupt download never sits where Apply would pick it up.
+func (a *App) DownloadUpdate(version string) (string, error) {
+	// Everything from here to the first body byte is displayed as one state,
+	// and it can legitimately take a minute: the release manifest lookup has a
+	// 15 s budget with a 15 s fallback behind it, and the asset request then
+	// gets 10 s to dial, 10 s for TLS and 30 s for the response headers, all
+	// of it replayed on each of the four attempts below. None of it was
+	// written down, so a reporter who watched it sit still and took a
+	// diagnostic sent a log with nothing about the update in it.
+	started := time.Now()
+	a.logger.Info("app update: download starting, looking up the release", "version", version)
+	asset, err := a.ResolveUpdateAsset(version)
+	if err != nil {
+		a.logger.Warn("app update: release lookup failed", "version", version,
+			"afterMs", time.Since(started).Milliseconds(), "err", err)
+		return "", err
+	}
+	a.logger.Info("app update: release found, opening the connection", "version", version,
+		"file", asset.Filename, "lookupMs", time.Since(started).Milliseconds())
+	dir, err := updateDir()
+	if err != nil {
+		return "", err
+	}
+	name := asset.Filename
+	if name == "" {
+		name = "STManager-" + version + assetExt()
+	}
+	finalPath := filepath.Join(dir, name)
+	partPath := finalPath + ".part"
+
+	// Retry the whole download a few times with a short backoff: a transient stall
+	// or drop on a slow link (the common cause of the in-app update "failing")
+	// should recover on its own instead of dumping the user back to the website.
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attemptAt := time.Now()
+		err := a.downloadAssetOnce(asset.URL, asset.SHA256, partPath)
+		if err == nil {
+			if rerr := os.Rename(partPath, finalPath); rerr != nil {
+				os.Remove(partPath)
+				return "", rerr
+			}
+			a.logger.Info("update downloaded and verified", "version", version, "path", finalPath, "attempts", attempt)
+			a.pruneStagedUpdates(appVersion)
+			return finalPath, nil
+		}
+		lastErr = err
+		os.Remove(partPath)
+		a.logger.Warn("app update: download attempt failed, retrying", "attempt", attempt, "max", maxAttempts,
+			"attemptMs", time.Since(attemptAt).Milliseconds(), "err", err)
+		if attempt < maxAttempts {
+			select {
+			case <-a.appCtx().Done():
+				return "", a.appCtx().Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+	}
+	return "", fmt.Errorf("download failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+// downloadAssetOnce streams the asset to partPath, emitting app:update:progress
+// (percent + live throughput) and verifying the SHA256. It uses the
+// no-total-timeout download client so a large file on a slow link is not killed by
+// a client timeout, and a stall watchdog (no bytes for 45 s) turns a frozen
+// transfer into a prompt error the caller retries.
+func (a *App) downloadAssetOnce(url, wantSHA, partPath string) error {
+	// No total-transfer deadline. A large asset on a slow link can legitimately
+	// take a long time, and a fixed cap (formerly 15 min) killed still-progressing
+	// downloads with "context deadline exceeded ... while reading body" on narrow
+	// bandwidth (the in-app update failing at ~70%). The only abort conditions are
+	// the stall watchdog below (no bytes for 45 s) via cancel, and the parent
+	// appCtx (app shutdown); the download client itself sets no total Timeout, only
+	// connect/TLS/response-header timeouts.
+	ctx, cancel := context.WithCancel(a.appCtx())
+	defer cancel()
+	req, err := newGETRequest(ctx, url)
+	if err != nil {
+		return err
+	}
+	resp, err := updateDownloadHTTPClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("download status %d", resp.StatusCode)
+	}
+
+	out, err := os.Create(partPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	h := sha256.New()
+	prog := newTransferProgress(a, "app:update:progress", resp.ContentLength, "")
+	beat := make(chan struct{}, 1)
+	go watchStall(ctx, cancel, beat, 45*time.Second)
+
+	var done int64
+	buf := make([]byte, 64*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return werr
+			}
+			h.Write(buf[:n])
+			done += int64(n)
+			select {
+			case beat <- struct{}{}:
+			default:
+			}
+			prog.report(done)
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	got := hex.EncodeToString(h.Sum(nil))
+	if !strings.EqualFold(got, wantSHA) {
+		return fmt.Errorf("checksum mismatch: got %s, expected %s", got, wantSHA)
+	}
+	return nil
+}
+
+// assetExt is the fallback download extension per OS when the manifest omits a
+// filename.
+func assetExt() string {
+	switch runtime.GOOS {
+	case "windows":
+		return ".exe"
+	case "darwin":
+		return ".dmg"
+	default:
+		return ".tar.gz"
+	}
+}
+
+// ApplyUpdate installs a file produced by DownloadUpdate. On Linux and Windows it
+// replaces the running binary and relaunches; on macOS it opens the .dmg for the
+// user to drag into Applications (replacing a running .app bundle in place is
+// not written yet, see canSelfReplace).
+func (a *App) ApplyUpdate(downloadedPath string) error {
+	if _, err := os.Stat(downloadedPath); err != nil {
+		return fmt.Errorf("downloaded file missing: %w", err)
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		// In place when this installation allows it and the release carries the
+		// .zip; otherwise the assisted flow, unchanged. The fallback is not a
+		// nicety: it is what makes the swap safe to ship, since every refusal
+		// (running from the DMG, an unwritable folder, a signature that does not
+		// verify) lands the user exactly where they were before.
+		// The non-darwin stub of applyDarwin always errors, which makes this
+		// comparison "always true" to a linter running on Linux; on macOS
+		// builds it is a real branch.
+		if err := a.applyDarwin(downloadedPath); err != nil { //nolint:staticcheck // SA4023: false positive from the cross-platform stub
+			// Two reasons live here and they used to read the same. "got a .dmg"
+			// is a CONSEQUENCE of this installation not being replaceable, and
+			// stated on its own it sends the reader hunting for a missing zip
+			// in the release that is sitting right there. So name the
+			// installation as well.
+			selfPath, selfReason, _ := SelfUpdateState()
+			a.logger.Info("macOS in-place update not possible, falling back to the assisted install",
+				"reason", err, "why", selfReason, "appPath", selfPath)
+			return a.RevealUpdateFile(downloadedPath)
+		}
+		return nil
+	case "windows":
+		return a.applyWindows(downloadedPath)
+	case "linux":
+		return a.applyLinux(downloadedPath)
+	}
+	return fmt.Errorf("self-update not supported on %q", runtime.GOOS)
+}
+
+// applyWindows swaps the running .exe with the downloaded one using the
+// rename-then-replace trick (a running .exe cannot be overwritten but can be
+// renamed), then relaunches and quits. The .old is cleaned up on the next start.
+func (a *App) applyWindows(newExe string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+	old := exe + ".old"
+	_ = os.Remove(old)
+	if err := os.Rename(exe, old); err != nil {
+		return fmt.Errorf("could not move the current app aside (is it in a write-protected folder?): %w", err)
+	}
+	if err := copyFile(newExe, exe); err != nil {
+		// Roll the rename back so the app still launches next time.
+		_ = os.Rename(old, exe)
+		return fmt.Errorf("could not write the new app: %w", err)
+	}
+	a.relaunchAndQuit(exe)
+	return nil
+}
+
+// applyLinux extracts the binary from the downloaded .tar.gz, swaps the running
+// binary with it and relaunches.
+func (a *App) applyLinux(tgz string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+	dir, _ := updateDir()
+	extracted := filepath.Join(dir, "STManager.new")
+	if err := extractLargestFile(tgz, extracted); err != nil {
+		return fmt.Errorf("could not unpack the update: %w", err)
+	}
+	defer os.Remove(extracted)
+	old := exe + ".old"
+	_ = os.Remove(old)
+	if err := os.Rename(exe, old); err != nil {
+		return fmt.Errorf("could not move the current app aside: %w", err)
+	}
+	if err := copyFile(extracted, exe); err != nil {
+		_ = os.Rename(old, exe)
+		return fmt.Errorf("could not write the new app: %w", err)
+	}
+	_ = os.Chmod(exe, 0o755)
+	a.relaunchAndQuit(exe)
+	return nil
+}
+
+// relaunchAndQuit launches the replaced binary AFTER this process has fully
+// exited, then quits. The app holds a SingleInstanceLock (see main.go), so a new
+// instance started while this one is still alive detects the old one and exits
+// immediately, then the old one quits and nothing is left running (the "it closed
+// but did not reopen" bug). The fix: spawn a small detached helper that waits for
+// THIS pid to disappear (the lock is released on exit), then starts the new
+// binary. The helper is orphaned by our quit but keeps running (Windows does not
+// cascade-kill children; on Linux it reparents to init).
+func (a *App) relaunchAndQuit(exe string) {
+	pid := os.Getpid()
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		// PowerShell ships on every supported Windows; Wait-Process blocks until
+		// our pid is gone (lock freed), then Start-Process launches detached.
+		ps := fmt.Sprintf("try { Wait-Process -Id %d -Timeout 30 } catch {}; Start-Sleep -Milliseconds 500; Start-Process -FilePath '%s'",
+			pid, strings.ReplaceAll(exe, "'", "''"))
+		cmd = exec.Command("powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps)
+	default:
+		// Poll until our pid is gone, then exec the new binary (replaces the sh).
+		sh := fmt.Sprintf("while kill -0 %d 2>/dev/null; do sleep 0.2; done; sleep 0.4; exec %s",
+			pid, shSingleQuote(exe))
+		cmd = exec.Command("sh", "-c", sh)
+	}
+	cmd.Dir = filepath.Dir(exe)
+	if err := cmd.Start(); err != nil {
+		a.logger.Warn("relaunch helper failed to start; please start the app manually", "err", err)
+		return
+	}
+	a.quitAfterRelaunchArmed(pid)
+}
+
+// quitAfterRelaunchArmed gives the just-started relaunch helper a moment to be
+// definitely running, then quits so the single-instance lock is released and the
+// helper can start the new version. Shared with the macOS bundle swap, which
+// arms its own helper (open -n on the bundle) but ends the same way.
+func (a *App) quitAfterRelaunchArmed(pid int) {
+	a.logger.Info("update applied; relaunch helper armed, quitting so it can start the new version", "pid", pid)
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		uiQuit(a.appCtx())
+	}()
+}
+
+// shSingleQuote wraps s in POSIX single quotes for safe interpolation into the
+// sh -c relaunch command, escaping any embedded single quote.
+func shSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// RevealUpdateFile opens the OS file manager / mounts the .dmg at the downloaded
+// file so the user can complete the install. Used on macOS and as the fallback
+// when a self-replace is refused (e.g. a write-protected folder on Windows).
+func (a *App) RevealUpdateFile(path string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path).Start() // mounts the .dmg, Finder shows it
+	case "windows":
+		return exec.Command("explorer", "/select,", filepath.FromSlash(path)).Start()
+	default:
+		return exec.Command("xdg-open", filepath.Dir(path)).Start()
+	}
+}
+
+// stagedVersionRe pulls the version out of a staged installer's file name,
+// e.g. "STM-Windows-v0.9.77.exe" or "STM-Linux-x64-v0.9.77.tar.gz".
+var stagedVersionRe = regexp.MustCompile(`v[0-9]+(?:\.[0-9]+)+`)
+
+// pruneStagedUpdates deletes installers the update cache no longer needs.
+// Every downloaded update used to stay there for good: one machine held eight
+// of them, 390 MB, in the user's AppData with nothing in the app hinting at it
+// (found 2026-09-08). An installer is removed when its version is not newer
+// than keepFrom, so the one the user is running and everything older go, while
+// an update already fetched but not applied yet survives a restart. A ".part"
+// is only touched when it has not grown for an hour, so a download in flight
+// is never pulled out from under itself. Best-effort throughout: a file still
+// locked is skipped and caught on the next run.
+func (a *App) pruneStagedUpdates(keepFrom string) {
+	dir, err := updateDir()
+	if err != nil {
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	var removed int
+	var freed int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		switch {
+		case strings.HasSuffix(name, ".part"):
+			if time.Since(info.ModTime()) < time.Hour {
+				continue
+			}
+		default:
+			v := stagedVersionRe.FindString(name)
+			if v == "" {
+				continue // not one of our installers, leave it alone
+			}
+			if v != keepFrom && !versionLess(v, keepFrom) {
+				continue // newer than what we run: a pending update, keep it
+			}
+		}
+		if rerr := os.Remove(filepath.Join(dir, name)); rerr != nil {
+			continue
+		}
+		removed++
+		freed += info.Size()
+	}
+	if removed > 0 {
+		a.logger.Info("update cleanup: removed staged installers",
+			"files", removed, "freedMB", freed/(1024*1024), "keptFrom", keepFrom, "dir", dir)
+	}
+}
+
+// cleanupOldBinary removes a leftover "<exe>.old" from a previous Windows/Linux
+// self-update. Called once on startup; best-effort (the file may still be locked
+// for a moment right after the swap, in which case the next start clears it).
+func (a *App) cleanupOldBinary() {
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+	old := exe + ".old"
+	if _, err := os.Stat(old); err == nil {
+		if rmErr := os.Remove(old); rmErr != nil {
+			a.logger.Info("update cleanup: previous binary still locked, will retry next start", "file", old)
+		} else {
+			a.logger.Info("update cleanup: removed previous binary", "file", old)
+		}
+	}
+}
+
+// copyFile copies src to dst (overwriting), preserving nothing but the bytes.
+// Used instead of os.Rename for the swap because the download dir and the app
+// dir can be on different volumes, where rename fails.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	// Close exactly once and surface its error: a discarded close on a writable
+	// file can hide a flush failure that leaves a truncated app binary. The copy
+	// error dominates when both fail.
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
+}
+
+// extractLargestFile writes the largest regular file inside a .tar.gz to dst. The
+// Linux desktop tarball holds a single binary (plus maybe a readme); the binary
+// dominates by size, so "largest regular file" picks it without hardcoding a name
+// that a future build rename would break.
+func extractLargestFile(tgz, dst string) error {
+	f, err := os.Open(tgz)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	// Two passes would need a re-open; instead buffer the best candidate to a temp
+	// file and swap. Simpler: scan to find the largest header size, then re-open.
+	var bestName string
+	var bestSize int64
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if h.Typeflag == tar.TypeReg && h.Size > bestSize {
+			bestSize = h.Size
+			bestName = h.Name
+		}
+	}
+	if bestName == "" {
+		return fmt.Errorf("no file found in archive")
+	}
+	// Second pass: re-open and copy the chosen entry.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	gz2, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gz2.Close()
+	tr2 := tar.NewReader(gz2)
+	for {
+		h, err := tr2.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if h.Name != bestName {
+			continue
+		}
+		out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+		if err != nil {
+			return err
+		}
+		// Close once and surface its error (a discarded close can hide a truncated
+		// extracted binary); the copy error dominates when both fail.
+		_, copyErr := io.Copy(out, io.LimitReader(tr2, bestSize))
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}
+	return fmt.Errorf("archive entry vanished between passes")
+}
+
+// dirWritable reports whether this process can actually create a file in dir.
+//
+// It writes and removes a probe file rather than reading permission bits: mode
+// bits alone lie often enough to matter here (group membership, ACLs, a
+// read-only mount, a directory owned by another admin), and the update is about
+// to depend on the answer. The probe is the same question the install will ask,
+// just asked while backing out is still free.
+func dirWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".stmanager-write-probe-")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
+}

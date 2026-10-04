@@ -1,0 +1,9548 @@
+import './bridge.js';
+import './style.css';
+import './modern.css';
+import './mobile.css';
+import './rbadd.css';
+import { pinPromptKey } from './worldmapinvite.js';
+import { mountMobileHome, VIEW_EVENT } from './mobilenav.js';
+import { openRadioAdd } from './rbadd.js';
+import { noteNotReady, noteWakeSucceeded, escalationForCount } from './wakeescalation.js';
+import {
+  DiscoverBoxes,
+  RefreshKnownBoxes,
+  AddBoxByIP,
+  GetPresets,
+  SetPreset,
+  RenamePreset,
+  DeletePreset,
+  MovePreset,
+  PlaySlot,
+  PlayURL,
+  RebootBox,
+  RestoreSTMCloud,
+  PushFavorites,
+  RecordUpdateIntent,
+  UpdateFailureReport,
+  SetOTARunning,
+  ClearUpdateIntent,
+  PendingUpdateIntent,
+  TrackPosition,
+  BoxPresets,
+  BoxSnapshot,
+  RecallBoxPreset,
+  CopyPresetsAcrossBoxes,
+  Pause,
+  Resume,
+  Stop,
+  Next,
+  Prev,
+  Status,
+  QueueNext,
+  QueuePrev,
+  QueueShuffle,
+  QueueRepeat,
+  GetQueue,
+  AppInfo,
+  BoxAgentVersion,
+  BoxStoragePreflight,
+  UpdateBoxAgent,
+  EnsureSpotifyEngine,
+  RecordOTAOutcome,
+  ClassifyOTAResult,
+  RestoreGroupAfterUpdate,
+  SetAppLocale,
+  CheckAppUpdate,
+  DownloadUpdate,
+  ApplyUpdate,
+  RevealUpdateFile,
+  ResolveStationLogo,
+  BoxSettings,
+  SetBoxVolume,
+  SelectBoxSource,
+  GetAppFlag,
+  SetAppFlag,
+  RescuedSpeakerCount,
+  StreamBitrate,
+  StreamTitle,
+  SpotifyBitrate,
+  SpotifyNowPlaying,
+  LogSpotifySaveGate,
+  SaveSpotifyPreset,
+  SaveDiagnosticBundle,
+  RadioSearch,
+  RadioSearchDetailed,
+  RadioStationsByURL,
+  RadioLookupForAdd,
+  RadioCheckStream,
+  RadioPrecheckSubmit,
+  RadioSubmitStation,
+  RadioStationByUUID,
+  ClassifyStreamURL,
+  isMissingBinding,
+  RadioTags,
+  RadioLanguages,
+  RadioVote,
+  RadioClick,
+  LogClientError,
+  BrowserOpenURL,
+  FormZone,
+  DissolveZone,
+  WakeBox,
+  EventsOn,
+  boxFetch,
+  readBoxBalance,
+} from './api.js';
+
+// Global frontend crash capture, registered as early as possible.
+// A JavaScript error during startup does not reach str.log on its own,
+// so a "flashes up and quits" leaves nothing to diagnose. Forward any
+// uncaught error or rejected promise to the Go logger. Best-effort:
+// the handlers never throw themselves.
+(function installClientErrorHooks() {
+  const seen = new Set();
+  // Show the error ON SCREEN, persistently, so a user can screenshot it.
+  // str.log is reset per launch, so an error that crashes/blanks the view is
+  // otherwise lost on restart (the cause of being un-diagnosable: the
+  // saved diagnostic only ever held the startup lines). The banner makes the
+  // real message + stack visible immediately, regardless of which view broke.
+  const showBanner = (text) => {
+    const add = () => {
+      try {
+        if (!document.body) return;
+        let el = document.getElementById('__strErrBanner');
+        if (!el) {
+          el = document.createElement('div');
+          el.id = '__strErrBanner';
+          el.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:99999;max-height:42vh;overflow:auto;background:#3a0d0d;color:#ffd7d7;font:12px/1.45 monospace;padding:10px 38px 12px 12px;border-top:2px solid #c0392b;white-space:pre-wrap';
+          const close = document.createElement('button');
+          close.textContent = '×';
+          close.style.cssText = 'position:absolute;top:4px;right:10px;background:transparent;color:#ffd7d7;border:0;font-size:20px;cursor:pointer';
+          close.onclick = () => el.remove();
+          el.appendChild(close);
+          const body = document.createElement('div');
+          body.id = '__strErrBannerBody';
+          el.appendChild(body);
+          document.body.appendChild(el);
+        }
+        const body = document.getElementById('__strErrBannerBody');
+        body.textContent = (body.textContent ? body.textContent + '\n\n' : '') + text;
+      } catch {}
+    };
+    if (typeof document !== 'undefined' && document.body) add();
+    else if (typeof window !== 'undefined') window.addEventListener('DOMContentLoaded', add);
+  };
+  // Wails' own callback registry drops in-flight call IDs when the webview
+  // context is replaced underneath it - a zoom or text-size change, a resize, a
+  // reload - while Go calls are still outstanding. What surfaces is
+  // "Callback 'main.App.CheckAppUpdate-3018697214' not registered!!!" thrown
+  // from wails/runtime.js. Nothing in the app is broken by it: the answer to a
+  // call nobody is waiting for any more is discarded, and the next poll simply
+  // asks again.
+  //
+  // It still goes to the log, because a burst of them means the webview is
+  // being recycled far more than it should be, and that IS worth seeing in a
+  // diagnostic. It must not raise the red overlay though. A user changed the
+  // text size, got a wall of red he had never seen, and reported it as a fault
+  // (and the same thing in discussion on macOS). An error banner
+  // that cries wolf about internal plumbing teaches people to ignore it, which
+  // costs us the one time it matters.
+  const isFrameworkNoise = (detail) => {
+    const d = String(detail || '');
+    return /Callback\s+'[^']*'\s+not registered/i.test(d) ||
+           (/wails\/runtime\.js/i.test(d) && /not registered/i.test(d));
+  };
+  const report = (kind, detail) => {
+    try { LogClientError(`${kind}: ${detail}`); } catch {}
+    try { console.error(kind, detail); } catch {}
+    if (isFrameworkNoise(detail)) return;
+    const key = kind + ':' + String(detail).slice(0, 200);
+    if (!seen.has(key)) { seen.add(key); showBanner(`STM ${kind}:\n${detail}`); }
+  };
+  try {
+    window.addEventListener('error', (e) => {
+      const stack = e && e.error && e.error.stack ? '\n' + e.error.stack : '';
+      report('window.onerror', `${(e && e.message) || ''} @ ${(e && e.filename) || ''}:${(e && e.lineno) || ''}${stack}`);
+    });
+    window.addEventListener('unhandledrejection', (e) => {
+      const r = e && e.reason;
+      report('unhandledrejection', (r && r.stack) ? r.stack : String(r));
+    });
+  } catch {}
+})();
+
+import {
+  state,
+  loadLastBox,
+  saveLastBox,
+  loadCachedBoxes,
+  saveCachedBoxes,
+  saveSearchCountry,
+} from './state.js';
+
+import {
+  $,
+  escapeHtml,
+  escapeAttr,
+  decodeXmlEntities,
+  formatNumber,
+  sleep,
+  formatRemaining,
+  splitUpdateTargets,
+  confirmWarn,
+  showError,
+  showToast,
+  hideToast,
+  compareVerBuild,
+  getBoxLabel,
+  savePresetCase,
+  dismissNotice,
+  noticeDismissed,
+  activeSlotFromLocation,
+  proxiedRadioPlaying,
+  orionStationPayload,
+  nativeSlotStale,
+  isLostStrKey,
+  clearNoticeDismissal,
+  balanceLabel,
+  shouldAdoptPresetArt,
+  appArtFromBoxArt,
+  artCarriesBoxForm,
+  STEREO_ICON,
+  GROUP_ICON,
+} from './utils.js';
+
+// Group membership (who follows master X) and the shared zoneLive poll live
+// in groups.js: ONE implementation for the selector frames, the group chips
+// and the Multi-Room tab. masterOf is imported under a distinct name because
+// renderBoxSelect keeps a local box-shaped wrapper of the same name.
+import {
+  masterOf as zoneMasterOf,
+  followersOf,
+  groupMembersOf,
+  resolvePlayTarget,
+  applyOptimisticZone,
+  fetchZoneLive,
+  sameBoxIdentity,
+  parsePlayRejection,
+  resolveBoxByRef,
+  stereoPairsOf,
+  inStereoPair,
+  masterBoxForKey,
+  pairMemberBoxes,
+  balanceSourceBox,
+  groupCountSplit,
+  onZoneLive,
+  notifyZoneLive,
+} from './groups.js';
+import { pairDisplayName } from './stereoNames.js';
+
+// The already-on-another-key refusal and the offer to move the station live in
+// presetmove.js, so vitest can drive the whole decision without a DOM.
+import { parsePresetConflict, presetConflictNote, offerPresetMove } from './presetmove.js';
+
+// Pure decisions of the search flow (URL-paste detection, the synthetic
+// play-this-URL card, the relaxed-filters hint) live in searchflow.js so
+// vitest covers them without a DOM.
+import {
+  isStreamURL,
+  syntheticStationForURL,
+  normalizeDetailedSearch,
+  relaxedHintVisible,
+  addStationGuideFold,
+} from './searchflow.js';
+
+import {
+  COUNTRIES,
+  ORDERS,
+  GENRE_CORE,
+  GENRE_BY_COUNTRY,
+  translateCountry,
+  canonGenre,
+  translateGenre,
+  translateTags,
+  flagFromCC,
+  localeFlagSvg,
+  optFlag,
+} from './localization.js';
+
+import {
+  t,
+  tLookup,
+  getLocale,
+  setLocale,
+  AVAILABLE_LOCALES,
+} from './i18n/index.js';
+
+// LOCALE_FLAG_CC maps i18n locale codes to ISO-3166 alpha-2 country
+// codes for flag emoji rendering. The "language flag" mapping is a UX
+// convention: English uses the Union Jack rather than US for global
+// audiences. Add new entries here when registering a new bundle.
+// A locale whose code happens to look like a country code is the trap here:
+// "ar" upper-cases to AR, which is Argentina. Locales with no country of their
+// own are listed with an empty string so the fallback below cannot invent one;
+// they are drawn by localeFlagSvg from a script mark instead.
+const LOCALE_FLAG_CC = {
+  ar: '',
+  'zh-Hant': '',
+  en: 'GB',
+  de: 'DE',
+  fr: 'FR',
+  es: 'ES',
+  ja: 'JP',
+  uk: 'UA',
+};
+
+// LOCALE_TO_RADIO_LANG maps the app UI locale to radio-browser's English
+// language name, so the radio language filter can default to the chosen app
+// language (e.g. a Dutch UI defaults the filter to Dutch stations) rather
+// than to the stick region's language or a last-used value.
+const LOCALE_TO_RADIO_LANG = {
+  en: 'english',
+  de: 'german',
+  fr: 'french',
+  es: 'spanish',
+  ja: 'japanese',
+  uk: 'ukrainian',
+  nl: 'dutch',
+  pl: 'polish',
+  lt: 'lithuanian',
+  lv: 'latvian',
+  tr: 'turkish',
+};
+
+import {
+  extractHost,
+  logoImgTag,
+  stationLogoChain,
+  monogramDataUri,
+  SPOTIFY_LOGO,
+} from './logos.js';
+
+// First view extracted out of this monolith into its own module. The view
+// pulls state/utils/i18n/api from the shared modules; only the slot-picker modal
+// is main.js-local, injected below. New views should follow this pattern so this
+// file stops growing.
+import { renderRecent, initRecentView } from './views/recent.js';
+import { shareModalHTML, shareTriggerHTML, wireShareModal, openShareModal } from './share.js';
+import { donateButtonsHTML, wireDonateButtons, donateFooterLinkHTML, playBillingOn, refreshPlayProducts } from './donate.js';
+import { PROJECT_URL, COMMUNITY_MAP_URL, SITE_HOST } from './project.js';
+import { renderMultiroom, initMultiroomView, stopMultiroomLive, resetMultiroomNotes } from './views/multiroom.js';
+import { renderSpotifyAlpha, initSpotifyView } from './views/spotify.js';
+import { renderPodcasts, initPodcastsView } from './views/podcasts.js';
+import { renderTuneIn, initTuneInView, openTuneInShare, syncTuneInPlayButtons } from './views/tunein.js';
+import { appendSavedBundlePath, failReportSaveHosts } from './failreport.js';
+// Which of a speaker's sources are line inputs a person can switch to, and what
+// each button is called (sourceinputs.js, vitest-covered).
+import { inputButtons, isActiveInput, sourceRowKey } from './sourceinputs.js';
+// Turning a refused preset transfer into a readable sentence is a pure
+// decision (copyreport.js, vitest-covered).
+import { presetCopyConflict } from './copyreport.js';
+// App-wide accessibility prefs (text size + theme). Applied to <html> before
+// the skeleton renders so the first paint already reflects the chosen size and
+// theme. The matching CSS lives in style.css (html.a11y-*).
+import { applyA11y, getScale, setScale, getTheme, setTheme } from './a11y.js';
+applyA11y();
+// Speaker Settings view (extracted from this monolith, same pattern as the views
+// above). loadBoxSettings is the entry point switchView calls. throttledSetVolume
+// is the shared volume-throttle instance the music view here reuses (the
+// settings slider and the music-view volume control share one throttle), so it
+// is imported rather than redefined.
+import {
+  loadBoxSettings,
+  initSettingsView,
+  throttledSetVolume,
+  openWebhookKeyMap,
+  noNetworkHere,
+} from './views/settings.js';
+// Library (DLNA MediaServer browse) view, extracted from this monolith, same
+// pattern as the views above. openLibrary is the entry point switchView calls;
+// showSlotPicker / formatDuration are main.js-local helpers it reuses, injected
+// below.
+import { openLibrary, initLibraryView } from './views/library.js';
+// USB stick setup / install wizard view (extracted from this monolith, same
+// pattern as the views above). renderSetupTargetPicker is the entry point
+// switchView calls; refreshDrives + loadWifiProfiles are also called from
+// switchView on Setup-tab activation. switchView / discoverBoxes / doBoxUpdate /
+// getRoomNames are main.js-local helpers it reuses, injected below.
+import {
+  renderSetupTargetPicker,
+  loadWifiProfiles,
+  refreshDrives,
+  initSetupView,
+  installRunActive,
+} from './views/setup.js';
+import { onSpeakerPurge } from './speakerPurge.js';
+// Inject the main.js-local helpers the views reuse so they behave exactly as
+// before without reimplementing them. All hoisted function declarations, safe
+// to pass here.
+initRecentView({ showSlotPicker, playStation, openPick, toggleFav, isFav });
+// openSpeakerSettings selects a speaker and shows its settings, which is where
+// its update lives. The Multi-Room tab needs it: a card that says a speaker
+// must be updated first has to be able to take the owner there.
+function openSpeakerSettings(box) {
+  if (!box) return;
+  try { selectBox(box); } catch { /* selection is best effort */ }
+  state.settingsBox = box;
+  switchView('settings');
+}
+
+initMultiroomView({ boxNeedsUpdate, discoverBoxes, selectBox, switchView, openSpeakerSettings, openWebhookKeyMap });
+initTuneInView({
+  playStation: (s) => playStation(s),
+  showSlotPicker: (o) => showSlotPicker(o),
+  currentBox: () => state.currentBox,
+  toggleFav: (s) => toggleFav(s),
+  isFav: (s) => isFav(s),
+  isPlaying: (ref) => searchRowIsPlaying({ stationuuid: ref, url: ref }),
+  pause: async () => {
+    // Show play again right away; the status poll confirms the pause.
+    state.nowPlayState = 'PAUSE_STATE';
+    syncPlayNowButtons();
+    renderNowPlayingBar();
+    await action('pause');
+  },
+});
+// A link shared from the TuneIn app arrives here: the Android share intent and
+// the iOS share extension call it, and it opens the station on the TuneIn tab.
+window.stmHandleShare = (text) => {
+  switchView('tunein');
+  return openTuneInShare(text);
+};
+initSpotifyView({
+  switchView,
+  // Live STM speaker list for the "sync Spotify login to all speakers" action.
+  stmBoxes: () => (state.boxes || [])
+    .filter(b => b && b.kind !== 'stock' && b.deviceID && b.host)
+    .map(b => ({ host: b.host, port: b.port, name: getBoxLabel(b) })),
+});
+initSettingsView({ switchView, updateFilterIndicators, discoverBoxes, renderBoxSelect, localizeLanguageName, doBoxUpdate, updateAllBoxes, boxNeedsUpdate, loadPresets, getRoomNames, speakerPicked: speakerPickedInTab, favStationsJSON, mergeFavStations });
+initLibraryView({ showSlotPicker, formatDuration, effectivePlayTarget, speakerPicked: speakerPickedInTab });
+initSetupView({ switchView, discoverBoxes, doBoxUpdate, getRoomNames, celebrateProvision: inviteWorldMapAfterProvision, speakerPicked: speakerPickedInTab });
+initPodcastsView();
+// Session maps this file keeps per speaker, cleared when STM is removed from
+// that speaker (Settings > Remove STM calls purgeSpeakerLocalState; see
+// speakerPurge.js). Registered as a hook because speakerPurge.js cannot import
+// this file. The maps are declared further down; the hook only runs on a
+// purge, long after the module has finished evaluating.
+onSpeakerPurge(({ host }) => {
+  if (host) {
+    sourceListCache.delete(host);
+    groupOpPending.delete(host);
+    pendingGroupEdits.delete(host);
+    worldMapKindSeen.delete(host);
+    worldMapEverStr.delete(host);
+    for (const key of [...supervisedIntent]) {
+      if (key === host || key.startsWith(host + ':')) supervisedIntent.delete(key);
+    }
+    if (loadedPresetsBoxKey && loadedPresetsBoxKey.startsWith(host + ':')) loadedPresetsBoxKey = null;
+    if (loadedSnapshotBoxKey && loadedSnapshotBoxKey.startsWith(host + ':')) loadedSnapshotBoxKey = null;
+  }
+});
+
+// __nextLogoFallback walks a preset logo <img>'s data-fallbacks list (a
+// pipe-separated set of candidate URLs) on each load error, swapping in the
+// next candidate. The list always ends in a locally generated monogram data
+// URI, which always loads, so a station whose favicon is missing or fails to
+// load shows a clean letter tile instead of a broken-image icon (VRT
+// stations showed broken icons because this handler was referenced in onerror
+// but never defined, so the cascade threw and the broken image stuck).
+window.__nextLogoFallback = function (img) {
+  try {
+    const fb = (img.getAttribute('data-fallbacks') || '').split('|').filter(Boolean);
+    if (fb.length) {
+      const next = fb.shift();
+      img.setAttribute('data-fallbacks', fb.join('|'));
+      img.src = next;
+      return;
+    }
+  } catch {}
+  // Chain exhausted (or attribute unreadable): stop so onerror cannot loop.
+  img.onerror = null;
+};
+
+// Delegated logo-fallback: drive the data-fallbacks cascade from a single
+// capture-phase 'error' listener instead of an inline onerror="" attribute on
+// every <img>. Inline handlers require a CSP 'unsafe-inline' script-src, which
+// we deliberately do NOT allow (see index.html CSP). 'error' does not bubble,
+// so we listen in the capture phase, where it still reaches us. Only acts while
+// data-fallbacks still has candidates, so it stops once the monogram loads.
+window.addEventListener('error', (e) => {
+  const img = e && e.target;
+  if (img && img.tagName === 'IMG' && img.getAttribute && img.getAttribute('data-fallbacks')) {
+    window.__nextLogoFallback(img);
+  }
+}, true);
+
+// ---------- Station logo hydration ----------
+// logoImgTag renders a tile with the local monogram as the immediate
+// src. Here we upgrade each such tile to a real logo asynchronously:
+// the Go backend (ResolveStationLogo) validates the station's own HTTPS
+// favicon and then DuckDuckGo by HTTP status, returning a real URL or ""
+// (keep the monogram). Resolution runs in Go because DuckDuckGo serves
+// its "no icon" 404 as a grey chevron that the webview would otherwise
+// display. A MutationObserver catches every tile any view renders, so no
+// render site needs to call this explicitly. Results are cached in Go.
+function hydrateLogo(img) {
+  if (!img || img.dataset.logoResolved) return;
+  img.dataset.logoResolved = '1';
+  const hosts = (img.dataset.logoHosts || '').split('|').filter(Boolean);
+  const fav = img.dataset.logoFav || '';
+  const brand = img.dataset.logoBrand || '';
+  if (!fav && !brand && hosts.length === 0) return; // nothing to resolve, monogram stays
+  ResolveStationLogo(fav, brand, hosts).then((url) => {
+    if (typeof url === 'string' && url) {
+      const mono = img.dataset.logoMono || img.src;
+      img.onerror = () => { img.onerror = null; img.src = mono; };
+      img.src = url;
+    }
+  }).catch(() => {});
+}
+
+(function setupLogoHydration() {
+  const scan = (root) => {
+    if (root.nodeType !== 1) return;
+    if (root.matches && root.matches('img[data-logo-hosts]')) hydrateLogo(root);
+    if (root.querySelectorAll) root.querySelectorAll('img[data-logo-hosts]').forEach(hydrateLogo);
+  };
+  const obs = new MutationObserver((muts) => {
+    for (const m of muts) for (const n of m.addedNodes) scan(n);
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  // Catch any tiles already present before the observer attached.
+  scan(document.body);
+})();
+
+// ---------- DOM Skeleton ----------
+
+// Stroke icons for the nav tabs. Static markup only, never user data.
+const TAB_ICON_PATHS = {
+  box: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  library: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
+  recent: '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>',
+  settings: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
+  setup: '<rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="14" r="4"/><line x1="12" y1="6" x2="12.01" y2="6"/>',
+  multiroom: '<rect x="2" y="7" width="8" height="14" rx="1.5"/><rect x="14" y="3" width="8" height="18" rx="1.5"/><circle cx="6" cy="15" r="2"/><circle cx="18" cy="14" r="2.5"/>',
+  spotify: '<circle cx="12" cy="12" r="10"/><path d="M7 9.5c3.5-1 7.5-.6 10.5 1"/><path d="M7.5 12.8c3-.8 6-.4 8.5 1"/><path d="M8 16c2.3-.6 4.6-.3 6.5.8"/>',
+  podcasts: '<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/>',
+  tunein: '<circle cx="12" cy="13" r="2"/><path d="M8.5 9.5a5 5 0 0 0 0 7"/><path d="M15.5 9.5a5 5 0 0 1 0 7"/><path d="M5.6 6.6a9 9 0 0 0 0 12.8"/><path d="M18.4 6.6a9 9 0 0 1 0 12.8"/>',
+};
+function tabIcon(view) {
+  return `<svg class="tab-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16" aria-hidden="true">${TAB_ICON_PATHS[view] || ''}</svg>`;
+}
+
+document.querySelector('#app').innerHTML = `
+  <header class="app-header">
+    <div class="app-header-row">
+      <img class="app-logo app-logo-mark" src="/logo-mark.png" alt="" aria-hidden="true" width="34" height="34"/>
+      <div class="app-brand">SoundTouch <span class="app-brand-accent">Manager</span></div>
+      <div class="app-a11y a11y-dd">
+        <button type="button" class="a11y-dd-trigger" id="a11yTrigger" aria-haspopup="dialog" aria-expanded="false" aria-label="${escapeAttr(t('a11y.title'))}" title="${escapeAttr(t('a11y.title'))}"><span class="a11y-dd-icon" aria-hidden="true">Aa</span></button>
+        <div class="a11y-dd-menu" id="a11yMenu" role="dialog" aria-label="${escapeAttr(t('a11y.title'))}" hidden>
+          <div class="a11y-group">
+            <div class="a11y-group-label" id="a11ySizeLabel">${escapeHtml(t('a11y.textSize'))}</div>
+            <div class="a11y-seg" role="group" aria-labelledby="a11ySizeLabel">
+              <button type="button" data-scale="1" aria-pressed="${getScale() === 1}">${escapeHtml(t('a11y.size.normal'))}</button>
+              <button type="button" data-scale="2" aria-pressed="${getScale() === 2}">${escapeHtml(t('a11y.size.large'))}</button>
+              <button type="button" data-scale="3" aria-pressed="${getScale() === 3}">${escapeHtml(t('a11y.size.xlarge'))}</button>
+            </div>
+          </div>
+          <div class="a11y-group">
+            <div class="a11y-group-label" id="a11yThemeLabel">${escapeHtml(t('a11y.theme'))}</div>
+            <div class="a11y-seg" role="group" aria-labelledby="a11yThemeLabel">
+              <button type="button" data-theme="dark" aria-pressed="${getTheme() === 'dark'}">${escapeHtml(t('a11y.theme.dark'))}</button>
+              <button type="button" data-theme="light" aria-pressed="${getTheme() === 'light'}">${escapeHtml(t('a11y.theme.light'))}</button>
+              <button type="button" data-theme="contrast" aria-pressed="${getTheme() === 'contrast'}">${escapeHtml(t('a11y.theme.contrast'))}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="app-locale locale-dd" role="group" aria-label="${escapeAttr(t('settings.language'))}">
+        ${(() => {
+          const cur = AVAILABLE_LOCALES.find(l => l.code === getLocale()) || AVAILABLE_LOCALES[0];
+          const curCc = LOCALE_FLAG_CC[cur.code] ?? cur.code.toUpperCase();
+          const trigger = `<button type="button" class="locale-dd-trigger" id="localeTrigger" aria-haspopup="listbox" aria-expanded="false" title="${escapeAttr(cur.label)}"><span class="locale-flag-emoji" aria-hidden="true">${localeFlagSvg(cur.code, curCc) || flagFromCC(curCc)}</span><span class="locale-flag-code">${escapeHtml(cur.code.toUpperCase())}</span><span class="locale-dd-caret" aria-hidden="true">&#9662;</span></button>`;
+          const items = AVAILABLE_LOCALES.map(l => {
+            const cc = LOCALE_FLAG_CC[l.code] ?? l.code.toUpperCase();
+            const sel = l.code === getLocale();
+            return `<li role="option" class="locale-dd-item${sel ? ' active' : ''}" data-locale="${escapeAttr(l.code)}" aria-selected="${sel ? 'true' : 'false'}"><span class="locale-flag-emoji" aria-hidden="true">${localeFlagSvg(l.code, cc) || flagFromCC(cc)}</span><span class="locale-dd-name">${escapeHtml(l.label)}</span></li>`;
+          }).join('');
+          return trigger + `<ul class="locale-dd-menu" id="localeMenu" role="listbox" hidden>${items}</ul>`;
+        })()}
+      </div>
+    </div>
+    <div class="app-tagline" id="appTagline"></div>
+    <div class="app-supported" id="appSupported"></div>
+  </header>
+  <div class="tabs">
+    <button class="tab-btn active" data-view="box">${tabIcon('box')}${escapeHtml(t('nav.music'))}</button>
+    <button class="tab-btn" data-view="library">${tabIcon('library')}${escapeHtml(t('nav.library'))}</button>
+    <button class="tab-btn" data-view="recent">${tabIcon('recent')}${escapeHtml(t('nav.recent'))}</button>
+    <button class="tab-btn" data-view="settings">${tabIcon('settings')}${escapeHtml(t('nav.speakerSettings'))}</button>
+    <button class="tab-btn" data-view="setup">${tabIcon('setup')}${escapeHtml(t('nav.setupStick'))}</button>
+    <button class="tab-btn" data-view="multiroom">${tabIcon('multiroom')}${escapeHtml(t('nav.multiroom'))}<span class="tab-badge" id="multiroomTabBadge" hidden></span></button>
+    <button class="tab-btn" data-view="spotify">${tabIcon('spotify')}${escapeHtml(t('nav.spotify'))}</button>
+    <button class="tab-btn" data-view="tunein">${tabIcon('tunein')}${escapeHtml(t('nav.tunein'))}</button>
+    <button class="tab-btn" data-view="podcasts">${tabIcon('podcasts')}${escapeHtml(t('nav.podcasts'))}<span class="beta-pill planned-pill">${escapeHtml(t('common.planned'))}</span></button>
+  </div>
+  <div id="globalSecurityBanner" class="global-security-banner hidden">
+    <span class="global-security-text">
+      <b>${escapeHtml(t('banner.recommendation'))}</b> ${escapeHtml(t('banner.sshRecommend'))}
+    </span>
+    <button class="btn btn-mini" id="globalSecurityRebootBtn">${escapeHtml(t('speaker.reboot'))}</button>
+    <button class="btn btn-secondary btn-mini" id="globalSecurityDismissBtn">${escapeHtml(t('speaker.issueDismiss'))}</button>
+  </div>
+  <div id="view-box" class="view"></div>
+  <div id="view-library" class="view hidden"></div>
+  <div id="view-recent" class="view hidden"></div>
+  <div id="view-settings" class="view hidden"></div>
+  <div id="view-setup" class="view hidden"></div>
+  <div id="view-multiroom" class="view hidden"></div>
+  <div id="view-spotify" class="view hidden"></div>
+  <div id="view-tunein" class="view hidden"></div>
+  <div id="view-podcasts" class="view hidden"></div>
+
+  <div class="modal hidden" id="pickModal">
+    <div class="modal-content">
+      <h3 id="pickTitle">${escapeHtml(t('preset.assignTitle'))}</h3>
+      <p class="modal-sub" id="pickSub"></p>
+      <div class="pick-grid" id="pickGrid"></div>
+      <button class="btn btn-secondary" id="pickCancel">${escapeHtml(t('common.cancel'))}</button>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="warnModal">
+    <div class="modal-content">
+      <h3 class="warn-title"><span class="warn-icon">&#9888;</span> ${escapeHtml(t('modal.warnTitle'))}</h3>
+      <div id="warnBody"></div>
+      <div class="warn-buttons">
+        <button class="btn btn-secondary" id="warnCancel">${escapeHtml(t('common.cancel'))}</button>
+        <button class="btn btn-danger" id="warnConfirm">${escapeHtml(t('modal.proceed'))}</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="errorModal">
+    <div class="modal-content">
+      <h3 class="warn-title"><span class="warn-icon">&#9888;</span> ${escapeHtml(t('modal.errorTitle'))}</h3>
+      <textarea id="errorText" class="error-text" readonly></textarea>
+      <div class="warn-buttons">
+        <button class="btn btn-secondary" id="errorCopy">${escapeHtml(t('modal.copy'))}</button>
+        <button class="btn" id="errorClose">${escapeHtml(t('common.close'))}</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="creditsModal">
+    <div class="modal-content">
+      <h3 id="creditsTitle">${escapeHtml(t('credits.title'))}</h3>
+      <p class="modal-sub" id="creditsIntro">${escapeHtml(t('credits.intro'))}</p>
+      <div id="creditsBody" class="credits-list"></div>
+      <button class="btn" id="creditsClose">${escapeHtml(t('common.close'))}</button>
+    </div>
+  </div>
+
+  <div class="modal hidden" id="donateModal">
+    <div class="modal-content donate-modal">
+      <h3 id="donateModalTitle">${escapeHtml(t('credits.donate'))}</h3>
+      <p class="modal-sub" id="donateModalSlogan"></p>
+      <p class="modal-sub hidden" id="donatePlayStatus"></p>
+      <div class="donate-modal-btns" id="donateModalBtns"></div>
+      <button class="btn" id="donateClose">${escapeHtml(t('common.close'))}</button>
+    </div>
+  </div>
+
+  ${shareModalHTML()}
+
+  <div class="modal hidden" id="updateAllOverlay">
+    <div class="modal-content ua-modal">
+      <h3>${escapeHtml(t('updateAll.title'))}</h3>
+      <p class="modal-sub" id="uaSummary"></p>
+      <div id="uaList" class="ua-list"></div>
+      <div class="warn-buttons">
+        <!-- Never disabled. Closing only HIDES this window, it does not cancel
+             the run, so disabling it protects nothing and can strand the user:
+             the button was greyed while any row had no final outcome, and a
+             speaker that drops off the Wi-Fi mid-update never gets one, so the
+             window could not be dismissed at all. Reported 2026-08-23 by an
+             owner whose speakers were dropping off a congested network. -->
+        <button class="btn" id="uaClose">${escapeHtml(t('common.close'))}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shown only while a run is still going and the panel above is hidden.
+       Closing that panel does not stop anything, but with nothing left on
+       screen "hidden" and "finished" look identical, and the next thing an
+       owner does is close the app. -->
+  <button class="ua-mini hidden" id="uaMini" type="button"></button>
+
+  <div id="toast" class="toast"></div>
+
+  <footer class="app-footer" id="appFooter"></footer>
+`;
+
+
+// Tabs
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.onclick = () => switchView(btn.dataset.view);
+});
+// Adding a station to radio-browser.info needs no speaker, so this is reachable
+// from places that stay visible before one is connected.
+function openAddStation() {
+  openRadioAdd(($('searchQ') || {}).value || '', {
+    api: { RadioLookupForAdd, RadioCheckStream, RadioPrecheckSubmit, RadioSubmitStation, RadioStationByUUID },
+    t,
+    escapeHtml,
+    locale: getLocale(),
+    openURL: (u) => { try { BrowserOpenURL(u); } catch {} },
+    countries: COUNTRIES,
+    country: state.searchCountry || '',
+    optFlag,
+  });
+}
+if (document.documentElement.classList.contains('stm-mobile')) {
+  mountMobileHome({
+    t, escapeHtml, icon: tabIcon,
+    openView: (v) => switchView(v),
+    onDonate: () => showDonate(),
+    onAddStation: () => openAddStation(),
+  });
+}
+
+// Language picker in the header. Switching locale reloads the page so
+// the full UI re-renders against the new bundle. Reload is heavy but
+// keeps the rendering path simple: no piecemeal rerender of 3000
+// lines of view code.
+(function wireLocalePicker() {
+  const trigger = document.getElementById('localeTrigger');
+  const menu = document.getElementById('localeMenu');
+  if (!trigger || !menu) return;
+  const close = () => { menu.hidden = true; trigger.setAttribute('aria-expanded', 'false'); };
+  const open = () => { menu.hidden = false; trigger.setAttribute('aria-expanded', 'true'); };
+  trigger.onclick = (e) => { e.stopPropagation(); if (menu.hidden) open(); else close(); };
+  menu.querySelectorAll('.locale-dd-item').forEach(item => {
+    item.onclick = () => {
+      const code = item.dataset.locale;
+      if (code && code !== getLocale() && setLocale(code)) {
+        location.reload();
+      } else {
+        close();
+      }
+    };
+  });
+  // Close on outside click or Escape.
+  document.addEventListener('click', (e) => { if (!e.target.closest('.locale-dd')) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+})();
+
+// Accessibility menu (text size + theme) in the header. Mirrors the locale
+// dropdown's open/close behaviour. Unlike the locale switch these apply
+// instantly by toggling classes on <html>, so no page reload is needed.
+(function wireA11yPicker() {
+  const trigger = document.getElementById('a11yTrigger');
+  const menu = document.getElementById('a11yMenu');
+  if (!trigger || !menu) return;
+  const close = () => { menu.hidden = true; trigger.setAttribute('aria-expanded', 'false'); };
+  const open = () => { menu.hidden = false; trigger.setAttribute('aria-expanded', 'true'); };
+  trigger.onclick = (e) => { e.stopPropagation(); if (menu.hidden) open(); else close(); };
+  const syncPressed = (attr, val) => {
+    menu.querySelectorAll(`button[${attr}]`).forEach(b => {
+      b.setAttribute('aria-pressed', String(b.getAttribute(attr) === String(val)));
+    });
+  };
+  menu.querySelectorAll('button[data-scale]').forEach(b => {
+    b.onclick = () => { const n = Number(b.dataset.scale); setScale(n); syncPressed('data-scale', n); };
+  });
+  menu.querySelectorAll('button[data-theme]').forEach(b => {
+    b.onclick = () => { setTheme(b.dataset.theme); syncPressed('data-theme', b.dataset.theme); };
+  });
+  document.addEventListener('click', (e) => { if (!e.target.closest('.a11y-dd')) close(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+})();
+
+// Tell the Go backend which UI language is active, so server-side
+// provisioning (the Setup-AP push) sets the speaker's display language
+// to the user's language instead of a hardcoded default. This runs on
+// every load — including after a locale switch, since the picker above
+// reloads the page — so the backend always has the current locale.
+// Best-effort: a binding error must never block UI startup.
+SetAppLocale(getLocale()).catch(() => {});
+
+// Tagline and supported-models line follow the active locale, falling
+// back to English. Native-speaker translations live inline here for
+// the languages we have native-speaker copy for. New languages added
+// to i18n/bundles fall back to English until a maintainer adds
+// localized prose here.
+// Since the network install landed, every SoundTouch model runs STM - also the
+// ones that never read a USB stick at boot (300, Wave, SA-4/SA-5, CineMate).
+// Naming four models here was both wrong and discouraging for owners of the
+// others, so the line now says what is true: all of them.
+const SUPPORTED_LINE = {
+  de: 'für alle SoundTouch Modelle',
+  fr: 'pour tous les modèles SoundTouch',
+  it: 'per tutti i modelli SoundTouch',
+  es: 'para todos los modelos SoundTouch',
+  nl: 'voor alle SoundTouch modellen',
+  pt: 'para todos os modelos SoundTouch',
+  ja: 'すべての SoundTouch モデルに対応',
+  uk: 'для всіх моделей SoundTouch',
+  pl: 'dla wszystkich modeli SoundTouch',
+  lt: 'visiems SoundTouch modeliams',
+  lv: 'visiem SoundTouch modeļiem',
+  tr: 'tüm SoundTouch modelleri için',
+  ar: 'لجميع طُرز SoundTouch',
+  en: 'for every SoundTouch model',
+};
+
+const TAGLINES = {
+  de: 'Bose SoundTouch Lautsprecher ohne Bose Cloud weiter nutzen.',
+  fr: 'Continue d\'utiliser tes enceintes Bose SoundTouch sans le cloud Bose.',
+  it: 'Continua a usare gli altoparlanti Bose SoundTouch senza il cloud di Bose.',
+  es: 'Sigue usando tus altavoces Bose SoundTouch sin la nube de Bose.',
+  nl: 'Blijf je Bose SoundTouch speakers gebruiken, zonder de Bose cloud.',
+  pt: 'Continua a usar os teus altifalantes Bose SoundTouch sem a cloud Bose.',
+  ja: 'Bose SoundTouch スピーカーを Bose クラウドなしで使い続けられます。',
+  uk: 'Користуйтеся колонками Bose SoundTouch і далі, без хмари Bose.',
+  pl: 'Korzystaj dalej z głośników Bose SoundTouch, bez chmury Bose.',
+  lt: 'Toliau naudokitės savo Bose SoundTouch garsiakalbiais be Bose debesies.',
+  lv: 'Turpiniet lietot savus Bose SoundTouch skaļruņus bez Bose mākoņa.',
+  tr: 'Bose SoundTouch hoparlörlerinizi Bose bulutu olmadan kullanmaya devam edin.',
+  ar: 'واصِل استخدام مكبرات صوت Bose SoundTouch دون سحابة Bose.',
+  en: 'Keep using your Bose SoundTouch speakers, without the Bose cloud.',
+};
+
+(function applyTagline() {
+  const lang = getLocale();
+  const tEl = $('appTagline');
+  if (tEl) tEl.textContent = TAGLINES[lang] || TAGLINES.en;
+  const sEl = $('appSupported');
+  if (sEl) sEl.textContent = SUPPORTED_LINE[lang] || SUPPORTED_LINE.en;
+})();
+
+// --- New-feature discovery dots ------------------------
+// A small blue dot on a nav tab points the user to a new STM-exclusive feature
+// they have not opened yet; it clears the moment they open that tab. Per viewer
+// (localStorage), so once found it stays gone. Add an entry when you ship a new
+// exclusive feature and drop it a few releases later once it is no longer "new".
+const NEW_FEATURES = [
+  { id: '2026-08-permanent-group', view: 'multiroom' },
+  { id: '2026-08-copy-presets', view: 'settings' },
+  { id: '2026-08-recently-played', view: 'recent' },
+];
+const SEEN_FEATURES_KEY = 'str.seenFeatures';
+function seenFeatureSet() {
+  try { return new Set(JSON.parse(localStorage.getItem(SEEN_FEATURES_KEY) || '[]')); }
+  catch { return new Set(); }
+}
+function markViewFeaturesSeen(view) {
+  const seen = seenFeatureSet();
+  let changed = false;
+  for (const f of NEW_FEATURES) {
+    if (f.view === view && !seen.has(f.id)) { seen.add(f.id); changed = true; }
+  }
+  if (changed) { try { localStorage.setItem(SEEN_FEATURES_KEY, JSON.stringify([...seen])); } catch {} }
+}
+// renderNavDots paints/removes the blue dot on each nav tab from the seen set.
+// Idempotent, so it is safe to call on every box refresh and every view switch.
+function renderNavDots() {
+  const seen = seenFeatureSet();
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    const want = NEW_FEATURES.some(f => f.view === btn.dataset.view && !seen.has(f.id));
+    const dot = btn.querySelector('.nav-newdot');
+    if (want && !dot) {
+      const s = document.createElement('span');
+      s.className = 'nav-newdot';
+      s.setAttribute('aria-label', t('nav.newFeatureDot'));
+      s.title = t('nav.newFeatureDot');
+      btn.appendChild(s);
+    } else if (!want && dot) {
+      dot.remove();
+    }
+  });
+}
+
+function switchView(view) {
+  state.view = view;
+  document.dispatchEvent(new CustomEvent(VIEW_EVENT, { detail: view }));
+  document.querySelectorAll('.tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.view === view);
+  });
+  // Opening a tab counts as finding its new exclusive features: clear their dots.
+  markViewFeaturesSeen(view);
+  renderNavDots();
+  $('view-box').classList.toggle('hidden', view !== 'box');
+  $('view-library').classList.toggle('hidden', view !== 'library');
+  $('view-recent').classList.toggle('hidden', view !== 'recent');
+  $('view-settings').classList.toggle('hidden', view !== 'settings');
+  $('view-setup').classList.toggle('hidden', view !== 'setup');
+  $('view-multiroom').classList.toggle('hidden', view !== 'multiroom');
+  // The Multiroom view runs an active-only live poll (multiroom.js); stop it the
+  // moment we leave so it never keeps polling boxes from behind another tab.
+  // Its result notes go with it: an error note is meant to stay until the next
+  // action, not to greet the user on every return to the tab (the
+  // "stereo pair cannot be grouped" note that survived every screen change).
+  if (view !== 'multiroom') { stopMultiroomLive(); resetMultiroomNotes(); }
+  $('view-spotify').classList.toggle('hidden', view !== 'spotify');
+  $('view-tunein').classList.toggle('hidden', view !== 'tunein');
+  $('view-podcasts').classList.toggle('hidden', view !== 'podcasts');
+  // Global SSH banner: the Setup tab has no speaker context, so hide
+  // the banner there unconditionally. Otherwise let checkSshBanner
+  // decide.
+  if (view === 'setup') {
+    const gb = $('globalSecurityBanner');
+    if (gb) gb.classList.add('hidden');
+  } else {
+    checkSshBanner();
+  }
+  if (view === 'setup') {
+    // A finished install's status lines stayed in the panel for good: leave
+    // the tab, come back, and the old "installing..." lines were still there
+    // (shorty310). The panel is cleared on every entry unless
+    // an install is actually running, whose live status must stay visible.
+    if (!installRunActive()) { const r = $('setupResult'); if (r) r.innerHTML = ''; }
+    refreshDrives();
+    // Re-render the target picker on every entry into the Setup
+    // tab. The list may have changed (newly powered speaker,
+    // freshly installed STM) and the user just opened the tab to
+    // start a prep flow — make sure they see the right targets.
+    renderSetupTargetPicker();
+    // Lazy-load saved WiFi profiles. v0.5.16
+    // gated the macOS keychain auto-prompt that fired on app start;
+    // v0.5.17 defers the lookup entirely to Setup-tab activation so
+    // Windows (netsh wlan show profiles) and Linux (nmcli) also do
+    // not run the OS call for users who only use Music or Settings.
+    // Idempotent: re-runs on every Setup-tab open so a refreshed
+    // OS profile list is picked up too.
+    if (typeof loadWifiProfiles === 'function') loadWifiProfiles();
+  }
+  if (view === 'box') {
+    // Refresh the mDNS list on every switch to the music view so a
+    // recently renamed speaker or a speaker that went offline does
+    // not linger. discoverBoxes is async and non-blocking.
+    discoverBoxes();
+    refreshStatus();
+    loadMusicTabVolume();
+    // Re-evaluate the Favorites entry every time the music view is shown so a
+    // stored favorites list always brings the button back (#Dieter: the button
+    // was set once at init, before the WebView had restored localStorage, then
+    // never re-checked, so it stayed hidden after a restart even though the
+    // favorites were still saved).
+    updateFavModeBtn();
+  }
+  if (view === 'settings') loadBoxSettings();
+  if (view === 'library') openLibrary();
+  if (view === 'recent') renderRecent();
+  if (view === 'multiroom') renderMultiroom(true);
+  if (view === 'spotify') renderSpotifyAlpha();
+  if (view === 'tunein') renderTuneIn();
+  if (view === 'podcasts') renderPodcasts();
+}
+
+
+// ---------- Footer ----------
+
+// withAppReferrer appends UTM parameters to URLs pointing at the
+// project's own website so the site's visitor analytics can attribute
+// traffic that originated in the desktop app. Vendor URLs (GitHub,
+// PayPal, Ko-fi, GitHub Sponsors) are returned unchanged because
+// their analytics do not respect UTM tags and a few of them refuse
+// query strings on canonical paths.
+function withAppReferrer(url, campaign) {
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    if (!SITE_HOST || (host !== SITE_HOST && !host.endsWith('.' + SITE_HOST))) return url;
+    if (!u.searchParams.has('utm_source'))   u.searchParams.set('utm_source',   'soundtouch-manager-app');
+    if (!u.searchParams.has('utm_medium'))   u.searchParams.set('utm_medium',   'desktop');
+    if (!u.searchParams.has('utm_campaign')) u.searchParams.set('utm_campaign', campaign || 'app');
+    const ver = (state.appInfo && state.appInfo.version) || '';
+    if (ver && !u.searchParams.has('utm_content')) u.searchParams.set('utm_content', ver);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+// OSS STM bundles, links, or builds on. Listed in full regardless of license
+// (it does not hurt to be generous), with the bundled GPL-3.0 go-librespot
+// first since that one is a licensing obligation, not just a courtesy.
+const OSS_CREDITS = [
+  { name: 'go-librespot', by: 'devgianlu', license: 'GPL-3.0', url: 'https://github.com/devgianlu/go-librespot', role: 'Spotify Connect client (bundled as a separate binary)' },
+  { name: 'Wails', license: 'MIT', url: 'https://wails.io', role: 'desktop app framework' },
+  { name: 'gorilla/websocket', license: 'BSD-2-Clause', url: 'https://github.com/gorilla/websocket', role: 'Bose gabbo WebSocket client' },
+  { name: 'grandcat/zeroconf', license: 'MIT', url: 'https://github.com/grandcat/zeroconf', role: 'mDNS discovery' },
+  { name: 'golang.org/x/sys', license: 'BSD-3-Clause', url: 'https://pkg.go.dev/golang.org/x/sys', role: 'low-level system calls' },
+  { name: 'Go', license: 'BSD-3-Clause', url: 'https://go.dev', role: 'language and toolchain' },
+  { name: 'Vite', license: 'MIT', url: 'https://vitejs.dev', role: 'frontend build tool' },
+  { name: 'Octicons', by: 'GitHub', license: 'MIT', url: 'https://github.com/primer/octicons', role: 'interface icons' },
+  { name: 'Exo 2', by: 'The Exo 2 Project Authors', license: 'OFL-1.1', url: 'https://github.com/googlefonts/Exo-2.0', role: 'app name typeface' },
+  { name: 'Mozilla CA certificate store', by: 'curl project', license: 'MPL-2.0', url: 'https://curl.se/docs/caextract.html', role: 'public certificate authorities, so speakers built with an incomplete list can still reach stations' },
+  { name: 'radio-browser.info', license: 'community service', url: 'https://www.radio-browser.info', role: 'radio station directory' },
+  { name: 'DuckDuckGo icons', license: 'service', url: 'https://duckduckgo.com', role: 'station logos' },
+];
+
+// Projects that contributed KNOWLEDGE rather than code. STM ships none of their
+// source, but several of its central mechanisms would not exist without their
+// published findings, so they are credited in their own section. `donate` is
+// filled in only where the project actually accepts support; most of them do
+// not, which is worth seeing.
+const RESEARCH_CREDITS = [
+  {
+    name: 'streborn', by: 'Jens Roggenfelder (JRpersonal)',
+    url: 'https://github.com/JRpersonal/streborn',
+    donate: 'https://paypal.me/JR31337',
+    role: 'The original project this app is based on.',
+  },
+  {
+    name: 'Bose-SoundTouch', by: 'gesellix',
+    url: 'https://github.com/gesellix/Bose-SoundTouch',
+    donate: 'https://github.com/sponsors/gesellix',
+    role: 'Documented the account and service schema that lets a speaker register its sources again, which is what makes the preset buttons work without the Bose cloud.',
+  },
+  {
+    name: 'SixBack', by: 'Dirk Tostmann',
+    url: 'https://github.com/tostmann/SixBack',
+    donate: 'https://paypal.me/busware',
+    role: 'Showed how a speaker distinguishes a source it does not know from one it cannot log into, which is why STM can now tell those two failures apart.',
+  },
+  {
+    name: 'soundcork', by: 'deborahgu',
+    url: 'https://github.com/deborahgu/soundcork',
+    role: 'Wrote down the Bose cloud API from real speaker traffic, the reference STM checks its own emulation against.',
+  },
+  {
+    name: 'BoseSoundtouch', by: 'TimoGo',
+    url: 'https://github.com/TimoGo/BoseSoundtouch',
+    role: 'Documented the speaker command sequence for joining a Wi-Fi network, including the detail the official service manual leaves out.',
+  },
+  {
+    name: 'Soundtouch-without-the-app', by: 'bosefirmware',
+    url: 'https://github.com/bosefirmware/Soundtouch-without-the-app',
+    role: 'Collected the firmware images and cloud-free operating notes STM uses to tell speaker generations apart.',
+  },
+  {
+    name: 'bosesoundtouchapi', by: 'thlucas1',
+    url: 'https://github.com/thlucas1/bosesoundtouchapi',
+    role: 'The most complete public description of the speaker’s own control API.',
+  },
+  {
+    name: 'libsoundtouch', by: 'CharlesBlonde',
+    url: 'https://github.com/CharlesBlonde/libsoundtouch',
+    role: 'The original community library for these speakers, and the first description of their live event stream.',
+  },
+  {
+    name: 'opencloudtouch',
+    url: 'https://github.com/opencloudtouch/opencloudtouch',
+    donate: 'https://www.buymeacoffee.com/b49rjg5k6vj',
+    role: 'A parallel effort to keep these speakers alive after the shutdown, and a useful cross-check on findings.',
+  },
+];
+
+// showCredits opens the open-source credits dialog from the footer link.
+function showCredits() {
+  const modal = $('creditsModal');
+  const body = $('creditsBody');
+  if (!modal || !body) return;
+  $('creditsTitle').textContent = t('credits.title');
+  $('creditsIntro').textContent = t('credits.intro');
+  const row = (c, extra) => `<div class="credit-row">`
+    + `<div><a href="#" class="footer-link credit-name" data-url="${escapeAttr(c.url)}">${escapeHtml(c.name)}</a>`
+    + (c.by ? ` <span class="credit-by">${escapeHtml(t('credits.by'))} ${escapeHtml(c.by)}</span>` : '')
+    + extra + `</div>`
+    + `<div class="credit-role">${escapeHtml(c.role)}</div></div>`;
+  body.innerHTML = OSS_CREDITS.map(c =>
+    row(c, ` <span class="credit-license">${escapeHtml(c.license)}</span>`)
+  ).join('')
+    + `<h3 class="credit-section">${escapeHtml(t('credits.researchTitle'))}</h3>`
+    + `<p class="credit-section-intro">${escapeHtml(t('credits.researchIntro'))}</p>`
+    + RESEARCH_CREDITS.map(c => row(c, c.donate
+      ? ` <a href="#" class="footer-link credit-name credit-donate" data-url="${escapeAttr(c.donate)}">${escapeHtml(t('credits.donate'))}</a>`
+      : '')).join('');
+  body.querySelectorAll('.credit-name[data-url]').forEach(a => {
+    a.onclick = (e) => { e.preventDefault(); BrowserOpenURL(a.dataset.url); };
+  });
+  const close = () => modal.classList.add('hidden');
+  $('creditsClose').onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  modal.classList.remove('hidden');
+}
+
+async function renderFooter() {
+  try {
+    state.appInfo = await AppInfo();
+  } catch {
+    state.appInfo = { version: t('common.unknown'), build: '', author: '', githubUrl: '', donateUrl: '', websiteUrl: '', donateSlogan: '' };
+  }
+  const i = state.appInfo;
+  const links = [];
+  if (i.githubUrl)  links.push(`<a href="#" data-url="${escapeAttr(i.githubUrl)}" class="footer-link">GitHub</a>`);
+  if (i.websiteUrl && i.websiteUrl !== i.githubUrl) links.push(`<a href="#" data-url="${escapeAttr(i.websiteUrl)}" class="footer-link">${escapeHtml(t('footer.website'))}</a>`);
+  // Early in the row on purpose: the row wraps on a narrow window, and this is
+  // the one entry whose whole point is to still be reachable there. The donate
+  // rail is hidden below 62em, which with a larger text size is a fairly wide
+  // window, so without this link somebody who WANTS to donate has nowhere to
+  // click (reported 2026-09-09 by a user who had just written that he wanted to
+  // buy a coffee).
+  links.push(donateFooterLinkHTML());
+  // Persistent way to reach the community pin map. The one-time celebration invite
+  // auto-dismisses, so users who miss it had no way back and kept asking "where do
+  // I add my pin?" (Helmut). This footer link is always available.
+  if (COMMUNITY_MAP_URL) links.push(`<a href="#" id="footerWorldMap" class="footer-link" title="${escapeAttr(t('worldMap.inviteBtn'))}">🌍 ${escapeHtml(t('footer.worldMap'))}</a>`);
+  links.push(`<a href="#" id="footerSaveLogs" class="footer-link" title="${escapeAttr(t('footer.saveLogsHint'))}">${escapeHtml(t('footer.saveLogs'))}</a>`);
+  links.push(`<a href="#" id="footerCredits" class="footer-link">${escapeHtml(t('footer.credits'))}</a>`);
+  // Where to report something. Asked for on 2026-08-06: "maybe the SoundTouch Manager app
+  // should have some kind of Support/Help menu item which points the user to
+  // github to log issues and send feedback". Until then the only route was
+  // knowing the project is on GitHub and finding it there, which a user who
+  // installed the app from the website has no reason to know.
+  links.push(`<a href="#" id="footerReport" class="footer-link">${escapeHtml(t('footer.reportProblem'))}</a>`);
+  links.push(`<a href="#" id="footerShare" class="footer-link">${escapeHtml(t('share.footer'))}</a>`);
+  const buildStr = i.build && i.build !== 'dev' ? ` <span class="build-stamp">(Build ${escapeHtml(i.build)})</span>` : '';
+  // Clicking the version opens the release notes. For a clean tagged
+  // build that is the matching GitHub release page (which carries the
+  // generated "What's changed" notes); for a dev build (version like
+  // v0.6.21-3-gabc-dirty) there is no tag page, so fall back to the
+  // releases list.
+  const repo = (i.githubUrl || PROJECT_URL).replace(/\/+$/, '');
+  const isTag = /^v\d+\.\d+\.\d+$/.test(i.version || '');
+  const releaseNotesUrl = isTag ? `${repo}/releases/tag/${i.version}` : `${repo}/releases`;
+  $('appFooter').innerHTML = `
+    <div class="footer-left">
+      SoundTouch Manager &middot; Version <a href="#" id="appVersionLink" class="footer-link" title="${escapeAttr(t('banner.whatsNew'))}"><b>${escapeHtml(i.version)}</b></a>${buildStr}${i.author ? ' &middot; ' + escapeHtml(i.author) : ''}
+      <div class="footer-fine">Independent open source project, donation funded, MIT license.</div>
+    </div>
+    <div class="footer-right">${links.join(' &middot; ')}</div>
+  `;
+  $('appFooter').querySelectorAll('.footer-link[data-url]').forEach(a => {
+    a.onclick = (e) => { e.preventDefault(); BrowserOpenURL(withAppReferrer(a.dataset.url, 'footer')); };
+  });
+  const verLink = $('appVersionLink');
+  if (verLink) verLink.onclick = (e) => { e.preventDefault(); BrowserOpenURL(releaseNotesUrl); };
+  const creditsLink = $('footerCredits');
+  if (creditsLink) creditsLink.onclick = (e) => { e.preventDefault(); showCredits(); };
+  const donateLink = $('footerDonate');
+  if (donateLink) donateLink.onclick = (e) => { e.preventDefault(); showDonate(); };
+  // Straight to the issue list rather than the repository front page: a user
+  // with a problem wants to see whether it is already reported and to write it
+  // down, not to read a README.
+  const reportLink = $('footerReport');
+  if (reportLink) reportLink.onclick = (e) => { e.preventDefault(); BrowserOpenURL(`${repo}/issues`); };
+  const shareLink = $('footerShare');
+  if (shareLink) shareLink.onclick = (e) => { e.preventDefault(); openShareModal(); };
+  const worldMapLink = $('footerWorldMap');
+  if (worldMapLink) worldMapLink.onclick = (e) => { e.preventDefault(); try { BrowserOpenURL(worldMapURL()); } catch {} };
+  const saveLogsBtn = $('footerSaveLogs');
+  if (saveLogsBtn) {
+    saveLogsBtn.onclick = async (e) => {
+      e.preventDefault();
+      saveLogsBtn.classList.add('working');
+      try {
+        const hosts = (state.boxes || []).map(b => b && b.host).filter(Boolean);
+        const res = await SaveDiagnosticBundle(hosts, true);
+        if (res && res.savePath) {
+          showToast(t('footer.saveLogsDone', { path: res.savePath, size: Math.round((res.bytes || 0) / 1024) }));
+        }
+        // If user cancelled the dialog, savePath comes back empty —
+        // no toast on cancel.
+      } catch (err) {
+        showError(String(err));
+      } finally {
+        saveLogsBtn.classList.remove('working');
+      }
+    };
+  }
+  renderDonateSidebar();
+  // The quiet version line with its "check for updates" link is on screen
+  // from the start. It used to appear only once the first scheduled check
+  // completed 8 s in, so the control materialized out of nowhere and at
+  // least one user never spotted it at all.
+  try { renderAppUpdateCheckLink($('appUpdateBanner'), ''); } catch {}
+  // Defer the update check out of the critical startup path: the window
+  // and discovery come up first, and the network call (a reported suspect
+  // for a macOS start crash) only fires once the app is already running,
+  // so even if it ever misbehaved it cannot abort startup. checkAppUpdate
+  // is itself fully guarded (try/catch + Go-side recover).
+  setTimeout(() => { try { checkAppUpdate(); } catch {} }, 8000);
+  // Long-running apps re-check every 12 hours: STM often stays open for
+  // days on a media PC, and the startup-only check meant such installs never
+  // learned about a new release (and its security fixes) until a restart. The
+  // banner render is idempotent, so a repeat check just refreshes it.
+  setInterval(() => { try { checkAppUpdate(); } catch {} }, 12 * 3600 * 1000);
+  // Advance the track progress once a second between speaker polls, so the bar
+  // moves like a clock instead of stepping whenever the status poll lands.
+  setInterval(() => { try { renderTrackProgress(); } catch {} }, 1000);
+  // appInfo may have arrived after the first discovery completed; the
+  // badge function defers until both are known. Re-render the box list
+  // too so the per-speaker update dot (boxNeedsUpdate) appears once the
+  // app version is finally known.
+  updateSettingsTabBadge();
+  if (state.boxes.length) renderBoxSelect();
+  // Same race, and it was costing the user the better part of a minute right
+  // after they had updated the app, which is exactly when the speakers are
+  // behind and the prompt matters most.
+  //
+  // Both prompts need two facts: the app's version (this function, an await)
+  // and the speakers' versions (a discovery pass). They were only ever
+  // re-evaluated at the END of a discovery pass, so whenever appInfo lost that
+  // race the card was skipped and nothing looked at it again until the NEXT
+  // pass happened along. The delay was never a timer; it was a second sweep.
+  // Now that both facts are in hand, ask immediately. Both are idempotent and
+  // cheap, and both hide themselves when nothing is behind.
+  if (state.boxes.length) {
+    try { maybeShowSpeakerUpdateCard(); } catch {}
+    try { checkBoxUpdate(); } catch {}
+  }
+}
+
+// Donate sidebar — three branded buttons that open in the system
+// browser via Wails. Brand colours and assets follow each provider's
+// guidelines:
+//   * GitHub Sponsors: white background, #bf3989 (Mona Pink) border
+//     and Octicons heart-fill SVG (MIT licensed)
+//   * PayPal: #FFC439 yellow background, two-tone "PayPal" wordmark
+//     in #003087 + #009CDE per the official color system
+//   * Ko-fi: #FF5E5B coral background, coffee-cup mark + white text
+//
+// Links are baked in rather than fetched from appInfo because each
+// provider has its own canonical URL — keeping them inline removes a
+// round trip and means the sidebar renders even before AppInfo loads.
+function renderDonateSidebar() {
+  const side = $('donateSide');
+  if (!side) return;
+  const i = state.appInfo || {};
+  const slogan = i.donateSlogan || t('footer.donateSlogan');
+
+  side.innerHTML = `
+    <div class="donate-icon">&#9749;</div>
+    <div class="donate-slogan">${escapeHtml(slogan)}</div>
+    ${donateButtonsHTML()}
+    ${shareTriggerHTML()}
+  `;
+
+  wireDonateButtons(side);
+  const shareBtn = $('shareTrigger');
+  if (shareBtn) shareBtn.onclick = openShareModal;
+}
+
+// showDonate opens the same three buttons as a dialog, from the footer link.
+//
+// The rail they normally live in is an overlay that needs a wide window: it is
+// display:none below 62em, and because that threshold is in em it moves out
+// with the user's text size, so a narrow window or a large font hides it
+// entirely. The CSS comment beside that rule promised "below that the footer
+// donate link carries it" and there was no such link, which is how a user who
+// had gone looking in order to actually pay reported the coffee button as
+// missing (mail, 2026-09-09). The footer is always on screen, so this is the
+// path that cannot disappear.
+function showDonate() {
+  const modal = $('donateModal');
+  const btns = $('donateModalBtns');
+  if (!modal || !btns) return;
+  const i = state.appInfo || {};
+  const play = playBillingOn();
+  const title = $('donateModalTitle');
+  if (title) title.textContent = play ? t('play.title') : t('credits.donate');
+  const slogan = $('donateModalSlogan');
+  if (slogan) slogan.textContent = play ? t('play.body') : (i.donateSlogan || t('footer.donateSlogan'));
+  btns.innerHTML = donateButtonsHTML();
+  wireDonateButtons(btns);
+  if (play) refreshPlayProducts();
+  const close = () => modal.classList.add('hidden');
+  const closeBtn = $('donateClose');
+  if (closeBtn) closeBtn.onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  modal.classList.remove('hidden');
+}
+
+const PLAY_RESULT = {
+  ok: 'play.thanks',
+  pending: 'play.pending',
+  error: 'play.failed',
+};
+
+// The Android shell calls these after Play returns a catalogue or a purchase.
+window.onPlayProducts = () => {
+  try { renderDonateSidebar(); } catch {}
+  const modal = $('donateModal');
+  if (modal && !modal.classList.contains('hidden')) {
+    const btns = $('donateModalBtns');
+    if (btns) {
+      btns.innerHTML = donateButtonsHTML();
+      wireDonateButtons(btns);
+    }
+  }
+};
+window.onPlayPurchase = (status) => {
+  const el = $('donatePlayStatus');
+  const key = PLAY_RESULT[status];
+  if (!el || !key) return;
+  el.textContent = t(key);
+  el.classList.remove('hidden');
+  const modal = $('donateModal');
+  if (modal) modal.classList.remove('hidden');
+};
+
+// renderAppUpdateCheckLink leaves a quiet way back to the update notice in the
+// place the banner would occupy.
+//
+// Dismissing the notice used to be one-way. The version check ran 8 s after
+// start and then every twelve hours, and a dismissal was remembered for that
+// version, so somebody who clicked it away, or who went back to an older
+// build, had nothing left to press and no way to be offered the update again
+// ("How do I force it to check for updates?"). A manual
+// check also ignores the stored dismissal, because a person pressing this has
+// just answered the question the dismissal was standing in for.
+// Off in this build: the release it would offer is upstream's, and installing
+// it would replace this customised app. The footer still shows the version.
+const APP_UPDATE_CHECK = false;
+
+function renderAppUpdateCheckLink(banner, note) {
+  if (!banner) return;
+  if (!APP_UPDATE_CHECK) { banner.classList.add('hidden'); return; }
+  banner.classList.add('app-update-quiet');
+  banner.classList.remove('hidden');
+  // Name the version next to the link. On its own the link was a stray line
+  // above everything else with nothing to explain why it was there; with the
+  // installed version in front of it, the line says what it is about.
+  const cur = (state.appInfo && state.appInfo.version) ? String(state.appInfo.version) : '';
+  banner.innerHTML = (cur ? `<span class="app-update-quiet-ver">${escapeHtml(t('setup.versionLabel', { version: cur }))}</span>` : '')
+    + `<a href="#" id="appUpdateCheckLink" class="footer-link">${escapeHtml(t('banner.checkForAppUpdate'))}</a>`
+    + (note ? `<span class="app-update-quiet-note">${escapeHtml(note)}</span>` : '');
+  const link = $('appUpdateCheckLink');
+  if (link) link.onclick = (e) => {
+    e.preventDefault();
+    link.textContent = t('banner.checkingForAppUpdate');
+    try { clearNoticeDismissal('appUpdate'); } catch {}
+    checkAppUpdate(true);
+  };
+}
+
+async function checkAppUpdate(manual) {
+  if (!APP_UPDATE_CHECK) return;
+  // Entirely best-effort: an unreachable endpoint or a garbage payload
+  // must never break the UI. Validate every field defensively and stay
+  // silent on any failure.
+  const banner = $('appUpdateBanner');
+  try {
+    const m = await CheckAppUpdate();
+    if (!m || typeof m !== 'object' || typeof m.version !== 'string' || !m.version) {
+      // Nothing newer. Say so when the user asked; otherwise just leave the
+      // way back on screen.
+      renderAppUpdateCheckLink(banner, manual ? t('banner.appIsCurrent') : '');
+      return;
+    }
+    if (!banner) return;
+    // An app update outranks the speaker updates and hides their prompts (see
+    // speakerUpdateCardMuted). Set before the dismissal check: the ORDER
+    // holds either way, and a user who clicked the app notice away has not
+    // stopped needing the app first.
+    state.appUpdateVersion = m.version;
+    if (noticeDismissed('appUpdate', m.version)) {
+      renderAppUpdateCheckLink(banner, '');
+      return;
+    }
+    banner.classList.remove('app-update-quiet');
+    // Keep the banner discreet: version, a single "What's new" LINK to
+    // the release notes (not the notes inline, which took too much space
+    // and does not interest every user), and the download button.
+    // Only treat a real http(s) URL as a download link; anything else is
+    // ignored so we never hand junk to the system browser.
+    const dlUrl = (typeof m.downloadUrl === 'string' && /^https?:\/\//i.test(m.downloadUrl)) ? m.downloadUrl : '';
+    // Link target for the notes: an explicit notesUrl from the server if
+    // present, else the matching GitHub release page for the new version,
+    // else the releases list.
+    const repo = ((state.appInfo && state.appInfo.githubUrl) || PROJECT_URL).replace(/\/+$/, '');
+    // /releases/latest always resolves to the newest PUBLISHED release, so it
+    // never 404s on a draft/just-published tag (the "page not found" a user hit).
+    const latestUrl = `${repo}/releases/latest`;
+    const notesUrl = (typeof m.notesUrl === 'string' && /^https?:\/\//i.test(m.notesUrl))
+      ? m.notesUrl
+      : latestUrl;
+    // The banner itself only shows for a genuinely newer version (CheckAppUpdate
+    // returns nothing otherwise), and the download button only when the manifest
+    // carries a real download URL. The button is a primary button so it stands
+    // out in the notice instead of reading as a faint secondary control.
+    // In-app update: download the matching asset, verify its SHA256, then
+    // install. Linux/Windows self-replace and relaunch; macOS downloads+verifies
+    // and opens the .dmg (replacing a running .app bundle is unwritten work, not
+    // a Gatekeeper problem: the build is notarized). The button
+    // always shows now: the asset URL + hash are resolved from the release
+    // manifest in the backend, so it no longer depends on the manifest carrying a
+    // downloadUrl. notesUrl / releases page stays as the manual fallback.
+    const isMacOS = /Mac|iPhone|iPad|iPod/i.test(navigator.platform || navigator.userAgent || '');
+    // Label makes the target unambiguous: this updates THE APP itself, not the
+    // speaker (a non-technical user clicked the speaker-update expecting the app
+    // to update, and ended up with two .exe copies downloaded by hand).
+    const installLabel = isMacOS ? t('banner.downloadAppUpdate') : t('banner.installAppNow');
+    banner.innerHTML = `
+      <div class="app-update-text"><span class="app-update-icon" aria-hidden="true">&#8593;</span><span><b>${escapeHtml(t('banner.appUpdateAvail'))}</b> ${escapeHtml(m.version)} &middot; <a href="#" id="appUpdateNotes" class="footer-link">${escapeHtml(t('banner.whatsNew'))}</a></span></div>
+      <button class="btn btn-primary app-update-btn" id="appUpdateBtn">${escapeHtml(installLabel)}</button>
+      <button class="banner-close" id="appUpdateDismiss" aria-label="${escapeAttr(t('banner.dismiss'))}" title="${escapeAttr(t('banner.dismissTitle'))}">&times;</button>
+    `;
+    banner.classList.remove('hidden');
+    const notesLink = $('appUpdateNotes');
+    if (notesLink) notesLink.onclick = (e) => { e.preventDefault(); BrowserOpenURL(notesUrl); };
+    const dl = $('appUpdateBtn');
+    if (dl) dl.onclick = () => runAppUpdate(m.version, dl, installLabel, isMacOS, dlUrl || latestUrl);
+    // Clicking it away is allowed and remembered, for THIS version only. The
+    // next release is news again and says so; the user dismisses that one in
+    // turn or installs it.
+    const x = $('appUpdateDismiss');
+    if (x) x.onclick = () => {
+      dismissNotice('appUpdate', m.version);
+      // Not hidden: the quiet link stays so the notice can be brought back.
+      renderAppUpdateCheckLink(banner, '');
+      // The speaker prompts stay muted: the app is still the thing to do first.
+      // They return once the app is current.
+      maybeShowSpeakerUpdateCard();
+    };
+  } catch (e) {
+    try { console.warn('checkAppUpdate failed', e); } catch {}
+    // A check that could not run must not swallow the control that triggers
+    // it, and a person who pressed it is owed the failure: with the link
+    // quietly resetting, a machine on which the request always fails (AV
+    // proxy, firewall, DNS) looks exactly like "no update exists", and one
+    // user pressed through several releases believing that.
+    try { renderAppUpdateCheckLink(banner, manual ? t('banner.appCheckFailed') : ''); } catch {}
+  }
+}
+
+// runAppUpdate downloads + verifies the new version and installs it. On
+// Linux/Windows the backend replaces the running binary and relaunches, so the
+// app quits mid-call and the code after ApplyUpdate only runs on macOS (assisted:
+// the verified .dmg is opened for the user to drag into Applications). On any
+// failure the button becomes a "download from the website" fallback so the user
+// is never stuck.
+// downloadWasInterrupted separates "the connection went away" from a genuine
+// failure of the update itself.
+//
+// Everything here is a transport fault: the machine lost its network, the
+// connection was cut, the server never answered, or the download stopped short.
+// None of them says anything is wrong with the app, the release or the file, so
+// none of them earns an error the user is invited to copy and send on. A hash
+// mismatch or a file that cannot be written is the opposite and is left to the
+// full error path.
+//
+// Matching on the message rather than a typed error because these arrive from
+// the Go side already flattened into a string.
+export function downloadWasInterrupted(err) {
+  const s = String(err || '').toLowerCase();
+  return [
+    'network is unreachable', 'unreachable network', // the machine has no route
+    'no route to host', 'no such host', 'dns',        // gateway or resolver gone
+    'connection reset', 'connection refused', 'broken pipe',
+    'eof', 'unexpected eof',                          // cut mid-transfer
+    'timeout', 'deadline exceeded', 'timed out',
+    'canceled', 'cancelled', 'aborted',
+    'i/o error', 'connection was aborted',
+  ].some((m) => s.includes(m));
+}
+
+// fmtRate turns a bytes/second number into a short human rate for the live
+// download/upload throughput shown during an app update or a speaker update.
+function fmtRate(bps) {
+  bps = Number(bps) || 0;
+  if (bps >= 1024 * 1024) return (bps / 1048576).toFixed(1) + ' MB/s';
+  if (bps >= 1024) return Math.round(bps / 1024) + ' KB/s';
+  return Math.max(0, Math.round(bps)) + ' B/s';
+}
+
+// showMacHandoff turns the update banner into the standing instruction for the
+// one step macOS leaves to the user: drag the new app out of the mounted .dmg.
+//
+// It replaces the banner rather than adding a second notice, because at this
+// point the "install now" button has done everything it can and re-pressing it
+// only downloads the same file again. The button here is short on purpose (Jens'
+// rule: a button carries a few words, never a status message) and re-opens the
+// downloaded file for anyone who closed the Finder window before reading it.
+//
+// Nothing dismisses this by itself. The banner is rebuilt from scratch by the
+// next update check, which finds the app already current once the user has
+// dragged it across, so the instruction disappears exactly when it is obsolete.
+function showMacHandoff(path) {
+  const banner = $('appUpdateBanner');
+  if (!banner) { showToast(t('banner.macDownloaded')); return; }
+  banner.innerHTML = `
+    <div class="app-update-text"><span class="app-update-icon" aria-hidden="true">&#10003;</span><span><b>${escapeHtml(t('banner.macReadyTitle'))}</b> ${escapeHtml(t('banner.macDownloaded'))}</span></div>
+    <button class="btn btn-primary app-update-btn" id="appUpdateReveal">${escapeHtml(t('banner.macShowFile'))}</button>
+  `;
+  banner.classList.remove('hidden');
+  const rv = $('appUpdateReveal');
+  if (rv && path) rv.onclick = () => { RevealUpdateFile(path).catch(() => {}); };
+}
+
+async function runAppUpdate(version, btn, installLabel, isMacOS, fallbackUrl) {
+  btn.disabled = true;
+  const off = EventsOn('app:update:progress', (p) => {
+    const pct = (p && typeof p === 'object') ? p.pct : p;
+    const rate = (p && typeof p === 'object' && p.bytesPerSec) ? ' (' + fmtRate(p.bytesPerSec) + ')' : '';
+    btn.textContent = t('banner.downloadingPct', { pct }) + rate;
+  });
+  try {
+    // Not "Downloading 0%". Nothing is downloading yet: the release
+    // manifest still has to be looked up and the connection opened, which is
+    // a minute of legitimate waiting on a slow link, and the first progress
+    // event only fires once body bytes arrive. Showing 0% for all of it made
+    // a reporter watch a frozen percentage and take a diagnostic.
+    btn.textContent = t('banner.connecting');
+    const path = await DownloadUpdate(version);
+    btn.textContent = t('banner.installing');
+    await ApplyUpdate(path);
+    // Reached only on macOS (Linux/Windows relaunch+quit inside ApplyUpdate).
+    //
+    // The last step is the user's: drag the app out of the mounted .dmg. Saying
+    // that in a toast did not work, because ApplyUpdate opens the .dmg and
+    // Finder's window comes up over ours, exactly where the toast sits, and the
+    // toast is gone by the time the user looks back. Reported 2026-08-06 with a
+    // screenshot showing the Finder window on top of it: "I feel that this
+    // notice is easy to miss". So the instruction takes over the update banner
+    // and stays there until the new version is actually running.
+    if (isMacOS) {
+      btn.disabled = false;
+      btn.textContent = installLabel;
+      showMacHandoff(path);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    // A download the network cut off is not a fault anybody needs to report,
+    // and it is not a reason to send the user to a web page either: the same
+    // button, pressed again once the connection is back, is the whole fix.
+    // Reported by shorty310 after pulling his Wi-Fi mid-download: he got
+    // the copyable error modal, which reads as "send this to the developer",
+    // and a button that had turned into "Get it from the downloads page".
+    if (downloadWasInterrupted(e)) {
+      btn.textContent = t('banner.retryAppUpdate');
+      btn.onclick = () => runAppUpdate(version, btn, installLabel, isMacOS, fallbackUrl);
+      showToast(t('banner.updateInterrupted'), 9000);
+    } else {
+      // A real failure: a hash that did not match, a file that could not be
+      // written. That one IS worth showing in full and worth the web fallback.
+      showError(t('banner.updateFailed', { err: String(e) }));
+      btn.textContent = t('banner.getFromReleases');
+      if (fallbackUrl) btn.onclick = () => BrowserOpenURL(fallbackUrl);
+      // Reassure the non-technical user: the app replaces itself, so any .exe
+      // they downloaded by hand earlier can simply be deleted (the
+      // duplicate-copies confusion that prompted this).
+      showToast(t('banner.manualHint'));
+    }
+  } finally {
+    if (typeof off === 'function') off();
+  }
+}
+
+// ---------- Box steuern View ----------
+
+$('view-box').innerHTML = `
+  <div class="topbar">
+    <div class="topbar-head">
+      <div class="topbar-title">${escapeHtml(t('topbar.title'))}</div>
+      <button class="btn btn-mini btn-primary" id="addStationTopBtn" title="${escapeAttr(t('rbadd.title'))}">${escapeHtml(t('rbadd.addStationBtn'))}</button>
+      <button class="btn-icon" id="refreshBtn" aria-label="${escapeAttr(t('topbar.refreshTitle'))}" title="${escapeAttr(t('topbar.refreshTitle'))}"><span class="refresh-icon" aria-hidden="true">&#x21bb;</span></button>
+    </div>
+    <div class="box-select" id="boxSelect">${escapeHtml(t('speaker.searching'))}</div>
+  </div>
+  <div id="boxHint" class="box-hint hidden">
+    <p>${escapeHtml(t('speaker.choose'))}</p>
+  </div>
+  <div id="boxControls" class="hidden">
+    <div class="status-bar" id="statusBar" role="status" aria-live="polite">
+      <div class="status-main" id="statusMain"></div>
+      <div class="track-progress hidden" id="trackProgress">
+        <span class="track-time" id="trackElapsed">0:00</span>
+        <div class="track-bar" id="trackBar"><div class="track-bar-fill" id="trackBarFill"></div></div>
+        <span class="track-time" id="trackTotal"></span>
+      </div>
+    </div>
+    <div class="group-control" id="groupControl"></div>
+    <div class="controls">
+      <button class="btn btn-mini hidden" id="trackPrevBtn" title="${escapeAttr(t('controls.prev'))}" aria-label="${escapeAttr(t('controls.prev'))}">&#9198;</button>
+      <button class="btn" id="pauseBtn">&#9208; ${escapeHtml(t('controls.pause'))}</button>
+      <button class="btn btn-mini hidden" id="trackNextBtn" title="${escapeAttr(t('controls.next'))}" aria-label="${escapeAttr(t('controls.next'))}">&#9197;</button>
+      <button class="btn" id="stopBtn">&#9209; ${escapeHtml(t('controls.stop'))}</button>
+      <div class="queue-controls hidden" id="queueControls">
+        <button class="btn btn-mini" id="queuePrevBtn" title="${escapeAttr(t('controls.prev'))}">&#9198; ${escapeHtml(t('controls.prev'))}</button>
+        <button class="btn btn-mini" id="queueNextBtn" title="${escapeAttr(t('controls.next'))}">&#9197; ${escapeHtml(t('controls.next'))}</button>
+        <button class="btn btn-mini toggle-btn" id="queueShuffleBtn" aria-label="${escapeAttr(t('controls.shuffle'))}" title="${escapeAttr(t('controls.shuffle'))}">&#128256;</button>
+        <button class="btn btn-mini toggle-btn" id="queueRepeatBtn" aria-label="${escapeAttr(t('controls.repeat'))}" title="${escapeAttr(t('controls.repeat'))}">&#128257;</button>
+        <span class="queue-pos" id="queuePos"></span>
+      </div>
+      <div class="source-buttons" id="sourceButtons">
+        <span class="source-inputs" id="sourceInputs"></span>
+        <button class="btn btn-source btn-source-icon" data-source="STANDBY" aria-label="${escapeAttr(t('controls.standbyTitle'))}" title="${escapeAttr(t('controls.standbyTitle'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" width="16" height="16" aria-hidden="true"><path d="M12 2v10"></path><path d="M18.4 6.6a9 9 0 1 1-12.8 0"></path></svg></button>
+      </div>
+      <div class="volume-control">
+        <span class="vol-icon" title="${escapeAttr(t('controls.volume'))}" aria-hidden="true">&#128266;</span>
+        <button class="btn btn-mini vol-step" id="volDown" aria-label="${escapeAttr(t('controls.volumeDown'))}" title="${escapeAttr(t('controls.volumeDown'))}">&#8722;</button>
+        <input type="range" id="musicVolume" min="0" max="100" step="1" aria-label="${escapeAttr(t('controls.volume'))}" title="${escapeAttr(t('controls.volumeWheelHint'))}" />
+        <button class="btn btn-mini vol-step" id="volUp" aria-label="${escapeAttr(t('controls.volumeUp'))}" title="${escapeAttr(t('controls.volumeUp'))}">+</button>
+        <span class="vol-val" id="musicVolumeVal">--</span>
+        
+      </div>
+    </div>
+    <div class="section-head"><h3>${escapeHtml(t('presets.heading'))}</h3></div>
+    <div class="grid" id="presets"></div>
+    <div class="preset-copy-row">
+      <button class="btn btn-mini preset-transfer-btn" id="presetTransferBtn" aria-label="" title="" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="15" height="15" aria-hidden="true"><path d="M4 12v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-7"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg> ${escapeHtml(t('presets.transferBtn'))}</button>
+    </div>
+    <div class="search">
+      <h3>${escapeHtml(t('search.heading'))} <small>(${escapeHtml(t('search.headingSub'))})</small></h3>
+      <div class="search-input-row">
+        <input type="text" id="searchQ" placeholder="${escapeAttr(t('search.placeholder'))}" />
+        <button class="btn" id="searchBtn">${escapeHtml(t('search.btn'))}</button>
+        <button class="btn btn-mini" id="topBtn">${escapeHtml(t('search.topBtn'))}</button>
+        <button class="btn btn-mini hidden" id="favModeBtn" title="${escapeAttr(t('search.favBtnTitle'))}">${escapeHtml(t('search.favBtn'))}</button>
+      </div>
+      <div class="search-filters">
+        <label>${escapeHtml(t('search.countryLabel'))}:
+          <select id="searchCountry"></select>
+        </label>
+        <label>${escapeHtml(t('search.languageLabel'))}:
+          <select id="searchLang"><option value="">${escapeHtml(t('search.allLanguages'))}</option></select>
+        </label>
+        <label>${escapeHtml(t('search.orderLabel'))}:
+          <select id="searchOrder"></select>
+        </label>
+        <label>${escapeHtml(t('search.bitrateLabel'))}:
+          <select id="searchBitrate">
+            <option value="0">${escapeHtml(t('search.bitrateAny'))}</option>
+            <option value="64">&ge; 64 kbit/s</option>
+            <option value="96">&ge; 96 kbit/s</option>
+            <option value="128">&ge; 128 kbit/s</option>
+            <option value="192">&ge; 192 kbit/s</option>
+            <option value="256">&ge; 256 kbit/s</option>
+            <option value="320">&ge; 320 kbit/s</option>
+          </select>
+        </label>
+        <label><input type="checkbox" id="searchOnlyOK" checked /> ${escapeHtml(t('search.onlyOK'))}</label>
+        <label><input type="checkbox" id="searchOnlyBose" checked /> ${escapeHtml(t('search.onlyBose'))}</label>
+      </div>
+      <div class="genre-chips" id="genreChips"></div>
+      <div class="search-count muted small hidden" id="searchCount"></div>
+      <details class="search-addhint" id="addStationBox">
+        <summary>${escapeHtml(t('search.addStationCta'))}</summary>
+        <div class="search-addhint-body">
+          ${escapeHtml(t('search.addStationHint'))}
+          <div class="search-addhint-actions">
+            <button class="btn btn-mini btn-primary" id="addStationAppBtn">${escapeHtml(t('rbadd.openBtn'))}</button>
+            <button class="btn btn-mini" id="addStationOpenBtn">radio-browser.info</button>
+          </div>
+        </div>
+      </details>
+      <div class="search-results" id="searchResults"></div>
+      <div class="load-more-row hidden" id="loadMoreRow">
+        <button class="btn btn-mini" id="loadMoreBtn">${escapeHtml(t('search.loadMore'))}</button>
+      </div>
+    </div>
+  </div>
+`;
+
+// Filter Dropdowns befuellen
+$('searchCountry').innerHTML = COUNTRIES.map(c =>
+  `<option value="${c.cc}">${optFlag(c.cc)}${escapeHtml(c.name)}</option>`
+).join('');
+$('searchOrder').innerHTML = ORDERS.map(o =>
+  `<option value="${o.v}">${escapeHtml(o.label)}</option>`
+).join('');
+$('searchCountry').value = state.searchCountry;
+$('searchOrder').value = state.searchOrder;
+$('searchOnlyOK').checked = state.searchOnlyOK;
+$('searchOnlyBose').checked = state.searchOnlyBose;
+
+// The refresh button also re-asks whether a newer app exists, and forgets any
+// earlier dismissal while doing so. Until now the app version was only checked
+// 8 s after start and then every 12 hours, so a user who had put the notice
+// away, or who moved back to an older build, had no way to be offered the
+// update again and pressing refresh appeared to do nothing at all (discussion
+// "How do I force it to check for updates?"). Somebody pressing refresh
+// is asking, so a stored "not now" must not answer for them.
+$('refreshBtn').onclick = () => {
+  try { clearNoticeDismissal('appUpdate'); checkAppUpdate(); } catch {}
+  discoverBoxes();
+};
+
+// Globaler Security Reboot Knopf (im Top Banner)
+const gsb = $('globalSecurityRebootBtn');
+if (gsb) gsb.onclick = async () => {
+  const box = state.currentBox || (state.boxes && state.boxes[0]);
+  if (!box) { showToast(t('speaker.noneSelected')); return; }
+  const ok = await confirmWarn(
+    t('speaker.rebootConfirmTitle'),
+    t('speaker.rebootConfirmBody')
+  );
+  if (!ok) return;
+  try {
+    await RebootBox(box.host, box.port);
+    showToast(t('speaker.rebootingToast'));
+    setTimeout(discoverBoxes, 35000);
+  } catch (e) { showError(e); }
+};
+// Dismiss the SSH reminder for the current speaker. The user has seen the
+// "remove the stick" hint and chooses not to be reminded again on this box
+// (persisted per speaker, like the conflict/no-Wi-Fi banners).
+const gsd = $('globalSecurityDismissBtn');
+if (gsd) gsd.onclick = () => {
+  const box = state.currentBox || (state.boxes && state.boxes[0]);
+  if (box) { try { localStorage.setItem(warnDismissKey(box, 'ssh'), String(Date.now())); } catch {} }
+  const gb = $('globalSecurityBanner');
+  if (gb) gb.classList.add('hidden');
+};
+// A STOPPED stream resumes too. Only a paused one counted, so after Stop the
+// button still read Pause and sent pause to a transport that had already
+// stopped: nothing happened and there was no way back to the music. Same fault,
+// same fix as the phone remote.
+$('pauseBtn').onclick = () => action(stoppedOrPaused(state.nowPlayState) ? 'resume' : 'pause');
+
+// stoppedOrPaused reports whether the transport should offer Play. INVALID_SOURCE
+// is deliberately excluded: nothing is loaded there, so Play would promise
+// something that cannot happen.
+function stoppedOrPaused(ps) { return ps === 'PAUSE_STATE' || ps === 'STOP_STATE'; }
+$('stopBtn').onclick = () => action('stop');
+// Track skip for a Spotify playlist (the DLNA folder queue has its own controls
+// in #queueControls). The agent's /api/next//api/prev are source-aware.
+$('trackNextBtn').onclick = () => action('next');
+$('trackPrevBtn').onclick = () => action('prev');
+
+// Queue transport controls (DLNA folder play queue). Each fires its action and
+// then a quick GetQueue refresh so the indicator and toggle states catch up
+// before the next status poll.
+$('queuePrevBtn').onclick = () => queueAction(QueuePrev);
+$('queueNextBtn').onclick = () => queueAction(QueueNext);
+$('queueShuffleBtn').onclick = () => {
+  const on = !(state.queue && state.queue.shuffle);
+  queueAction((h, p) => QueueShuffle(h, p, on));
+};
+$('queueRepeatBtn').onclick = () => {
+  const cur = (state.queue && state.queue.repeat) || 'off';
+  const nextMode = cur === 'off' ? 'all' : cur === 'all' ? 'one' : 'off';
+  queueAction((h, p) => QueueRepeat(h, p, nextMode));
+};
+
+// The input row and the standby button in the music tab, both routed through
+// the agent's /api/box/source endpoint via the SelectBoxSource binding.
+//
+// Delegated from the row because the input buttons are built per speaker now: a
+// soundbar's TV and HDMI sockets only exist once that speaker has reported them,
+// so there is no fixed set of buttons left to bind at startup.
+$('sourceButtons').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('.btn-source');
+  if (btn) selectSource(btn);
+});
+
+async function selectSource(btn) {
+  const box = state.currentBox;
+  if (!box) { showToast(t('speaker.noneSelected')); return; }
+  // The name that goes to the speaker is the name the speaker itself reported,
+  // which is why a CineMate's analogue input is switched with LOCAL and an
+  // SA-5's second line input needs the account alongside it: without the
+  // account its three AUX sockets are indistinguishable.
+  const src = btn.dataset.source;
+  const account = btn.dataset.sourceAccount || '';
+  const shown = btn.dataset.sourceLabel || src;
+  btn.disabled = true;
+  try {
+    await SelectBoxSource(box.host, box.port, src, account);
+    showToast(t('toast.source', { src: shown }));
+    setTimeout(refreshStatus, 800);
+  } catch (e) {
+    // A button is only drawn for an input the speaker listed, but if the box
+    // refuses it anyway (1005 UNKNOWN_SOURCE_ERROR, relayed by the agent as
+    // source_unavailable) show a clear message instead of the raw box error.
+    if (String(e).includes('source_unavailable')) {
+      showToast(t('toast.sourceUnavailable', { src: shown }));
+      btn.classList.add('hidden');
+    } else {
+      showError(e);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Volume slider in the music tab. Uses SetBoxVolume, debounced so a
+// drag does not fire a hundred API calls.
+let musicVolBox = null;
+const musicVolEl = $('musicVolume');
+const musicVolValEl = $('musicVolumeVal');
+// Drag-busy + grace period so the 2 s periodic refresh in
+// refreshStatus does not yank the thumb out from under the user
+// while they are wischen. musicVolUntil is the timestamp at which
+// auto-refresh is allowed to take over again after a release.
+state.musicVolBusy = false;
+state.musicVolUntil = 0;
+if (musicVolEl) {
+  // Live-update during drag: each input event throttles a
+  // SetBoxVolume call so the user sees the level move on the
+  // speaker WHILE they wipe, not only on release. The throttle
+  // collapses bursts so the box's tiny HTTP server never has more
+  // than one volume PUT in flight at a time.
+  musicVolEl.oninput = () => {
+    if (musicVolValEl) musicVolValEl.textContent = musicVolEl.value;
+    const box = state.currentBox;
+    if (!box) return;
+    musicVolBox = box;
+    state.desiredVolume = parseInt(musicVolEl.value, 10);
+    throttledSetVolume(box.host, box.port, state.desiredVolume);
+  };
+  // Keyboard arrows fire only `change`, not `input`, so we still
+  // dispatch on change as a safety net for that path.
+  musicVolEl.onchange = () => {
+    musicVolBox = state.currentBox;
+    if (!musicVolBox) return;
+    state.desiredVolume = parseInt(musicVolEl.value, 10);
+    throttledSetVolume(musicVolBox.host, musicVolBox.port, state.desiredVolume);
+  };
+  // pointerdown/up flag is the most reliable cross-device drag
+  // signal. Keyboard arrows fire only `change`, which is already
+  // wired above, so the busy flag is unnecessary there. Add a
+  // ~1.2 s grace period after release so the network round-trip
+  // to the box (and its own state update) does not race with us.
+  const beginBusy = () => { state.musicVolBusy = true; };
+  const endBusy = () => {
+    state.musicVolBusy = false;
+    state.musicVolUntil = Date.now() + 1200;
+  };
+  musicVolEl.addEventListener('pointerdown', beginBusy);
+  musicVolEl.addEventListener('pointerup', endBusy);
+  musicVolEl.addEventListener('pointercancel', endBusy);
+  musicVolEl.addEventListener('pointerleave', () => {
+    if (state.musicVolBusy) endBusy();
+  });
+
+  // Precise stepping: the +/- buttons and the mouse wheel both nudge the volume
+  // by exactly one, sharing one clamped helper. stepVolume mirrors what an
+  // oninput drag does (move the thumb, update the label, push to the box) and
+  // holds off the periodic auto-refresh for the same grace period so it does not
+  // snap the thumb back before the box has applied the change.
+  const stepVolume = (delta) => {
+    const box = state.currentBox;
+    if (!box) return;
+    const cur = parseInt(musicVolEl.value, 10) || 0;
+    const next = Math.max(0, Math.min(100, cur + delta));
+    if (next === cur) return;
+    musicVolEl.value = String(next);
+    if (musicVolValEl) musicVolValEl.textContent = String(next);
+    musicVolBox = box;
+    state.desiredVolume = next;
+    state.musicVolBusy = false;
+    state.musicVolUntil = Date.now() + 1200;
+    throttledSetVolume(box.host, box.port, next);
+  };
+  const volDown = $('volDown');
+  const volUp = $('volUp');
+  // Focusing the slider on a button press also arms the wheel gesture below, so
+  // a user can click "+" once and then keep scrolling to fine-tune.
+  if (volDown) volDown.onclick = () => { musicVolEl.focus(); stepVolume(-1); };
+  if (volUp) volUp.onclick = () => { musicVolEl.focus(); stepVolume(1); };
+
+  // Mouse wheel over the slider adjusts the volume, but ONLY while the slider is
+  // focused (the user clicked it or used the +/- buttons). Passively scrolling
+  // the page with the cursor merely passing over the slider must never change
+  // the volume: that accidental blast is exactly what we are guarding against.
+  // When not engaged we do not preventDefault, so the page scrolls as usual.
+  // Rate-limited to one step per notch so a fast flick moves one at a time.
+  let volWheelAt = 0;
+  musicVolEl.addEventListener('wheel', (e) => {
+    if (document.activeElement !== musicVolEl) return;
+    e.preventDefault();
+    const now = Date.now();
+    if (now - volWheelAt < 60) return;
+    volWheelAt = now;
+    stepVolume(e.deltaY < 0 ? 1 : -1);
+  }, { passive: false });
+}
+
+// syncMusicTabVolumeFromBox refreshes the music-tab slider so
+// hardware-button volume changes on the box (or any other client
+// changing the volume out from under us) show up here within ~2 s.
+// Called from refreshStatus on every poll. Cheap to call: BoxSettings
+// caches well on the agent side.
+async function syncMusicTabVolumeFromBox() {
+  const box = state.currentBox;
+  if (!box || !musicVolEl) return;
+  if (state.view !== 'box') return;
+  if (state.musicVolBusy) return;
+  if (Date.now() < (state.musicVolUntil || 0)) return;
+  try {
+    const data = await BoxSettings(box.host, box.port);
+    // Guard against a box switch while the request was in flight: a late
+    // reply from the previous speaker would show ITS volume for the new one,
+    // and the user's first slider touch would then send that stale level.
+    if (!sameBoxIdentity(state.currentBox, box)) return;
+    // The user may have started dragging during the round trip; re-check the
+    // drag guards so the reply cannot yank the thumb from under them.
+    if (state.musicVolBusy || Date.now() < (state.musicVolUntil || 0)) return;
+    const vol = (data && data.volume && data.volume.actual);
+    if (typeof vol !== 'number') return;
+    const current = parseInt(musicVolEl.value, 10);
+    if (current !== vol) {
+      musicVolEl.value = String(vol);
+      if (musicVolValEl) musicVolValEl.textContent = String(vol);
+    }
+  } catch {}
+}
+
+// checkSshBanner queries /api/stick/status to find out whether SSH is
+// open on the current speaker and toggles the global top banner
+// accordingly. Called on every refreshStatus + discoverBoxes so the
+// warning shows up before the user even visits the Settings tab.
+async function checkSshBanner() {
+  const gb = $('globalSecurityBanner');
+  if (!gb) return;
+  const box = state.currentBox;
+  // The Setup tab has no current speaker context, so the banner would
+  // be free-floating and just noise. Otherwise check sshOpen status.
+  if (!box || state.view === 'setup') { gb.classList.add('hidden'); return; }
+  // OTA window: agent restarts, SSH may flap, and the banner's
+  // "Reboot now" button would interrupt the agent exec. Suppress
+  // until doBoxUpdate clears the flag (finally{} guaranteed).
+  if (state.otaInProgress) { gb.classList.add('hidden'); return; }
+  try {
+    const r = await boxFetch(box, '/api/stick/status');
+    if (!r.ok) return;
+    const data = await r.json();
+    // The banner is a "remove the stick now that setup is done, otherwise SSH
+    // stays open" reminder. As of the pre-1.0 hardening run.sh no longer
+    // force-opens sshd on every boot; SSH is open only because a stick is in (the
+    // stick opens sshd via its remote_services marker), and a stickless reboot
+    // closes it. So sshOpen is now an accurate, self-clearing signal again, and
+    // keying on it (not data.mounted) also covers the Portable, where the stick
+    // is in but never auto-mounts so mounted=false. The old
+    // mounted-based gate was a workaround from when sshd was always up.
+    // (Setup view and the OTA window are already excluded above.)
+    // Suppress the nag when SSH is deliberately kept open across reboots via a
+    // persistent NAND marker (remote_services / enable-ssh): the banner's whole
+    // point is "remove the stick to close SSH", which does not apply and cannot
+    // be acted on here. The detailed, correctly-worded note lives in
+    // Speaker Settings. The transient stick-driven case still shows the banner so
+    // non-technical users learn to pull the stick, but it is dismissible per
+    // speaker (the reminder should not reappear on every app start once seen).
+    const show = !!(data && data.sshOpen && !data.sshPersistent) && !warnDismissed(box, 'ssh');
+    gb.classList.toggle('hidden', !show);
+  } catch {}
+}
+
+// loadMusicTabVolume fetches the current volume on a tab switch so
+// the slider position is in sync.
+async function loadMusicTabVolume() {
+  const box = state.currentBox;
+  if (!box || !musicVolEl) return;
+  try {
+    const data = await BoxSettings(box.host, box.port);
+    // Guard against a box switch while the request was in flight: two quick
+    // speaker clicks race their replies, and the slower (previous) speaker's
+    // volume must not land on the newly selected one — the first slider
+    // touch would send it there (a sudden loud jump).
+    if (!sameBoxIdentity(state.currentBox, box)) return;
+    const vol = (data && data.volume && data.volume.actual) || 0;
+    musicVolEl.value = String(vol);
+    if (musicVolValEl) musicVolValEl.textContent = String(vol);
+  } catch {}
+}
+$('searchBtn').onclick = () => doSearch();
+$('topBtn').onclick = () => doTop();
+$('favModeBtn').onclick = () => loadFavorites();
+updateFavModeBtn();
+// Pointer for the users who want a station that radio-browser.info does not
+// list yet: they can add it there and it shows up here after a while. The
+// paragraph used to sit below the load-more button as one long link and nobody
+// found it (three missing stations), so it is now a one-line
+// question above the results that unfolds into the full guide.
+{ const ab = $('addStationOpenBtn'); if (ab) ab.onclick = () => { try { BrowserOpenURL('https://www.radio-browser.info/'); } catch {} }; }
+for (const id of ['addStationAppBtn', 'addStationTopBtn']) {
+  const ab = $(id);
+  if (ab) ab.onclick = openAddStation;
+}
+$('loadMoreBtn').onclick = () => loadMore();
+$('searchQ').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
+$('searchQ').oninput = () => {
+  $('searchQ').classList.toggle('has-query', !!$('searchQ').value.trim());
+};
+$('searchCountry').onchange = () => {
+  state.searchCountry = $('searchCountry').value;
+  // A country change resets the language to "all". Otherwise a
+  // country/language mismatch filter would empty the results.
+  state.searchLang = '';
+  const ls = $('searchLang');
+  if (ls) ls.value = '';
+  updateFilterIndicators();
+  saveSearchCountry(state.searchCountry);
+  // Reload the language list scoped to the selected country so the
+  // counts reflect stations in THIS country, not the global pool.
+  state.languages = [];
+  loadLanguagesForCountry();
+  // Country-boost pills depend on the selected country — re-render
+  // so the highlighted row matches. Collapse the "More" expansion
+  // because the previous tail may no longer apply.
+  state.showMoreGenres = false;
+  renderGenreChips();
+  doRefilter();
+};
+
+async function loadLanguagesForCountry() {
+  try {
+    const cc = state.searchCountry || '';
+    // App-side: no box needed; query radio-browser directly.
+    state.languages = await RadioLanguages(cc, cc ? 60 : 40) || [];
+    renderLanguageOptions();
+  } catch {}
+}
+$('searchLang').onchange    = () => {
+  state.searchLang = $('searchLang').value;
+  updateFilterIndicators();
+  doRefilter();
+};
+
+// updateFilterIndicators setzt die has-filter CSS Klasse auf jene Filter
+// Dropdowns die einen anderen Wert als "alle" haben. Damit erkennt der
+// User sofort wo aktiv gefiltert wird.
+function updateFilterIndicators() {
+  const cc = $('searchCountry');
+  const lang = $('searchLang');
+  if (cc) cc.classList.toggle('has-filter', !!cc.value);
+  if (lang) lang.classList.toggle('has-filter', !!lang.value);
+}
+updateFilterIndicators();
+$('searchOrder').onchange   = () => { state.searchOrder   = $('searchOrder').value;   doRefilter(); };
+$('searchOnlyOK').onchange  = () => { state.searchOnlyOK  = $('searchOnlyOK').checked; doRefilter(); };
+$('searchOnlyBose').onchange = () => { state.searchOnlyBose = $('searchOnlyBose').checked; renderSearchResults(); };
+$('searchBitrate').onchange = () => { state.searchMinBitrate = parseInt($('searchBitrate').value, 10) || 0; renderSearchResults(); };
+$('pickCancel').onclick = closePick;
+
+// doRefilter re-runs the last action (Top or Search) with the new
+// filters but keeps the existing query string.
+function doRefilter() {
+  state.searchOffset = 0;
+  if (state.searchLastMode === 'search' && state.searchLastQuery) {
+    doSearch();
+  } else {
+    doTop();
+  }
+}
+
+// emptyStateOnScreen reports whether the "no speaker found" card is the thing
+// currently in the speaker panel. Its manual connect-by-IP field exists only
+// inside that card, so its presence is the cheapest honest test.
+function emptyStateOnScreen() {
+  return !!document.getElementById('emptyIpInput');
+}
+
+async function discoverBoxes() {
+  const hadBoxes = state.boxes.length > 0;
+  if (!hadBoxes && !emptyStateOnScreen() && !manualIpInputBusy()) {
+    // The FIRST search of a session, with nothing on screen yet: an explicit
+    // message, so the user understands the app is doing something.
+    //
+    // Not while the manual connect-by-IP field is in use either: a repeat
+    // sweep replacing the selector destroyed the input mid-typing, which made
+    // the manual fallback unusable exactly when it is needed.
+    $('boxSelect').textContent = t('speaker.searching');
+  } else {
+    // Every repeat, with speakers or without: the refresh icon spins and
+    // whatever is on screen stays put.
+    //
+    // The empty case used to blank the card back to the one-line text on every
+    // sweep, and a reporter watching an empty LAN saw the window toggle
+    // between two screens ten times in about a minute. Since the minute
+    // timer began sweeping the empty list it would do that for as long as
+    // nothing is found, which is the whole time somebody is waiting.
+    const rb = $('refreshBtn');
+    if (rb) rb.classList.add('spinning');
+  }
+  try {
+    // Known-first refresh: re-probe the speakers we already have directly
+    // (no mDNS), so their live values update within ~1 s, THEN run the full
+    // discovery to catch new or moved speakers. Most refreshes just want the
+    // current values of a known box, so this makes the button feel instant.
+    if (hadBoxes) {
+      try {
+        const quick = await RefreshKnownBoxes();
+        if (quick && quick.length) applyBoxList(quick);
+      } catch {}
+    }
+    const list = await DiscoverBoxes(4);
+    applyBoxList(list || []);
+    // Recovery burst: if we had speakers and this cycle found NONE, the LAN most
+    // likely re-IP'd every box at once (router restart, or a LAN<->Wi-Fi / band
+    // switch). Re-sweep on a short burst so the list comes back on its own instead
+    // of the user staring at an empty picker and hitting Refresh.
+    updateRecoveryBurst(hadBoxes, (list || []).length);
+    // Auto retry: if a recently set up speaker has not yet re-announced its
+    // new name via mDNS, search again every 4 s (driven by pendingNames).
+    scheduleNextAutoRefresh();
+  } catch (e) {
+    // Do NOT overwrite the picker with the raw exception. That took the retry
+    // button and the connect-by-IP field away with it, so a blocked first
+    // discovery left nothing to press. Repaint the picker and put the
+    // exception underneath, folded away, where it helps a bug report without
+    // being the whole screen.
+    if (!hadBoxes) {
+      try { renderBoxSelect(); } catch { /* keep whatever is on screen */ }
+      const hint = $('boxHint');
+      if (hint) {
+        hint.innerHTML = `<p>${escapeHtml(t('speaker.choose'))}</p>`
+          + `<details class="muted small"><summary>${escapeHtml(t('common.error'))}</summary>`
+          + `<div>${escapeHtml(String(e))}</div></details>`;
+        hint.classList.remove('hidden');
+      }
+    }
+  } finally {
+    const rb = $('refreshBtn');
+    if (rb) rb.classList.remove('spinning');
+  }
+}
+
+// Periodic background refresh (2026-08-20): the app used to learn a speaker's
+// new agent version only when the user pressed Refresh, so an app left open
+// all day kept showing "needs update" for speakers that were long done. Every
+// minute, re-probe the KNOWN speakers directly (no mDNS sweep, the same quick
+// path the Refresh button uses first) and re-evaluate the update banner.
+// Skipped while an OTA or an install runs so the probe never lands on a
+// speaker mid-flash.
+//
+// The empty list gets a full sweep instead of the known-box probe, because
+// there are no known boxes to probe. It used to be skipped altogether, on the
+// grounds that the recovery burst owned the empty case, and the burst declines
+// it: it only starts when speakers were there and vanished (`hadBoxesBefore`),
+// deliberately, so an empty LAN is never swept every six seconds. Between the
+// two, a session that never saw a speaker had nobody watching for one: start
+// the app with the Wi-Fi off and the picker still said "No speaker found" long
+// after the network was back, until Refresh was pressed by hand.
+//
+// Once a minute is the right cadence for it. Somebody staring at an empty
+// picker is waiting for exactly this, and it costs one sweep a minute for as
+// long as the app has nothing to show, which is the same situation in which
+// the app is doing nothing else at all.
+setInterval(async () => {
+  if (state.otaInProgress || installRunActive()) return;
+  if (!state.boxes.length) {
+    try {
+      await discoverBoxes();
+    } catch { /* the next tick retries */ }
+    return;
+  }
+  try {
+    const quick = await RefreshKnownBoxes();
+    if (quick && quick.length) {
+      applyBoxList(quick);
+      checkBoxUpdate();
+    }
+  } catch { /* transient network trouble: the next tick retries */ }
+}, 60000);
+
+// While the music tab is on screen, keep its group frames and the group
+// volume in step with what the speakers do on their own. A permanent group
+// re-forms on the master's play without the app being told, so the members
+// were already playing while the group volume only appeared after a manual
+// refresh. Same cadence as the phone page, only while the
+// window is visible, and the zone poll keeps its own 8 s debounce.
+setInterval(() => {
+  if (state.view !== 'box' || document.visibilityState !== 'visible') return;
+  if (state.otaInProgress || installRunActive() || !state.boxes.length) return;
+  refreshMusicZones();
+  refreshBoxPlaying();
+}, 15000);
+
+// applyBoxList folds a freshly probed box list into state + the UI. Shared by
+// the known-first quick refresh and the full discovery so both render
+// identically (current-box re-bind, speaker select, badges, setup picker).
+function applyBoxList(list) {
+  state.boxes = applyPendingNames(list || []);
+  // Stable display order. mDNS returns boxes in a nondeterministic order that
+  // varies between discovery cycles, so the speaker list visibly reshuffled
+  // whenever discovery re-ran, most noticeably mid-OTA when the updating box
+  // drops off and reappears. Sort by name (then host, then deviceID) so
+  // the order stays put across refreshes.
+  state.boxes.sort((a, b) =>
+    (a.friendlyName || a.name || a.host || '').toLowerCase()
+      .localeCompare((b.friendlyName || b.name || b.host || '').toLowerCase())
+    || (a.host || '').localeCompare(b.host || '')
+    || (a.deviceID || '').localeCompare(b.deviceID || ''));
+  saveCachedBoxes(state.boxes);
+  // Speaker Settings shows whatever record it was handed when the gear was
+  // clicked. Re-point it at this cycle's record for the same speaker, so a box
+  // that turned stock (STM removed, agent gone) or changed IP is shown as it
+  // is now, not as it was at click time.
+  if (state.settingsBox && state.settingsBox.deviceID) {
+    const freshSettings = state.boxes.find(b => b.deviceID === state.settingsBox.deviceID);
+    if (freshSettings) state.settingsBox = freshSettings;
+  }
+  if (state.currentBox && state.currentBox.deviceID) {
+    const fresh = state.boxes.find(b => b.deviceID === state.currentBox.deviceID);
+    // A selected speaker whose record turned stock cannot be controlled any
+    // more (STM was removed from it, or its agent is gone for good): treat it
+    // like a speaker that left the list. Transient stock sightings never reach
+    // here as stock (the cache promotes them), so this is a real change.
+    if (fresh && fresh.kind !== 'stock') {
+      const changed = fresh.host !== state.currentBox.host
+                   || fresh.port !== state.currentBox.port
+                   || fresh.version !== state.currentBox.version
+                   || fresh.friendlyName !== state.currentBox.friendlyName;
+      state.currentBox = fresh;
+      if (changed) {
+        // Same speaker (matched by deviceID), just a changed field: IP/port after
+        // a reconnect, version after an OTA, or a rename. Its presets are
+        // identical, so do NOT blank state.presets / the grid here, which flashed
+        // the grid empty on a routine re-discovery. loadPresets refreshes them in
+        // place (and now keeps them on a transient empty read).
+        state.searchResults = [];
+        state.nowLocation = '';
+        state.nowPlayState = '';
+        state.presetErrors = {};
+        $('searchResults').innerHTML = '';
+        loadPresets();
+        refreshStatus();
+        checkBoxUpdate();
+      }
+      refreshSourceButtons();
+    } else {
+      state.currentBox = null;
+      state.presets = [];
+      $('presets').innerHTML = '';
+    }
+  }
+  renderBoxSelect();
+  // Refresh the live multiroom zones so the music-tab group frames are current.
+  // Debounced (not a tight loop) and best-effort; repaints the selector on result.
+  refreshMusicZones();
+  // Mark which speakers are currently playing (small speaker icon on their tile).
+  refreshBoxPlaying();
+  updateSettingsTabBadge();
+  // The group count depends on the box list too (a stored permanent group is
+  // read off its master's record), so recount on every list refresh; the zone
+  // poll above recounts again once its round lands.
+  updateMultiroomTabBadge();
+  // localStorage is reliably restored by this first box refresh (see below), so
+  // paint the new-feature discovery dots here; a module-load call runs too early.
+  renderNavDots();
+  // Re-evaluate the Favorites entry on every box-list refresh. This is the first
+  // point after boot where localStorage is reliably restored in the WebView, so
+  // a favorites list saved in a previous session reliably brings the button back
+  // even if the one-shot init call ran before storage was ready (#Dieter).
+  updateFavModeBtn();
+  // Setup-tab target picker reuses the same state.boxes feed.
+  renderSetupTargetPicker();
+  // Per-speaker pin invite for stick installs: the USB stick provisions the
+  // speaker autonomously on power-cycle, so unlike the network/SSH install
+  // flows there is no in-app completion hook and celebrateProvision never
+  // fired - users saw no pin prompt after their first stick-installed speaker
+  // and only got the whole-set invite at the very end (2026-07-26). The
+  // discovery feed knows the moment instead: a box this session saw as stock
+  // reappearing as STM just got rescued.
+  maybeInviteStickProvisioned();
+  // Second world-map invite: once the user's whole supported SoundTouch set is
+  // running STM (no stock box left to convert), celebrate the milestone again.
+  maybeInviteWorldMapAllDone();
+  // Speakers left behind on an old agent: the single most common support
+  // theme (2026-07-27). Ask once per app start, right where the user works.
+  maybeShowSpeakerUpdateCard();
+  // Self-heal a mid-reboot misclassification (see updateStockReprobe).
+  updateStockReprobe();
+}
+
+// The speaker-update prompt. Users update the APP (the website tells them to)
+// and never learn that the speaker carries its own software: three independent
+// "my speaker switches itself off" reports on the same day all turned out to be
+// speakers left on an old agent, one of them proven by a screenshot showing app
+// v0.9.21 next to speaker v0.9.17. The existing cues were a blue dot on the
+// tile and a banner buried in Speaker Settings, and the screenshot proved both
+// are missable: dots read as decoration, and a user who never opens that tab
+// never sees the banner.
+//
+// So: ask ONCE PER APP START, in the music view where everyone works, naming
+// the affected speakers and offering one button that updates all of them. Not
+// a modal (that trains people to dismiss), not repeated within a session, and
+// it disappears by itself as soon as the speakers are current, because it is
+// driven purely by boxNeedsUpdate.
+let speakerUpdateCardShown = false;
+function maybeShowSpeakerUpdateCard() {
+  const el = $('speakerUpdateCard');
+  if (!el) return;
+  if (!state.appInfo || !state.appInfo.version) return;
+  // App first: while the app itself is out of date this card stays away, so
+  // the user is never shown two update prompts and left to guess the order.
+  if (speakerUpdateCardMuted()) { el.classList.add('hidden'); return; }
+  const outdated = (state.boxes || []).filter(b => b && b.kind !== 'stock' && !b.offline && boxNeedsUpdate(b));
+
+  // Nothing behind any more: TAKE THE CARD AWAY. This runs before the
+  // once-per-start latch on purpose. The latch used to short-circuit the whole
+  // function, so once the card had been shown there was no path that could ever
+  // hide it again: the user updated every speaker, the update finished, and the
+  // card still sat there asking them to do what they had just done (
+  // 2026-08-05, right after updating all four of his).
+  if (!outdated.length) { el.classList.add('hidden'); return; }
+
+  // Some are still behind. If the card is already up, refresh the list rather
+  // than leave a stale one naming speakers that are now current.
+  const visible = !el.classList.contains('hidden');
+  if (speakerUpdateCardShown && !visible) return; // asked once, they said later
+  speakerUpdateCardShown = true;
+
+  const list = outdated
+    .map(b => `<li>${escapeHtml(getBoxLabel(b))} <span class="suc-ver">${escapeHtml(b.version || '')}</span></li>`)
+    .join('');
+  const btnLabel = outdated.length > 1
+    ? t('speakerUpdate.btnAll', { n: outdated.length })
+    : t('speakerUpdate.btnOne');
+  el.innerHTML =
+    `<div class="suc-body">` +
+      `<div class="suc-title">${escapeHtml(t('speakerUpdate.title'))}</div>` +
+      `<div class="suc-text">${escapeHtml(t('speakerUpdate.text', { version: state.appInfo.version }))}</div>` +
+      `<ul class="suc-list">${list}</ul>` +
+      `<div class="suc-actions">` +
+        `<button class="btn btn-primary btn-mini" id="sucUpdate">${escapeHtml(btnLabel)}</button>` +
+        `<button class="btn btn-mini" id="sucLater">${escapeHtml(t('speakerUpdate.later'))}</button>` +
+      `</div>` +
+    `</div>`;
+  el.classList.remove('hidden');
+
+  const hide = () => el.classList.add('hidden');
+  const later = $('sucLater');
+  if (later) later.onclick = hide;
+  const go = $('sucUpdate');
+  if (go) {
+    go.onclick = async () => {
+      // Do NOT hide first. The card used to disappear on the click and only
+      // then start working; every path that then declined to start (an update
+      // already running, the speakers turning out to be current, a pre-flight
+      // the user cancelled) left the user staring at the tab they were on with
+      // the prompt gone for the rest of the session, because the
+      // once-per-start latch never brings it back. It hides when the update is
+      // actually under way, and stays put otherwise.
+      const label = go.textContent;
+      const restore = () => { go.disabled = false; go.textContent = label; };
+      // Re-resolve against the CURRENT box list. `outdated` is a snapshot from
+      // render time, and a discovery pass landing between render and click
+      // replaces every object in state.boxes: the stale copies can carry an
+      // address the speaker has already left. This is the "shortly after the
+      // app started, while the scan is still running" case.
+      const wanted = new Set(outdated.map(b => b.host));
+      const live = (state.boxes || []).filter(b => b && b.kind !== 'stock' && !b.offline && boxNeedsUpdate(b));
+      const targets = live.filter(b => wanted.has(b.host));
+      const pick = targets.length ? targets : live;
+      if (!pick.length) {
+        // Two different empties, and telling them apart matters. No speakers on
+        // the list at all means the sweep is mid-cycle or the LAN dropped them:
+        // keep the card up and say the speakers are not reachable. A populated
+        // list with nothing behind means they really are current, and the card
+        // has done its job.
+        const anyBox = (state.boxes || []).some(b => b && b.kind !== 'stock');
+        showToast(anyBox ? t('updateAll.noneToUpdate') : t('speakerUpdate.notReachable'));
+        if (anyBox) hide();
+        return;
+      }
+      go.disabled = true;
+      go.textContent = t('speakerUpdate.working');
+      try {
+        if (pick.length === 1) {
+          const box = pick[0];
+          // Point Speaker Settings AT THE SPEAKER BEING UPDATED before
+          // switching. doBoxUpdate only paints its progress while the user is
+          // looking at the target box, so landing on whichever speaker the
+          // settings tab happened to have selected ran the whole OTA with no
+          // visible sign of it at all: the exact "nothing happens" report.
+          state.settingsBox = box;
+          showToast(t('speakerUpdate.starting', { name: getBoxLabel(box) }));
+          switchView('settings');
+          hide();
+          await doBoxUpdate(box);
+        } else {
+          // updateAllBoxes probes every speaker (version, USB stick, Wi-Fi
+          // quality) before it can ask, which is seconds of silence on a busy
+          // LAN. It keeps its own "checking" toast up; the card stays on screen
+          // in its working state until that flow commits or backs out.
+          const started = await updateAllBoxes(hide);
+          if (!started) restore();
+          return;
+        }
+      } catch (e) { showError(e); restore(); return; }
+      restore();
+    };
+  }
+}
+
+// Stock self-heal: a speaker captured mid-reboot classifies as "stock" (its
+// Bose port answers before the STM agent is up) and, with no steady-state
+// auto-refresh, stayed labelled "ready for STM" until a manual refresh even
+// though the agent came back seconds later (live: an ST30 right after an OTA
+// reboot). While ANY listed box reads as stock, gently re-probe the known
+// addresses every 45s (direct probes only - no mDNS, no sweep); the cycle
+// that reaches the agent re-labels the tile and, once no stock box is left,
+// the timer stops. A genuinely stock speaker costs two tiny HTTP probes per
+// cycle, which is negligible next to the regular status polling.
+let _stockReprobeTimer = null;
+function updateStockReprobe() {
+  const anyStock = (state.boxes || []).some(b => b && b.kind === 'stock');
+  if (!anyStock) {
+    if (_stockReprobeTimer) { clearInterval(_stockReprobeTimer); _stockReprobeTimer = null; }
+    return;
+  }
+  if (_stockReprobeTimer) return;
+  _stockReprobeTimer = setInterval(async () => {
+    try {
+      const quick = await RefreshKnownBoxes();
+      if (quick && quick.length) applyBoxList(quick);
+    } catch { /* best-effort; next tick retries */ }
+  }, 45000);
+}
+
+// Recovery burst: after a network event (router restart, LAN<->Wi-Fi, band switch)
+// every speaker can come back on a new IP at once. Discovery then briefly returns
+// nothing, and with no steady-state auto-refresh the list would stay empty until
+// the user hits Refresh. When a cycle finds none but we had speakers, re-sweep
+// every 6 s (up to ~1 min) until they reappear; a cycle that finds any box stops it.
+let _recoveryInterval = null;
+let _recoveryTicks = 0;
+const RECOVERY_MAX_TICKS = 10;
+function updateRecoveryBurst(hadBoxesBefore, foundNow) {
+  if (foundNow > 0) {
+    if (_recoveryInterval) { clearInterval(_recoveryInterval); _recoveryInterval = null; }
+    _recoveryTicks = 0;
+    return;
+  }
+  if (_recoveryInterval) return; // a burst is already running; let it continue
+  if (!hadBoxesBefore) return;   // nothing was there to lose: don't sweep-spam an empty LAN
+  _recoveryTicks = 0;
+  _recoveryInterval = setInterval(() => {
+    if (_recoveryTicks++ >= RECOVERY_MAX_TICKS) {
+      clearInterval(_recoveryInterval); _recoveryInterval = null; _recoveryTicks = 0;
+      return;
+    }
+    discoverBoxes(); // re-sweeps; a successful cycle calls updateRecoveryBurst and clears this
+  }, 6000);
+}
+
+// Active-box health: how many consecutive status polls have failed, and when we
+// last kicked a rediscovery because of it. See refreshStatus's catch: a box that
+// goes unreachable for several polls has almost certainly changed IP under us.
+let _statusFailCount = 0;
+let _lastUnreachableRediscover = 0;
+
+let _autoRefreshTimer = null;
+function scheduleNextAutoRefresh() {
+  if (_autoRefreshTimer) clearTimeout(_autoRefreshTimer);
+  const now = Date.now();
+  const stillPending = Object.keys(state.pendingNames).some(
+    id => state.pendingNames[id].until > now
+  );
+  if (!stillPending) return; // everything already converged
+  _autoRefreshTimer = setTimeout(() => {
+    _autoRefreshTimer = null;
+    discoverBoxes();
+  }, 4000);
+}
+
+// applyPendingNames overrides the friendlyName from mDNS with our
+// locally stored value while the stick has not yet re-announced.
+// Entries expire at state.pendingNames[id].until.
+function applyPendingNames(list) {
+  const now = Date.now();
+  // Drop expired entries.
+  for (const id of Object.keys(state.pendingNames)) {
+    if (now > state.pendingNames[id].until) delete state.pendingNames[id];
+  }
+  // If the stick is already reporting the new name, clear the pending
+  // entry.
+  return list.map(b => {
+    const p = state.pendingNames[b.deviceID];
+    if (!p) return b;
+    if ((b.friendlyName || '') === p.name) {
+      delete state.pendingNames[b.deviceID];
+      return b;
+    }
+    return { ...b, friendlyName: p.name };
+  });
+}
+
+// refreshMusicZones fetches every STM speaker's live multiroom zone through
+// the shared groups.js poll (ONE implementation with the Multi-Room tab) so
+// the music-tab group frames are accurate, then repaints the selector.
+// Debounced to at most one fetch per 8s (NOT a tight loop); force=true skips
+// the debounce for the confirming fetch right after a group change, which
+// the debounce used to swallow, leaving the optimistic state unconfirmed.
+// Best-effort: a failed per-box poll keeps its last-good entry (groups.js).
+async function refreshMusicZones(force) {
+  const ran = await fetchZoneLive(state.boxes, { maxAgeMs: force ? 0 : 8000, minBoxes: 2 });
+  if (!ran) return;
+  renderBoxSelect();
+  renderGroupControl(); // keep the group chips + slider in sync with the live zones
+}
+
+// refreshBoxPlaying fetches every STM speaker's now-playing so the music-tab
+// selector can mark which speakers are currently playing (a small speaker icon
+// on their tile). Debounced to at most once per 8s, same cadence and best-effort
+// contract as refreshMusicZones. The currently-selected box is also marked live
+// from state.nowPlayState in the pill renderer, so its icon never lags the poll.
+let _boxPlayingFetchAt = 0;
+async function refreshBoxPlaying() {
+  // Offline tiles are excluded: every Status() against them just times out
+  // and would delay the whole Promise.allSettled round for nothing.
+  const stmBoxes = (state.boxes || []).filter(b => b && b.kind !== 'stock' && b.deviceID && b.host && !b.offline);
+  if (!stmBoxes.length) return;
+  const now = Date.now();
+  if (state.boxPlayingBusy || now - _boxPlayingFetchAt < 8000) return;
+  _boxPlayingFetchAt = now;
+  state.boxPlayingBusy = true;
+  try {
+    const results = await Promise.allSettled(stmBoxes.map(b => Status(b.host, b.port)));
+    const map = {};
+    results.forEach((r, i) => {
+      let playing = false;
+      if (r.status === 'fulfilled' && typeof r.value === 'string') {
+        const xml = r.value;
+        const ps = (xml.match(/playStatus>([^<]+)</) || [])[1] || '';
+        const src = (xml.match(/nowPlaying[^>]*source="([^"]*)"/) || [])[1] || '';
+        playing = (ps === 'PLAY_STATE' || ps === 'BUFFERING_STATE') && src !== 'STANDBY';
+      }
+      map[stmBoxes[i].deviceID] = playing;
+    });
+    state.boxPlaying = map;
+  } catch { /* keep previous marks */ } finally {
+    state.boxPlayingBusy = false;
+  }
+  renderBoxSelect();
+}
+
+// checkWedgeBanner shows the pull-the-plug hint when any STM speaker reports
+// the wedged-control state (transport accepted, never plays; only a
+// power-cycle clears it - see the agent's wedge detection). Global banner so
+// the hint is visible on every tab.
+function checkWedgeBanner() {
+  const el = $('boxWedgeBanner');
+  if (!el) return;
+  const wedged = (state.boxes || []).filter(b => b && b.boxHealth === 'wedged');
+  if (!wedged.length) { el.classList.add('hidden'); return; }
+  const names = wedged.map(b => getBoxLabel(b)).join(', ');
+  el.innerHTML = `<div class="app-update-text"><span class="app-update-icon" aria-hidden="true">&#9888;</span><span><b>${escapeHtml(t('speaker.wedgedTitle'))}</b> ${escapeHtml(t('speaker.wedgedBanner', { name: names }))}</span></div>`;
+  el.classList.remove('hidden');
+}
+
+// checkBoxIssueBanner is a heads-up when a speaker carries leftovers of a
+// rival cloud-free SoundTouch tool (they can fight STM) or has no STM Wi-Fi
+// backup saved. Global banner. Dismissible per box and warning type:
+// both are informational (a healthy speaker keeps playing either way), so the
+// user must be able to acknowledge them once instead of being nagged forever
+function warnDismissKey(box, type) {
+  return 'warnDismiss:' + (box.deviceId || box.host) + ':' + type;
+}
+function warnDismissed(box, type) {
+  try { return !!localStorage.getItem(warnDismissKey(box, type)); } catch { return false; }
+}
+function checkBoxIssueBanner() {
+  const el = $('boxIssueBanner');
+  if (!el) return;
+  const boxes = state.boxes || [];
+  const conflict = boxes.filter(b => b && b.conflictingMod && !warnDismissed(b, 'conflict'));
+  // A speaker asking a non-standard Bose cloud address. NOT dismissible
+  // and not folded into the conflict line: the marker files may be long gone
+  // (they do not survive a factory reset, this does) and nothing plays on such a
+  // speaker at all, so it is worth its own sentence naming the address.
+  const foreignCloud = boxes.filter(b => b && b.foreignCloudURL && !b.conflictingMod);
+  const noWifi = boxes.filter(b => b && b.wlanCredsMissing && !warnDismissed(b, 'nowifi'));
+  // A speaker refusing essentially every preset recall (Bose error 1036). This
+  // one is NOT dismissible: nothing the user presses will play until it clears,
+  // and the remedy people find on their own, pulling the plug, resets the box
+  // clock and poisons the next boot, while a soft restart clears it (
+  // Finding 4). Saying so at the moment it happens is the whole point.
+  // recallRefusal is the storm's quiet sibling (no 1036 ever fires, the box
+  // just drops its source for every recall); same remedy, same banner.
+  const storm = boxes.filter(b => b && (b.storm1036 || b.recallRefusal));
+  // A thumbs-key press the speaker refused. Not dismissible and worth its own
+  // line: the press produced NOTHING visible before this, so two owners spent
+  // days re-saving a group that was never the problem (2026-09-26). The
+  // speaker's own reason is shown verbatim rather than paraphrased.
+  const keyErr = boxes.filter(b => b && b.groupKeyError);
+  // A long press the speaker made and STM could not keep. Same shape as the
+  // key error: it happened, it was refused, and nothing visible said so, so
+  // the key appeared to snap back to the old station on its own.
+  const holdErr = boxes.filter(b => b && b.holdRefusedSource);
+  const msgs = [];
+  if (conflict.length) {
+    const names = conflict.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.conflictModBanner', { name: names, mod: conflict[0].conflictingMod })));
+  }
+  if (foreignCloud.length) {
+    const names = foreignCloud.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.foreignCloudBanner', {
+      name: names, url: foreignCloud[0].foreignCloudURL,
+    })));
+  }
+  if (noWifi.length) {
+    const names = noWifi.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.noWifiBanner', { name: names })));
+  }
+  if (storm.length) {
+    const names = storm.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.stormBanner', { name: names })));
+  }
+  if (keyErr.length) {
+    const names = keyErr.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.groupKeyErrorBanner', {
+      name: names, reason: keyErr[0].groupKeyError,
+    })));
+  }
+  if (holdErr.length) {
+    const names = holdErr.map(b => getBoxLabel(b)).join(', ');
+    msgs.push(escapeHtml(t('speaker.holdRefusedBanner', {
+      name: names, slot: holdErr[0].holdRefusedSlot || '?',
+    })));
+  }
+  if (!msgs.length) { el.classList.add('hidden'); return; }
+  // When a speaker has no saved Wi-Fi, give the user a direct way to act on it
+  // instead of just telling them to "set it up in the settings": the button
+  // jumps straight to that speaker's settings, where the Wi-Fi section is.
+  const wifiBtn = noWifi.length
+    ? `<button class="btn btn-mini" id="boxIssueWifiBtn">${escapeHtml(t('speaker.wifiSaveBtn'))}</button>`
+    : '';
+  // A conflicting-mod (AfterTouch) leftover is now removable in one click under
+  // the speaker's settings > Actions, so point the user there instead of leaving
+  // the banner as a dead end that suggested asking the other project / running an
+  // SSH command most users cannot act on.
+  const conflictBtn = conflict.length
+    ? `<button class="btn btn-mini" id="boxIssueConflictBtn">${escapeHtml(t('speaker.conflictRemoveBtn'))}</button>`
+    : '';
+  // The soft restart, offered right where the problem is stated. The speaker
+  // comes back in about a minute and the state is gone.
+  const stormBtn = storm.length
+    ? `<button class="btn btn-primary btn-mini" id="boxIssueStormBtn">${escapeHtml(t('speaker.stormRestartBtn'))}</button>`
+    : '';
+  // One press puts STM back on every hijacked speaker at once.
+  //
+  // The per-speaker Actions page cannot do this. Its repair rewrites the cloud
+  // address FILE, and a rival app that sets the address at runtime leaves that
+  // file untouched, so the repair healed nothing and said it had worked. The
+  // cure is a restart, because the firmware reads the file once at boot.
+  // Measured across five speakers on 2026-09-26 after the ST Remote Pro iOS app
+  // was started; one reboot each brought every one back stock and paired.
+  const cloudBtn = foreignCloud.length
+    ? `<button class="btn btn-primary btn-mini" id="boxIssueCloudBtn">${escapeHtml(t('speaker.cloudRestoreBtn', { n: foreignCloud.length }))}</button>`
+    : '';
+  el.innerHTML = `
+    <div class="app-update-text"><span class="app-update-icon" aria-hidden="true">&#9888;</span><span>${msgs.join('<br>')}</span></div>
+    ${cloudBtn}
+    ${stormBtn}
+    ${conflictBtn}
+    ${wifiBtn}
+    ${(conflict.length || noWifi.length) ? `<button class="btn btn-secondary btn-mini" id="boxIssueDismissBtn">${escapeHtml(t('speaker.issueDismiss'))}</button>` : ''}`;
+  const sb = $('boxIssueStormBtn');
+  if (sb) sb.onclick = async () => {
+    const box = storm[0];
+    sb.disabled = true;
+    showToast(t('speaker.stormRestarting', { name: getBoxLabel(box) }));
+    try {
+      await RebootBox(box.host, box.port);
+    } catch (e) {
+      showError(String(e));
+    } finally {
+      sb.disabled = false;
+    }
+  };
+  const cloudB = $('boxIssueCloudBtn');
+  if (cloudB) cloudB.onclick = () => runCloudRestore(foreignCloud, cloudB);
+  const wb = $('boxIssueWifiBtn');
+  if (wb) wb.onclick = () => { selectBox(noWifi[0]); switchView('settings'); };
+  const cb = $('boxIssueConflictBtn');
+  if (cb) cb.onclick = () => { selectBox(conflict[0]); switchView('settings'); };
+  const d = $('boxIssueDismissBtn');
+  if (d) d.onclick = () => {
+    const stamp = String(Date.now());
+    conflict.forEach(b => { try { localStorage.setItem(warnDismissKey(b, 'conflict'), stamp); } catch {} });
+    noWifi.forEach(b => { try { localStorage.setItem(warnDismissKey(b, 'nowifi'), stamp); } catch {} });
+    el.classList.add('hidden');
+  };
+  el.classList.remove('hidden');
+}
+
+// runCloudRestore puts STM back on every speaker a rival app has taken over.
+//
+// The confirmation carries the warning that matters more than the restart: as
+// long as the other app runs, it sets the address again, including right after
+// the speaker comes back. That is not a theory, it is what happened on
+// 2026-09-26: the hijack itself restarted all five speakers, and they came back
+// still pointing at the other service because the app was still open. Restart
+// them while it runs and the whole thing simply repeats.
+async function runCloudRestore(boxes, btn) {
+  if (!boxes || !boxes.length) return;
+  const names = boxes.map(b => getBoxLabel(b)).join(', ');
+  const ok = await confirmWarn(
+    t('speaker.cloudRestoreTitle'),
+    `<p>${escapeHtml(t('speaker.cloudRestoreBody', { name: names, n: boxes.length }))}</p>`
+    + `<p><b>${escapeHtml(t('speaker.cloudRestoreAppWarning'))}</b></p>`,
+  );
+  if (!ok) return;
+  btn.disabled = true;
+  // The progress line names the speaker being worked on. One at a time, so a
+  // fleet takes a few minutes and silence would read as a hang.
+  const off = EventsOn('cloudrestore:progress', (p) => {
+    if (!p) return;
+    showToast(t('speaker.cloudRestoreProgress', {
+      name: p.name || '', done: p.done || 0, total: p.total || boxes.length,
+    }));
+  });
+  try {
+    const results = await RestoreSTMCloud(boxes.map(b => ({
+      host: b.host, port: b.port, name: getBoxLabel(b),
+    })));
+    const done = (results || []).filter(r => r && r.restored);
+    const failed = (results || []).filter(r => r && !r.restored);
+    if (!failed.length) {
+      showToast(t('speaker.cloudRestoreDone', { n: done.length }));
+    } else {
+      // Name the speakers that are still wrong and why. A partial repair
+      // reported as success is the mistake this whole path exists to undo.
+      const detail = failed
+        .map(r => `${r.name || r.host}: ${r.error || r.stillForeign || '?'}`)
+        .join('; ');
+      showError(t('speaker.cloudRestorePartial', {
+        ok: done.length, bad: failed.length, detail,
+      }));
+    }
+    discoverBoxes();
+  } catch (e) {
+    showError(String(e));
+  } finally {
+    try { off(); } catch {}
+    btn.disabled = false;
+  }
+}
+
+// manualIpInputBusy reports whether a manual connect-by-IP input is in use
+// (focused or holding text). While one is, the speaker area must not be
+// re-rendered: the recovery burst repaints every ~6s and a rebuild wiped the
+// user's half-typed address and their focus. Both the empty state's field and
+// the one behind the "add by IP" tile count.
+function manualIpInputBusy() {
+  return ['emptyIpInput', 'listIpInput'].some(id => {
+    const el = document.getElementById(id);
+    if (!el) return false;
+    return document.activeElement === el || !!(el.value || '').trim();
+  });
+}
+
+// wireManualIp connects one connect-by-IP input/button pair. Shared by the
+// empty state and by the "add by IP" tile that sits at the end of a populated
+// speaker list: on a routed network, discovery finds ONE speaker and the empty
+// state disappears, which used to leave no way at all to add the second and
+// third by address.
+function wireManualIp(inputId, btnId) {
+  const ipInput = document.getElementById(inputId);
+  const addIp = document.getElementById(btnId);
+  if (!ipInput || !addIp) return;
+  const tryAddIp = async () => {
+    const ip = (ipInput.value || '').trim();
+    if (!ip) { ipInput.focus(); return; }
+    addIp.disabled = true;
+    showToast(t('speaker.manualIpSearching', { ip }));
+    try {
+      await AddBoxByIP(ip);
+      ipInput.value = ''; // so the next address can be typed straight away
+      await discoverBoxes(); // RefreshKnownBoxes now includes the cached box
+    } catch (e) {
+      showError(t('speaker.manualIpNotFound', { ip }));
+    } finally {
+      addIp.disabled = false;
+    }
+  };
+  addIp.onclick = tryAddIp;
+  ipInput.onkeydown = (e) => { if (e.key === 'Enter') tryAddIp(); };
+}
+
+// offlineAgo renders "how long unseen" for an offline speaker tile via
+// Intl.RelativeTimeFormat in the app locale, so the phrase localizes itself
+// ("vor 5 Minuten" / "5 minutes ago") without per-language time strings.
+function offlineAgo(sec) {
+  try {
+    const rtf = new Intl.RelativeTimeFormat(getLocale() || 'en', { numeric: 'auto' });
+    if (sec < 3600) return rtf.format(-Math.max(1, Math.round(sec / 60)), 'minute');
+    if (sec < 86400) return rtf.format(-Math.round(sec / 3600), 'hour');
+    return rtf.format(-Math.round(sec / 86400), 'day');
+  } catch { return Math.max(1, Math.round(sec / 60)) + ' min'; }
+}
+function offlineTitle(b) {
+  return t('speaker.offlineTooltip', { ago: offlineAgo(b.offlineSinceSec || 0) });
+}
+
+// dissolveGroupFrame takes apart the group led by masterKey, from the x on its
+// frame in the speaker picker. Same call the Multi-Room tab's x makes (the
+// DELETE goes to the master and clears its stored group), then the reachable
+// ex-followers are stopped so nothing keeps playing the group's stream alone.
+async function dissolveGroupFrame(masterKey) {
+  const mk = String(masterKey || '').toUpperCase();
+  // The same resolver the frame's label uses. A plain deviceID lookup missed
+  // whenever the app's record carries a different identity than the speaker's
+  // own answer, and this handler then returned without a word: the x was drawn
+  // and pressing it did nothing at all.
+  const masterBox = masterBoxForKey(mk, state.zoneLive, state.boxes);
+  if (!masterBox) {
+    showToast(t('multiroom.dissolveIncomplete'));
+    return;
+  }
+  const followers = state.boxes.filter(b => b !== masterBox && b.kind !== 'stock' && !b.offline &&
+    String(((state.zoneLive || {})[b.deviceID] || {}).master || '').toUpperCase() === mk);
+  try {
+    // Trust the speaker's verdict, the same way views/multiroom.js already
+    // does. A green tick on a group that is still playing is worse than no
+    // message at all: it sends the user round the loop again, which is exactly
+    // what nine refused dissolves in a row looked like from the outside
+    // (Juergen, eleven speakers, 2026-09-14).
+    const res = await DissolveZone(masterBox.host, masterBox.port);
+    if (res && res.ok === false) {
+      // The group is still there, so the optimistic empty zone must NOT be
+      // applied: painting it empty is what made the frame vanish and come back.
+      showToast(dissolveIncompleteMessage(res));
+    } else {
+      await Promise.allSettled(followers.map(b => Stop(b.host, b.port)));
+      state.zoneLive = applyOptimisticZone(state.zoneLive, masterBox, []);
+      notifyZoneLive();
+      showToast(t(res && res.nothing ? 'multiroom.nothingToUngroup' : 'group.dissolvedToast'));
+    }
+  } catch (e) {
+    showToast(t('multiroom.formFailed', { err: String((e && e.message) || e || '') }));
+  }
+  renderBoxSelect();
+  renderGroupControl();
+  setTimeout(() => refreshMusicZones(true), 1200);
+}
+
+function renderBoxSelect() {
+  const sel = $('boxSelect');
+  if (state.boxes.length === 0) {
+    // The empty state is static markup; while the manual-IP field is in use
+    // an identical rebuild would only destroy the input, so keep the DOM.
+    if (manualIpInputBusy()) return;
+    sel.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-state-title">${escapeHtml(t('speaker.emptyTitle'))}</div>
+        <div class="empty-state-text">
+          ${escapeHtml(t('speaker.emptyHelp1'))}
+          <br><br>
+          ${escapeHtml(t('speaker.emptyHelp2'))}
+        </div>
+        <div class="empty-state-buttons">
+          <button class="btn btn-mini" id="emptyRetry">${escapeHtml(t('speaker.retry'))}</button>
+          <button class="btn btn-primary btn-mini" id="emptyGoSetup">${escapeHtml(t('speaker.goSetup'))}</button>
+        </div>
+        <div class="manual-ip">
+          <div class="empty-state-text">${escapeHtml(t('speaker.manualIpHelp'))}</div>
+          <div class="manual-ip-row">
+            <input type="text" id="emptyIpInput" class="manual-ip-input" placeholder="${escapeAttr(t('speaker.manualIpPlaceholder'))}" inputmode="decimal" autocomplete="off" spellcheck="false">
+            <button class="btn btn-mini" id="emptyAddIpBtn">${escapeHtml(t('speaker.manualIpButton'))}</button>
+          </div>
+        </div>
+      </div>`;
+    const go = document.getElementById('emptyGoSetup');
+    if (go) go.onclick = () => switchView('setup');
+    const rt = document.getElementById('emptyRetry');
+    if (rt) rt.onclick = async () => {
+      const label = rt.innerHTML;
+      rt.disabled = true;
+      rt.setAttribute('aria-busy', 'true');
+      rt.innerHTML = `<span class="btn-spinner" aria-hidden="true"></span>${escapeHtml(t('speaker.searching'))}`;
+      // Held for a moment even when the sweep answers at once, so the press
+      // visibly registers instead of flickering.
+      const minShown = new Promise(r => setTimeout(r, 700));
+      try { await Promise.all([discoverBoxes(), minShown]); } finally {
+        if (rt.isConnected) {
+          rt.disabled = false;
+          rt.removeAttribute('aria-busy');
+          rt.innerHTML = label;
+        }
+      }
+    };
+    // Manual connect-by-IP: the fallback when discovery is blocked by the
+    // network (AP isolation, a different subnet, a VPN, or a security suite).
+    wireManualIp('emptyIpInput', 'emptyAddIpBtn');
+    updateBoxUiVisibility();
+  checkWedgeBanner();
+  checkBoxIssueBanner();
+    return;
+  }
+  // Cluster speakers that share a live multiroom zone into a colored frame
+  // (display only; grouping is done in the Multi-Room tab). Defensive: with no
+  // live group of >=2 discovered speakers the selector renders exactly as before.
+  const zlMap = state.zoneLive || {};
+  // Box-shaped wrapper around the shared groups.js helper (stock boxes are
+  // never zone members, whatever their deviceID collides with).
+  // A stereo pair is not a multiroom zone, and the speakers report it
+  // separately, so the picker used to show the two halves as two unrelated
+  // speakers. That is misleading twice over: they play as one, and pressing a
+  // preset on the pair is refused by the firmware with nothing on screen
+  // explaining why. Framing them like a group says what is going on.
+  const livePairs = stereoPairsOf(zlMap);
+  // Balance is read once when the selected speaker changes, never on the status
+  // poll (the speaker hangs on that endpoint while it is asleep). Pairing and
+  // unpairing happen without changing the selection, so without this the value
+  // would stay stale, or stay hidden for a pair formed after the speaker was
+  // picked. Keyed over ALL pairs, so a second pair forming after a speaker was
+  // selected still re-reads once; an unchanged set re-reads nothing.
+  const pairStamp = livePairs.map(p => `${p.id}|${p.master}`).sort().join(',');
+  if (pairStamp !== state.lastBalancePair) {
+    state.lastBalancePair = pairStamp;
+    setTimeout(() => { refreshBalance().catch(() => {}); }, 0);
+  }
+  // Every live pair frames under its own key (its master box's discovered
+  // deviceID). pairHostToKey routes any paired box to its frame; pairByKey
+  // gives the frame its pair, so each pair shows its OWN stored name. Matched on
+  // host, not deviceID: a two-chip chassis announces a different id over
+  // discovery than the one the firmware puts in the pair.
+  const pairHostToKey = new Map();
+  const pairByKey = new Map();
+  for (const p of livePairs) {
+    const boxes = pairMemberBoxes(p, state.boxes).map(x => x.box).filter(Boolean);
+    const masterBox = boxes.find(b =>
+      String(b.deviceID || '').toUpperCase() === String(p.master || '').toUpperCase()) || boxes[0] || null;
+    const key = masterBox ? String(masterBox.deviceID || '').toUpperCase() : '';
+    if (!key) continue;
+    pairByKey.set(key, p);
+    for (const b of boxes) pairHostToKey.set(b.host, key);
+  }
+  const masterOf = (b) => {
+    if (b.kind === 'stock') return '';
+    const z = zoneMasterOf(b.deviceID, zlMap);
+    if (z) return z;
+    const k = pairHostToKey.get(b.host);
+    if (k) return k;
+    return '';
+  };
+  const memberCount = {};
+  state.boxes.forEach(b => { const m = masterOf(b); if (m) memberCount[m] = (memberCount[m] || 0) + 1; });
+  // Which discovered box leads a given master key. NOT a plain deviceID
+  // lookup: the key comes from the speakers' own zone documents, so it names
+  // the master by the identity the SPEAKER answers with, while the box record
+  // here carries whatever the app resolved for it, and those two can be
+  // different values for the same speaker (field bundle 2026-09-07: three
+  // single-chip SoundTouch 10s where the box's own /info id WAS the zone master
+  // and the app's record held the other MAC). The lookup then found nobody, so
+  // the frame had no name and no x and no chip was starred. masterBoxForKey
+  // asks by address and by group shape as well, and answers null rather than
+  // guessing. Resolved once per key, because every pill asks again.
+  const masterBoxCache = new Map();
+  const masterBoxOfKey = (m) => {
+    if (!masterBoxCache.has(m)) masterBoxCache.set(m, masterBoxForKey(m, zlMap, state.boxes));
+    return masterBoxCache.get(m);
+  };
+  // A box is a framed master only when its group actually renders a frame, i.e.
+  // >=2 of its members are discovered here. This keeps the master star and the
+  // frame in lock-step (never a lone star on an unframed pill). Compared by
+  // HOST for the same reason: the id is the field that can disagree.
+  const isFramedMaster = (b) => {
+    const m = masterOf(b);
+    if (!m || memberCount[m] < 2) return false;
+    const resolved = masterBoxOfKey(m);
+    return !!resolved && resolved.host === b.host;
+  };
+  const pill = (b) => {
+    const isStock = b.kind === 'stock';
+    // Sticky offline tiles (2026-07-26): a speaker once sighted stays listed
+    // when scans miss it (reboot, plug pulled), clearly greyed out with a
+    // disconnect mark and a "last seen ..." tooltip, until it answers again.
+    const off = !!b.offline;
+    const offCls = off ? ' offline' : '';
+    const offTitle = off ? offlineTitle(b) : '';
+    const offAttr = off ? ` data-offline="1" title="${escapeAttr(offTitle)}"` : '';
+    const offMark = off
+      ? `<span class="box-offline-mark" aria-label="${escapeAttr(offTitle)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="12" height="12" aria-hidden="true"><line x1="1" y1="1" x2="23" y2="23"></line><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"></path><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"></path><path d="M10.71 5.05A16 16 0 0 1 22.58 9"></path><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"></path><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line></svg></span>`
+      : '';
+    // The main speaker of a group is named as such, not only starred: a lone
+    // star did not read as "this one leads".
+    const groupMark = isFramedMaster(b)
+      ? `<span class="box-group-master" title="${escapeAttr(t('multiroom.groupMasterTitle'))}">&#9733; ${escapeHtml(t('multiroom.mainBadge'))}</span>`
+      : '';
+    const active = state.currentBox && state.currentBox.host === b.host && !isStock ? ' active' : '';
+    const stockCls = isStock ? ' stock' : '';
+    const label = getBoxLabel(b);
+    // Model (e.g. "SoundTouch 10") right next to the name so users
+    // with several speakers can tell ST10 from ST20 at a glance.
+    // Fall back gracefully when an older agent only advertises the
+    // generic "SoundTouch".
+    const model = b.model && b.model !== 'SoundTouch'
+      ? `<span class="box-model" title="${escapeAttr(t('speaker.modelTitle'))}">${escapeHtml(b.model)}</span>`
+      : '';
+    if (isStock) {
+      // Every stock Bose speaker STM discovers is an install candidate: a box
+      // reachable by IP installs over the network (stick-free), so we invite the
+      // install for any model rather than blocking one. Soundbars / adapters
+      // install too; their missing hardware preset buttons are noted in Setup.
+      //
+      // A box STM once ran on whose agent went silent for good while the stock
+      // firmware still answers (uninstalled, NAND wiped, agent crashed) is a
+      // stock box too, but says so: a grey "STM not running" instead of the
+      // first-time "Ready for STM", so the owner knows this is a repair, not
+      // a speaker that never had STM (2026-09-06 report: the card kept the
+      // old version badge on a speaker STM had just been removed from).
+      const gone = !!b.stmNotRunning;
+      const badge = `<span class="box-stock-badge${gone ? ' box-stock-badge-gone' : ''}">${escapeHtml(t(gone ? 'speaker.stmNotRunningBadge' : 'speaker.needsInstallBadge'))}</span>`;
+      const stockTitle = off ? offTitle : t(gone ? 'speaker.stmNotRunningTooltip' : 'speaker.stockTooltip');
+      return `<span class="box-btn${stockCls}${offCls}" data-host="${b.host}" data-port="${b.port}" data-stock="1"${off ? ' data-offline="1"' : ''} role="button" tabindex="0" title="${escapeAttr(stockTitle)}">${offMark}${escapeHtml(label)}${model} <small>${b.host}</small>${badge}</span>`;
+    }
+    // An offline tile keeps showing the last CONFIRMED self-report, marked
+    // stale: a fresh-looking version on an unreachable box is how the
+    // falsified v-numbers stayed believable for twenty minutes.
+    const ver = b.version ? `<span class="box-ver${b.offline ? ' box-ver-stale' : ''}" title="${escapeAttr(t(b.offline ? 'speaker.staleVersionTitle' : 'speaker.stickVersionTitle'))}">${escapeHtml(b.version)}</span>` : '';
+    // Red dot when this speaker's agent is older than the app's embedded
+    // one: a glanceable "update available" cue right on the speaker button
+    // itself, in addition to the settings-tab badge and the music-tab
+    // banner.
+    const showUpd = boxNeedsUpdate(b);
+    const updCls = showUpd ? ' needs-update' : '';
+    // A WORD, not a dot: the blue dot that used to sit here reads as decoration
+    // to non-technical users. A screenshot from a user whose speaker had been
+    // three versions behind for days showed the dot in plain sight, twice, while
+    // he was writing to ask why his speaker kept switching itself off
+    // (2026-07-27). The tooltip spells out both versions.
+    const updDot = showUpd
+      ? `<span class="box-update-chip" role="button" tabindex="0" data-host="${b.host}" data-port="${b.port}" title="${escapeAttr(t('speaker.updateChipTitle', { box: b.version || '?', app: (state.appInfo && state.appInfo.version) || '?' }))}">${escapeHtml(t('speaker.updateChip'))}</span>`
+      : '';
+    // Small speaker icon on a tile whose speaker is currently playing, so the
+    // playing speaker is obvious among several. The selected box is marked live
+    // from nowPlayState (no poll lag); the others from the refreshBoxPlaying poll.
+    const isCurrent = state.currentBox && state.currentBox.host === b.host;
+    const playingNow = (state.boxPlaying && state.boxPlaying[b.deviceID])
+      || (isCurrent && (state.nowPlayState === 'PLAY_STATE' || state.nowPlayState === 'BUFFERING_STATE'));
+    const playMark = playingNow
+      ? `<span class="box-playing" title="${escapeAttr(t('speaker.playingNow'))}" aria-label="${escapeAttr(t('speaker.playingNow'))}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="13" height="13" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a7 7 0 0 1 0 14.14"></path></svg></span>`
+      : '';
+    return `<span class="box-btn${active}${updCls}${playingNow ? ' playing-now' : ''}${offCls}" data-host="${b.host}" data-port="${b.port}"${offAttr} role="button" tabindex="0">${groupMark}${offMark}${playMark}${escapeHtml(label)}${model} <small>${b.host}</small>${ver}${updDot}<span class="box-edit" data-host="${b.host}" data-port="${b.port}" title="${escapeAttr(t('speaker.editTitle'))}">&#9881;</span></span>`;
+  };
+  // "Add by IP" tile, always available once at least one speaker is listed.
+  // On a routed network mDNS and the local /24 scan find only the speakers on
+  // this subnet, and the empty state's address field is gone the moment the
+  // first one shows up, so there was no path left to add the others.
+  // Collapsed to a bare plus until clicked, so it stays out of the way for
+  // everyone whose speakers are simply found: this is a rescue path for a
+  // network that hides them, not something most people ever need. It carries
+  // its name as the accessible label and its explanation as the tooltip, so
+  // nothing is lost by dropping the words next to the symbol.
+  const addIpTile = () => `
+    <span class="box-btn box-add-ip" id="addIpTile" role="button" tabindex="0" aria-label="${escapeAttr(t('speaker.addByIp'))}" title="${escapeAttr(t('speaker.manualIpHelp'))}">+</span>
+    <span class="manual-ip-row box-add-ip-row hidden" id="addIpRow">
+      <input type="text" id="listIpInput" class="manual-ip-input" placeholder="${escapeAttr(t('speaker.manualIpPlaceholder'))}" inputmode="decimal" autocomplete="off" spellcheck="false">
+      <button class="btn btn-mini" id="listAddIpBtn">${escapeHtml(t('speaker.manualIpButton'))}</button>
+    </span>`;
+  const groups = Object.keys(memberCount).filter(m => memberCount[m] >= 2).sort();
+  if (groups.length === 0) {
+    sel.innerHTML = state.boxes.map(pill).join('') + addIpTile();
+  } else {
+    // Key the frame colour to the GROUP, not to its position in the list. With
+    // (i % 4) + 1 a zone changed colour whenever another zone lost a member and
+    // dropped out of the list, which is the one thing an identity colour must
+    // not do.
+    //
+    // The hash is only a PREFERENCE, though. Taken raw it collides: with four
+    // slots and four zones two of them share a colour more often than not, and
+    // the old positional scheme at least guaranteed four distinct colours for
+    // four groups. So hash first, then linear-probe into the next free slot, so
+    // a zone keeps its colour across refreshes AND simultaneous zones stay
+    // distinguishable up to the four the palette holds.
+    const colorOf = {};
+    const taken = new Set();
+    for (const m of groups) {
+      let h = 0;
+      for (let i = 0; i < m.length; i++) h = (h * 31 + m.charCodeAt(i)) >>> 0;
+      let slot = h % 4;
+      for (let k = 0; k < 4 && taken.has(slot); k++) slot = (slot + 1) % 4;
+      taken.add(slot);
+      colorOf[m] = slot + 1;
+    }
+    let html = '';
+    for (const m of groups) {
+      const members = state.boxes.filter(b => masterOf(b) === m);
+      // master first inside the frame
+      members.sort((a, b) => (((b.deviceID || '').toUpperCase() === m ? 1 : 0) - ((a.deviceID || '').toUpperCase() === m ? 1 : 0)));
+      // Name the group after its master speaker so it is obvious which zone the
+      // frame is (the master leads the multiroom group). Through the same
+      // resolver the star uses, so a frame can never be left nameless and
+      // without its x by a key the box record does not carry (see
+      // masterBoxOfKey).
+      const masterBox = masterBoxOfKey(m);
+      const groupName = masterBox ? getBoxLabel(masterBox) : '';
+      // A stereo pair gets its own wording and its own mark. Reusing the
+      // multiroom label would call two speakers acting as one channel pair a
+      // "group led by X", which is not what it is.
+      const framePair = pairByKey.get(m) || null;
+      const isPair = !!framePair;
+      const pairIcon = STEREO_ICON;
+      const zoneIcon = GROUP_ICON;
+      // A permanent group says so on its frame: it comes back by itself when
+      // the main speaker plays, a temporary one ends with the next standby.
+      // The main speaker's own zone answer carries the flag.
+      const permanent = !isPair && masterBox && !!(((state.zoneLive || {})[masterBox.deviceID] || {}).permanent);
+      const permBadge = permanent
+        ? ` <span class="box-group-perm" title="${escapeAttr(t('speaker.permanentTitle'))}">&#128257; ${escapeHtml(t('speaker.permanentBadge'))}</span>`
+        : '';
+      const groupLabel = groupName
+        ? `<span class="box-group-label" title="${escapeAttr(isPair ? t('speaker.stereoPairTitle') : t('speaker.groupLabelTitle', { name: groupName }))}">${isPair ? pairIcon : zoneIcon} ${escapeHtml(isPair ? (pairDisplayName(framePair, renderBoxSelect) || t('multiroom.stereoHeading')) : groupName)}${permBadge}</span>`
+        : '';
+      // The same x the Multi-Room tab has: take THIS group apart from where it
+      // is shown. It was only on the other tab. A stereo
+      // pair keeps its undo on the Multi-Room tab, where both halves are named.
+      const xBtn = (!isPair && masterBox)
+        ? `<button class="box-group-x" data-dissolve="${escapeAttr(m)}" title="${escapeAttr(t('multiroom.dissolveGroupTip'))}" aria-label="${escapeAttr(t('multiroom.dissolveGroupTip'))}">&times;</button>`
+        : '';
+      html += `<div class="box-group box-group-c${colorOf[m]}${xBtn ? ' has-x' : ''}">${xBtn}${groupLabel}${members.map(pill).join('')}</div>`;
+    }
+    html += state.boxes.filter(b => { const mm = masterOf(b); return !(mm && memberCount[mm] >= 2); }).map(pill).join('');
+    sel.innerHTML = html + addIpTile();
+    sel.querySelectorAll('.box-group-x').forEach(x => {
+      x.onclick = (e) => { e.stopPropagation(); dissolveGroupFrame(x.dataset.dissolve); };
+    });
+  }
+  const ipTile = document.getElementById('addIpTile');
+  const ipRow = document.getElementById('addIpRow');
+  if (ipTile && ipRow) {
+    const openIpRow = () => {
+      ipTile.classList.add('hidden');
+      ipRow.classList.remove('hidden');
+      const inp = document.getElementById('listIpInput');
+      if (inp) inp.focus();
+    };
+    ipTile.onclick = openIpRow;
+    ipTile.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openIpRow(); } };
+  }
+  wireManualIp('listIpInput', 'listAddIpBtn');
+  sel.querySelectorAll('.box-btn').forEach(btn => {
+    // The "add by IP" tile shares the .box-btn look but is not a speaker.
+    // Without this it got the speaker handler assigned over its own, and
+    // since it carries no host the handler found nothing and returned in
+    // silence: the tile simply did not react to a click (live 2026-07-29).
+    if (btn.classList.contains('box-add-ip')) return;
+    btn.onclick = async (e) => {
+      // A click on the gear icon opens the settings view rather than
+      // selecting the speaker.
+      if (e.target.closest('.box-edit') || e.target.closest('.box-update-chip')) return;
+      // An offline tile cannot be selected (every call would fail); clicking
+      // it explains itself and kicks off a fresh discovery, which is also the
+      // fastest way to bring a returned speaker back to life in the list.
+      if (btn.dataset.offline) {
+        showToast(btn.title || t('speaker.offlineTooltip', { ago: '' }));
+        discoverBoxes();
+        return;
+      }
+      const host = btn.dataset.host;
+      const port = parseInt(btn.dataset.port, 10);
+      const box = state.boxes.find(b => b.host === host && b.port === port);
+      if (!box) return;
+      if (box.kind === 'stock') {
+        // Any stock Bose speaker is the happy path now: reachable boxes install
+        // over the network (stick-free), so we invite every model into Setup with
+        // a positive CTA instead of blocking soundbars / adapters. Setup notes the
+        // hardware-preset-button caveat for 'limited' models.
+        const label = getBoxLabel(box);
+        const ok = await confirmWarn(
+          t('speaker.stockConfirmTitle'),
+          t(box.stmNotRunning ? 'speaker.stmNotRunningConfirmBody' : 'speaker.stockConfirmBody', { label: escapeHtml(label) }),
+          { icon: null, confirmLabel: t('speaker.stockConfirmCta'), confirmClass: 'btn btn-primary' },
+        );
+        // Pin the clicked box as the setup target so Setup opens on the
+        // network-install hero for THIS speaker (not an arbitrary one on a
+        // multi-box LAN). The install starts from the hero button, not here.
+        if (ok) { state.setupTarget = { kind: 'stock', box }; switchView('setup'); }
+        return;
+      }
+      selectBox(box);
+    };
+  });
+  // Gear click: set settingsBox and switch the tab.
+  // The "Update" chip TAKES YOU THERE, it does not start the update. It used
+  // to fire the update on the spot, from a tab where nothing about updating is
+  // shown: one click on a small word next to a speaker name and the speaker
+  // restarts. Updating a speaker takes minutes and reboots it, so it should be
+  // a decision made on the page that explains it, not a side effect of a click
+  // meant to find out what the chip even means.
+  sel.querySelectorAll('.box-update-chip').forEach(chip => {
+    const open = (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const host = chip.dataset.host;
+      const port = parseInt(chip.dataset.port, 10);
+      const box = (state.boxes || []).find(b => b.host === host && b.port === port);
+      if (!box) return;
+      state.settingsBox = box;
+      switchView('settings');
+    };
+    chip.onclick = open;
+    chip.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') open(e); };
+  });
+  sel.querySelectorAll('.box-edit').forEach(icon => {
+    icon.onclick = (e) => {
+      e.stopPropagation();
+      const host = icon.dataset.host;
+      const port = parseInt(icon.dataset.port, 10);
+      const box = state.boxes.find(b => b.host === host && b.port === port);
+      if (!box) return;
+      state.settingsBox = box;
+      switchView('settings');
+    };
+  });
+  if (!state.currentBox) {
+    // Auto-select only STM speakers. Stock speakers cannot be
+    // controlled and would put the music tab into a permanent
+    // "loading" state.
+    const stmBoxes = state.boxes.filter(b => b.kind !== 'stock');
+    const lastID = loadLastBox();
+    let target = lastID ? stmBoxes.find(b => b.deviceID === lastID) : null;
+    if (!target && stmBoxes.length === 1) target = stmBoxes[0];
+    if (target) selectBox(target);
+  }
+  updateBoxUiVisibility();
+  checkWedgeBanner();
+  checkBoxIssueBanner();
+}
+
+// speakerPickedInTab keeps the tabs in lock-step in the other direction: a
+// speaker picked in Settings or Setup becomes the music tab's active box too.
+// Stock boxes cannot be driven from the music tab, so they only preselect the
+// Settings/Setup pickers and leave the music selection alone.
+function speakerPickedInTab(box) {
+  if (!box) return;
+  state.settingsBox = box;
+  state.setupTarget = { kind: box.kind === 'stock' ? 'stock' : 'str', box };
+  if (box.kind !== 'stock' && (!state.currentBox || state.currentBox.host !== box.host)) {
+    selectBox(box);
+  }
+}
+
+function selectBox(box) {
+  // Clear the cached now-playing line when actually switching to a different
+  // speaker, so the status bar does not show the previous box's track until the
+  // first poll for the new box lands. Re-selecting the same box must not
+  // blank it on every call.
+  const switched = !state.currentBox || state.currentBox.host !== (box && box.host);
+  state.currentBox = box;
+  // Stereo balance is per-speaker and only exists on the master of a pair, so
+  // it is re-read whenever the selected speaker changes. Not on the status
+  // poll: the speaker does not answer this one while it is asleep.
+  setTimeout(() => { refreshBalance().catch(() => {}); }, 0);
+  if (box && box.deviceID) saveLastBox(box.deviceID);
+  // Tab-selection lock-step: the speaker picked here is preselected in the
+  // Settings and Setup tabs too (their pickers re-render on every tab entry),
+  // so switching tabs never lands on a different speaker than the one the
+  // user was just controlling.
+  if (box) {
+    state.settingsBox = box;
+    state.setupTarget = { kind: box.kind === 'stock' ? 'stock' : 'str', box };
+  }
+  state.presetErrors = {};
+  if (switched) { resetNowPlaying(); renderNowPlayingBar(); }
+  renderBoxSelect();
+  loadPresets();
+  refreshStatus();
+  checkBoxUpdate();
+  loadTaxonomy();
+  // Pull the current volume so the music-tab slider does not start
+  // at 0 — otherwise the first touch yanks it to whatever value the
+  // slider was last left at. The tab-switch path in switchView()
+  // also calls this, but a tab switch is not always involved (the
+  // box-select buttons can fire without leaving the music view).
+  loadMusicTabVolume();
+  // Fetch the stick's region and use it as a default for radio search.
+  // Do not overwrite a country the user has already picked manually.
+  loadStickRegion();
+  // Draw the input buttons this speaker actually has. A soundbar's TV and HDMI
+  // sockets only appear once the speaker has listed them.
+  refreshSourceButtons();
+}
+
+// refreshSourceButtons draws one button per input the selected speaker reports,
+// and is run after every selectBox() AND after every discovery refresh so the
+// row tracks model detection that lands later (Bose stock /info enrichment).
+//
+// Two layers. The speaker's own source list is the answer, and until it arrives
+// the row holds the classic AUX plus Bluetooth pair, minus what the model name
+// rules out. The list then replaces them, which is what brings a soundbar's TV,
+// CBL-Sat, BD-DVD and Game sockets in, splits an SA-5's three
+// line inputs, and still catches the ST20 variants that ship without
+// Bluetooth and used to answer a BT /select with 1005 UNKNOWN_SOURCE_ERROR
+// The row is rebuilt on every box switch, so a button hidden after a
+// 1005 rejection on one speaker comes back on a speaker that has the input
+// (it stayed hidden for every box until an app restart).
+//
+// sourceListCache remembers each speaker's list. The startup pair is drawn
+// first on every refresh, and for a speaker whose list had already dropped a
+// button that made the button blink in and out every minute (
+// 2026-09-06), so a list already read wins from the first frame.
+const sourceListCache = new Map();
+async function refreshSourceButtons() {
+  const row = $('sourceInputs');
+  if (!row || !state.currentBox) return;
+  const box = state.currentBox;
+  renderSourceButtons(inputButtons(sourceListCache.get(box.host), box.model || ''), box.host);
+  try {
+    const settings = await BoxSettings(box.host, box.port);
+    // Guard against a box switch while the request was in flight.
+    if (state.currentBox !== box) return;
+    const sources = (settings && settings.sources) || [];
+    // Only trust a non-empty list. An empty one means the speaker did not
+    // answer /sources, and the startup pair is the better guess than no inputs
+    // at all on a box that has them.
+    if (Array.isArray(sources) && sources.length) {
+      sourceListCache.set(box.host, sources);
+      renderSourceButtons(inputButtons(sources, box.model || ''), box.host);
+    }
+  } catch {
+    // Keep what is on screen on any error.
+  }
+}
+
+// The Bluetooth glyph, so that input keeps the icon it has always had in this
+// row while every other input is drawn from the name the speaker gives it.
+const BLUETOOTH_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="16" height="16" aria-hidden="true"><polyline points="6.5 6.5 17.5 17.5 12 23 12 1 17.5 6.5 6.5 17.5"></polyline></svg>';
+
+let sourceRowDrawn = '';
+
+function renderSourceButtons(buttons, host) {
+  const row = $('sourceInputs');
+  if (!row) return;
+  const key = sourceRowKey(host, buttons);
+  if (key === sourceRowDrawn) {
+    highlightActiveSource();
+    return;
+  }
+  sourceRowDrawn = key;
+  row.innerHTML = buttons.map((b) => {
+    const title = escapeAttr(t('controls.inputTitle', { input: b.label }));
+    const data = `data-source="${escapeAttr(b.source)}" data-source-account="${escapeAttr(b.sourceAccount)}" data-source-label="${escapeAttr(b.label)}"`;
+    if (b.bluetooth) {
+      return `<button class="btn btn-source btn-source-icon" ${data} aria-label="${escapeAttr(b.label)}" title="${title}">${BLUETOOTH_ICON}</button>`;
+    }
+    return `<button class="btn btn-source" ${data} title="${title}">${escapeHtml(b.label)}</button>`;
+  }).join('');
+  highlightActiveSource();
+}
+
+// highlightActiveSource marks the input the speaker is playing from. Called
+// after every status poll and again after a rebuild of the row, because the
+// buttons are replaced now and would otherwise come back unlit while the
+// speaker is still on that input.
+function highlightActiveSource() {
+  document.querySelectorAll('.btn-source').forEach((b) => {
+    const button = { source: b.dataset.source, sourceAccount: b.dataset.sourceAccount };
+    b.classList.toggle('active', isActiveInput(button, state.nowSource, state.nowSourceAccount));
+  });
+}
+
+// boxFetch lives in api.js next to boxURL, imported above.
+
+let regionLoaded = false;
+async function loadStickRegion() {
+  if (regionLoaded || !state.currentBox) return;
+  try {
+    const r = await boxFetch(state.currentBox, '/api/region');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data && data.country) {
+      // Deliberately do NOT seed the radio-search country filter from the
+      // stick region. STM is a worldwide app; the radio search defaults to
+      // all countries so a German-provisioned box does not silently hide
+      // every non-German station. The country filter stays at the user's
+      // own choice (persisted) or "all countries" until they
+      // pick one. The region still drives only the language default below.
+      //
+      // Default the language filter to the APP language, not the stick
+      // region's language and not a last-used value. Only when the app
+      // locale has no obvious radio-browser language do we fall back to the
+      // region's language.
+      if (!state.searchLang) {
+        state.searchLang = LOCALE_TO_RADIO_LANG[getLocale()] || data.language || '';
+      }
+      updateFilterIndicators();
+      // Re-render the language dropdown so the locale-based default is
+      // injected and selected even when this resolves after loadTaxonomy
+      // (the two run concurrently on box selection).
+      renderLanguageOptions();
+      regionLoaded = true;
+    }
+  } catch {}
+}
+
+// loadTaxonomy fetches the genre tag list and the language list from
+// the stick once, then renders the genre chips and the language
+// dropdown.
+async function loadTaxonomy() {
+  // App-side: query radio-browser directly, no box needed.
+  if (state.tags.length === 0) {
+    try {
+      state.tags = await RadioTags(24) || [];
+      renderGenreChips();
+    } catch {}
+  }
+  if (state.languages.length === 0) {
+    try {
+      state.languages = await RadioLanguages('', 40) || [];
+      renderLanguageOptions();
+    } catch {}
+  }
+}
+
+// Tracks whether the user has clicked "Mehr Genres" to expand the
+// long tail of auto-fetched tags. Resets on every fresh page load.
+state.showMoreGenres = false;
+
+function renderGenreChips() {
+  const wrap = $('genreChips');
+  if (!wrap) return;
+
+  // 1. Aggregate the live counts from radio-browser so each chip can
+  //    show "N Sender" in its tooltip. State.tags may be empty on
+  //    first paint — that's fine, core chips still render with 0.
+  const liveCounts = {};
+  for (const t of state.tags) {
+    const canon = canonGenre(t.name);
+    if (!canon) continue;
+    liveCounts[canon] = (liveCounts[canon] || 0) + (t.stationcount || 0);
+  }
+
+  // 2. Country-boost pills (max 2). state.searchCountry is the user's
+  //    selected country in the search filter — it falls back to the
+  //    stick's region.txt if the user hasn't manually picked one.
+  const cc = (state.searchCountry || '').toUpperCase();
+  const boost = GENRE_BY_COUNTRY[cc] || [];
+
+  const chipHtml = (canon, label, count, extraClass) => {
+    const active = state.searchTag === canon ? ' active' : '';
+    const cls = ['chip', active.trim(), extraClass || ''].filter(Boolean).join(' ');
+    const title = count > 0 ? t('search.nStations', { n: formatNumber(count) }) : '';
+    return `<button class="${cls}" data-tag="${escapeAttr(canon)}" title="${escapeAttr(title)}">${escapeHtml(label)}</button>`;
+  };
+  const labelFor = (canon) => translateGenre(canon) || canon.replace(/\b\w/g, c => c.toUpperCase());
+
+  const seen = new Set();
+  const parts = [];
+
+  parts.push('<button class="chip' + (!state.searchTag ? ' active' : '') + '" data-tag="">' + escapeHtml(t('search.allGenres')) + '</button>');
+
+  for (const canon of boost) {
+    if (!canon || seen.has(canon)) continue;
+    seen.add(canon);
+    parts.push(chipHtml(canon, labelFor(canon), liveCounts[canon] || 0, 'chip--boost'));
+  }
+  for (const canon of GENRE_CORE) {
+    if (seen.has(canon)) continue;
+    seen.add(canon);
+    parts.push(chipHtml(canon, labelFor(canon), liveCounts[canon] || 0));
+  }
+
+  // 3. Long tail: tags from state.tags that the user might recognise
+  //    but we did not promote into the core set. Shown only when the
+  //    user expands via "Mehr Genres".
+  const tail = Object.keys(liveCounts)
+    .filter(canon => !seen.has(canon) && liveCounts[canon] > 0)
+    .map(canon => ({ canon, count: liveCounts[canon] }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 24);
+
+  if (state.showMoreGenres) {
+    for (const t of tail) {
+      seen.add(t.canon);
+      parts.push(chipHtml(t.canon, labelFor(t.canon), t.count));
+    }
+  }
+
+  // 4. Toggle button at the end. Hidden when there is no tail to
+  //    reveal, or when the currently selected tag is in the tail (so
+  //    the user does not lose their selection by collapsing).
+  const showSelectedInTail = state.searchTag && !seen.has(state.searchTag);
+  if (tail.length > 0 || state.showMoreGenres) {
+    const label = state.showMoreGenres ? t('search.fewerGenres') : t('search.moreGenres', { n: tail.length });
+    parts.push(`<button class="chip chip--more" id="genreMoreToggle">${escapeHtml(label)}</button>`);
+  }
+  if (showSelectedInTail) {
+    // Selection points to a tag the tail dropdown is hiding — force
+    // expand so the user sees their own filter.
+    state.showMoreGenres = true;
+  }
+
+  wrap.innerHTML = parts.join('');
+  wrap.querySelectorAll('.chip').forEach(btn => {
+    btn.onclick = () => {
+      if (btn.id === 'genreMoreToggle') {
+        state.showMoreGenres = !state.showMoreGenres;
+        renderGenreChips();
+        return;
+      }
+      state.searchTag = btn.dataset.tag || '';
+      renderGenreChips();
+      doRefilter();
+    };
+  });
+}
+
+// localizeLanguageName looks up the display name for a language emitted
+// by radio-browser.info. The API hands us lowercased English names
+// ("german", "english", ...). The i18n bundle holds the per-locale
+// translation under `lang.<name>`. Unknown languages fall back to a
+// capitalised version of the raw API value.
+// radio-browser hands us lowercase English language names; map the
+// common ones to ISO 639 codes so Intl.DisplayNames can localize them
+// into the active app language (works for every locale, no per-language
+// tables).
+const LANG_NAME_TO_CODE = {
+  german: 'de', english: 'en', french: 'fr', spanish: 'es', italian: 'it',
+  dutch: 'nl', portuguese: 'pt', russian: 'ru', polish: 'pl', turkish: 'tr',
+  arabic: 'ar', japanese: 'ja', chinese: 'zh', mandarin: 'zh', cantonese: 'yue',
+  swedish: 'sv', norwegian: 'nb', danish: 'da', finnish: 'fi', czech: 'cs',
+  hungarian: 'hu', romanian: 'ro', greek: 'el', ukrainian: 'uk', bulgarian: 'bg',
+  croatian: 'hr', serbian: 'sr', slovak: 'sk', slovenian: 'sl', estonian: 'et',
+  latvian: 'lv', lithuanian: 'lt', irish: 'ga', welsh: 'cy', catalan: 'ca',
+  galician: 'gl', basque: 'eu', icelandic: 'is', hindi: 'hi', thai: 'th',
+  vietnamese: 'vi', korean: 'ko', indonesian: 'id', malay: 'ms', persian: 'fa',
+  hebrew: 'he', bengali: 'bn', tamil: 'ta', urdu: 'ur', maltese: 'mt',
+};
+let _langDN = null;
+let _langDNLocale = null;
+// localizeLanguageName localizes a radio-browser language name to the
+// active app language via Intl.DisplayNames (per-locale cached), falling
+// back to the i18n lang table, then a capitalized form of the raw name.
+function localizeLanguageName(name) {
+  if (!name) return '';
+  // Localize to the active app language via Intl.DisplayNames, exactly like
+  // regionName does for countries (the Wails webview is Chromium and honours
+  // the locale argument, as the localized country dropdown proves). So a
+  // French UI shows French language names, Dutch shows Dutch, and so on,
+  // for every app language without hand-translated tables. Cached per locale.
+  const code = LANG_NAME_TO_CODE[name.toLowerCase().trim()];
+  if (code) {
+    try {
+      const loc = getLocale();
+      if (_langDNLocale !== loc) {
+        _langDN = new Intl.DisplayNames([loc], { type: 'language' });
+        _langDNLocale = loc;
+      }
+      const n = _langDN.of(code);
+      if (n && n.toLowerCase() !== code) return n;
+    } catch (_) {
+      // Intl unavailable / bad code: fall through to the table.
+    }
+  }
+  // Names not in the code map (e.g. "american english"), or if Intl failed:
+  // the i18n lang table (selected language for de/en, else English), then the
+  // raw radio-browser name title-cased.
+  const translated = tLookup('lang', name.toLowerCase().trim());
+  if (translated) return translated;
+  return name.replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function renderLanguageOptions() {
+  const sel = $('searchLang');
+  if (!sel) return;
+  const sorted = (state.languages || [])
+    .filter((l) => l.name)
+    .map((l) => ({ name: l.name, stationcount: l.stationcount, label: localizeLanguageName(l.name) }));
+  // Ensure the language matching the app UI locale is always selectable,
+  // even when radio-browser's top-N-by-count list omits it (smaller
+  // languages like Lithuanian or Latvian fall outside the limit).
+  // Without this the locale-based pre-selection (LOCALE_TO_RADIO_LANG)
+  // cannot apply, because the matching <option> would not exist.
+  const want = state.searchLang || LOCALE_TO_RADIO_LANG[getLocale()] || '';
+  if (want && !sorted.some((l) => l.name.toLowerCase() === want.toLowerCase())) {
+    sorted.push({ name: want, stationcount: null, label: localizeLanguageName(want) });
+  }
+  // Sort alphabetically by the localized display name, consistent with
+  // the country dropdown. The API returns languages by station count.
+  sorted.sort((a, b) => a.label.localeCompare(b.label));
+  const opts = [`<option value="">${escapeHtml(t('search.allLanguages'))}</option>`];
+  for (const l of sorted) {
+    const count = (l.stationcount == null) ? '' : ` (${l.stationcount})`;
+    opts.push(`<option value="${escapeAttr(l.name)}">${escapeHtml(l.label)}${count}</option>`);
+  }
+  sel.innerHTML = opts.join('');
+  sel.value = state.searchLang;
+}
+
+// updateSettingsTabBadge shows a small blue dot on the speaker
+// settings tab whenever at least one discovered speaker reports a
+// version or build stamp different from the desktop app's own. The
+// dot signals: there is work to do in this tab, namely OTA-update
+// at least one speaker.
+//
+// Compared against BOTH version and build because two local dev
+// builds often share the same `git describe` version but carry
+// distinct build stamps. Without the build check the badge would
+// silently agree while the speaker-settings status line is
+// screaming "update available".
+//
+// Version + build data comes from the mDNS TXT record so no extra
+// HTTP call is needed. The badge updates as the speaker list
+// refreshes.
+// boxNeedsUpdate decides whether a single discovered speaker is running
+// an agent older than the desktop app's embedded one. A box is flagged
+// when its version OR build stamp differs from the app's. Two local dev
+// builds often share the same `git describe` version but carry distinct
+// build stamps, so both halves matter (see updateSettingsTabBadge).
+//
+// Returns false for stock boxes (no agent yet — that is a "needs install"
+// case, handled separately) and when the app version is not yet known.
+// speakerUpdateCardMuted reports whether the speaker-update CARD should stay
+// away because the app itself is out of date.
+//
+// Both cards at once left people guessing which to act on first, and the wrong
+// order is the harmful one: updating a speaker from an old app installs that
+// old app's bundled speaker software, so the speaker is behind again the moment
+// the app is updated. App first, speakers second.
+//
+// ONLY the card. The small "Update" next to a speaker and the mark on the
+// Speaker Settings tab always stay: they report what state a speaker is IN, and
+// a state indicator that comes and goes with an unrelated notice is worse than
+// the ordering problem it was meant to solve. Hiding those was too broad.
+function speakerUpdateCardMuted() {
+  return !!state.appUpdateVersion;
+}
+
+function boxNeedsUpdate(b) {
+  if (!b || b.kind === 'stock' || !b.version) return false;
+  // Mid-update (post-OTA pin window): the agent restarts and cannot answer its
+  // real version, so no update flag. This transient flag replaced the old
+  // stamp of the APP version onto the record, which falsified the roster and
+  // made a retry claim "already up to date" after an all-failed run.
+  if (b.otaPending) return false;
+  const appVer   = state.appInfo && state.appInfo.version;
+  const appBuild = state.appInfo && state.appInfo.build;
+  if (!appVer) return false;
+  // The binary itself, before any clock. A speaker that is already running the
+  // exact agent this build carries is current, whatever the stamps say.
+  //
+  // v0.9.88 is why this comes first. Its release workflow took the build stamp
+  // inside a three-leg matrix, so the app shipped stamped 2026-09-26-2023 while
+  // the agent it embeds carried 2026-09-26-2022: one minute apart, same commit.
+  // The comparison below then declared every speaker on earth out of date and
+  // kept the badge lit no matter how often the user updated.
+  // The binary the speaker RUNS, when it says. A speaker whose disk carries this
+  // build but boots something older still needs help, so the on-disk hash
+  // is only used when the agent is too old to report what it runs, where it is
+  // still better than a stamp.
+  const appSha = state.appInfo && state.appInfo.agentSha256;
+  if (appSha && b.agentRunningSha256) {
+    if (b.agentRunningSha256 === appSha) return false;
+  } else if (appSha && b.agentBinarySha256 && b.agentBinarySha256 === appSha) {
+    return false;
+  }
+  // Light the badge only when THIS app can actually upgrade the box, i.e. the
+  // app (and its embedded agent) is NEWER than the box. When the box is newer
+  // than the app, an OTA would push the app's older embedded agent and
+  // DOWNGRADE the box, so that is an "update the app" situation, not a
+  // speaker-update one (the update-banner confusion). compareVerBuild
+  // treats a missing box build (older agent that does not broadcast build=) as
+  // older, so that case still flags.
+  return compareVerBuild(appVer, appBuild, b.version, b.build) > 0;
+}
+
+function updateSettingsTabBadge() {
+  const btn = document.querySelector('.tab-btn[data-view="settings"]');
+  if (!btn) return;
+  const needsUpdate = state.boxes.some(boxNeedsUpdate);
+  btn.classList.toggle('has-update', needsUpdate);
+}
+
+// updateMultiroomTabBadge shows how many groups exist right now (live zones
+// plus stored permanent groups, see groupCount) as a small count on the
+// Multi-Room tab, so a user sees at a glance that groups exist and shape which
+// speakers play together, without opening the tab. Fed by
+// the shared zone poll through onZoneLive, so it is right as soon as the first
+// round lands and after every refresh path (music-tab poll, Multi-Room poll,
+// optimistic group edits). Hidden at zero; no poll or timer of its own.
+function updateMultiroomTabBadge() {
+  const el = $('multiroomTabBadge');
+  if (!el) return;
+  const split = groupCountSplit(state.zoneLive, state.boxes);
+  const n = split.total;
+  el.hidden = n === 0;
+  el.textContent = n ? String(n) : '';
+  // A badge carries the colour of the state that produced it. A saved group
+  // that is not currently formed is drawn as a dashed muted frame, so a count
+  // made up only of those reads muted too; as soon as one group is actually
+  // live the badge is brand again, matching the solid frames (
+  // 2026-09-12: the blue count over a grey dashed frame did not read as the
+  // same thing).
+  el.classList.toggle('tab-badge-stored', n > 0 && split.live === 0);
+  const tip = n ? t('nav.multiroomBadgeTitle', { n }) : '';
+  el.title = tip;
+  el.setAttribute('aria-label', tip);
+}
+onZoneLive(updateMultiroomTabBadge);
+
+// foreignMod maps a leftover /mnt/nv directory name (as the agent reports it in
+// foreignDirs / conflictingMod) to a human-readable name of the OTHER SoundTouch
+// tool it belongs to, so the app can tell the user exactly what to remove to
+// free NAND for the Spotify engine. Unknown names are shown verbatim.
+const foreignMod = {
+  aftertouch: 'AfterTouch',
+  opentouchcloud: 'OpenTouchCloud',
+  opentouch: 'OpenTouchCloud',
+  bosman: 'Bosman',
+  betterst: 'BetterST',
+  sixback: 'SixBack',
+  soundploy: 'SoundPloy',
+};
+
+// foreignSoftwareLabel turns a box version's foreignDirs/conflictingMod into a
+// readable, de-duplicated list ("AfterTouch, OpenTouchCloud") for the
+// "not enough space" message. Empty when the box carries no foreign leftovers.
+function foreignSoftwareLabel(v) {
+  const names = [];
+  const push = (raw) => {
+    if (!raw) return;
+    String(raw).split(',').forEach((n) => {
+      const key = n.trim().toLowerCase();
+      if (!key) return;
+      const label = foreignMod[key] || n.trim();
+      if (!names.includes(label)) names.push(label);
+    });
+  };
+  if (v) { push(v.conflictingMod); push(v.foreignDirs); }
+  return names.join(', ');
+}
+
+// superviseUpdateIntent reports an update that never reached its goal. It does
+// NOT act.
+//
+// Standing rule: a binary reaches a speaker only while an
+// install or update is running, never from a background task. Anything that
+// quietly pushed files onto speakers on its own is gone, because a speaker that
+// rewrites itself when nobody asked is worse than one that is plainly out of
+// date: the user cannot predict it, cannot see it, and cannot stop it.
+//
+// So all that is left of the old repair is telling the truth. The target was
+// written down when the update started, and if the speaker never got there, the
+// user is told once and decides.
+const supervisedIntent = new Set();
+
+async function superviseUpdateIntent(box) {
+  if (!box || !box.host || box.kind === 'stock') return;
+  if (state.otaInProgress) return;
+  const key = box.host + ':' + box.port;
+  if (supervisedIntent.has(key)) return;
+  let pending;
+  try { pending = await PendingUpdateIntent(box.host, box.port); } catch { return; }
+  if (!pending || !pending.action) return;
+  supervisedIntent.add(key);
+  // One line, once per speaker per session, pointing at the button the user
+  // would press anyway. No push, no reboot, no surprise. The engine case gets
+  // its own words: "the update is unfinished" on a speaker whose version tile
+  // looks current read as nonsense (field, 2026-08-29), when the truth was
+  // simply a missing Spotify component the next update click delivers.
+  const intentKey = pending.action === 'engine' ? 'update.engineMissing' : 'update.leftUnfinished';
+  showToast(t(intentKey, { name: pending.name || getBoxLabel(box) }));
+}
+
+// installSpotifyEngineVisible delivers the Spotify engine (go-librespot) to a box
+// ON DEMAND, from a visible button, with honest feedback. It replaces the old
+// silent background self-heal: a box does not free NAND on its own, so a silent
+// retry was pointless and hid the real cause. If the box is too full, we name
+// the OTHER SoundTouch software eating the space so the user knows what to
+// remove; otherwise we confirm success. Re-renders the banner afterwards.
+//
+// The two branches say different things on purpose. The agent emits
+// conflictingMod/foreignDirs only when something foreign is actually sitting in
+// /mnt/nv, so an empty label means either "nothing to remove" or "the version
+// read failed", never "you have add-ons". Until 2026-08-23 both branches told
+// the user to remove other SoundTouch add-ons, and a user whose speaker was
+// clean went looking for them and wrote in about it ("Getting rid of add-ons",
+// 2026-08-22). The unnamed branch now asks for the diagnostic logs instead,
+// which is the only thing that can actually find the space.
+async function installSpotifyEngineVisible(box) {
+  if (!box || !box.host) return;
+  const btn = $('boxInstallEngineBtn');
+  if (btn) { btn.disabled = true; btn.textContent = t('spotify.engineInstalling'); }
+  try {
+    const res = await EnsureSpotifyEngine(box.host, box.port);
+    if (res && !/no embedded engine/i.test(res)) showToast(t('update.spotifyDoneToast'));
+  } catch (e) {
+    const m = String((e && e.message) || e || '');
+    if (/insufficient nand|no space|507/i.test(m)) {
+      let foreign = '';
+      try { foreign = foreignSoftwareLabel(await BoxAgentVersion(box.host, box.port)); } catch {}
+      showToast(foreign ? t('spotify.engineTooFullNamed', { software: foreign }) : t('spotify.engineTooFull'));
+    } else {
+      showToast(t('spotify.engineInstallFailed'));
+    }
+  } finally {
+    try { await checkBoxUpdate(); } catch {}
+  }
+}
+
+async function checkBoxUpdate() {
+  if (!state.currentBox || !state.appInfo) return;
+  // Piggy-back the engine recovery on a check that already runs whenever a
+  // speaker is looked at; it costs one version read and only acts on a speaker
+  // that says its engine was taken away for an update.
+  superviseUpdateIntent(state.currentBox);
+  const banner = $('boxUpdateBanner');
+  // The speaker-update banner moved out of the music view into Speaker
+  // Settings (rendered prominently at the top by loadBoxSettings for the
+  // settings-selected box). When that element is not present (music view),
+  // this is a no-op so the old music-view callers never throw.
+  if (!banner) return;
+  banner.classList.add('hidden');
+  // If an OTA is in flight on a DIFFERENT box, the update button on
+  // the currently-viewed box must be locked. We still need the
+  // banner to be visible so the user has a clear reason for the
+  // disabled state. The version-mismatch check runs first so we
+  // know whether to show the banner at all; the OTA gate then
+  // decides what to put inside it.
+  const otaElsewhere = state.otaInProgress && state.otaTargetHost && state.otaTargetHost !== state.currentBox.host;
+  const renderUpdateBtn = () => {
+    if (otaElsewhere) {
+      return `<button class="btn btn-primary btn-mini" id="boxUpdateBtn" disabled>${escapeHtml(t('update.runningBtn'))}</button><div class="op-status" id="boxUpdateStatus">${escapeHtml(t('update.otherBoxRunning', { name: state.otaTargetName || '...' }))}</div>`;
+    }
+    return `<button class="btn btn-primary btn-mini" id="boxUpdateBtn">${escapeHtml(t('update.refreshBtnSpeaker'))}</button><div class="op-status" id="boxUpdateStatus"></div>`;
+  };
+  // "Update all speakers": offered next to the single-speaker button when
+  // two or more speakers are behind, so a multi-speaker household updates them in
+  // one click instead of one at a time. Hidden while any OTA is already running.
+  const eligibleCount = (state.boxes || []).filter(b => b && b.kind !== 'stock' && b.host && boxNeedsUpdate(b) && !otaStuck(b)).length;
+  const renderUpdateAllBtn = () => (eligibleCount >= 2 && !state.otaInProgress)
+    ? `<button class="btn btn-secondary btn-mini" id="boxUpdateAllBtn">${escapeHtml(t('updateAll.button', { count: eligibleCount }))}</button>`
+    : '';
+  const wireUpdateAllBtn = () => { const b = $('boxUpdateAllBtn'); if (b) b.onclick = updateAllBoxes; };
+  const boxName = getBoxLabel(state.currentBox);
+  // OTA running on THIS box: show an honest "updating" banner instead of the
+  // stale "update available" one (the heading kept saying
+  // "available" while the speaker was already restarting). The button stays
+  // disabled; doBoxUpdate's 1 s ticker keeps the countdown text current. This
+  // early return also stops a mid-OTA discovery refresh from re-rendering an
+  // enabled "Update" button over the progress text.
+  if (state.otaInProgress && state.otaTargetHost === state.currentBox.host) {
+    banner.innerHTML = `
+      <div class="update-msg">
+        <b>${escapeHtml(t('update.inProgressTitle', { name: boxName }))}</b><br>
+        <small class="muted">${escapeHtml(t('update.rebootNote'))}</small>
+      </div>
+      <button class="btn btn-primary btn-mini" id="boxUpdateBtn" disabled>${escapeHtml(t('update.runningBtn'))}</button>
+      <div class="op-status" id="boxUpdateStatus">${escapeHtml(t('update.uploading'))}</div>
+    `;
+    banner.classList.remove('hidden');
+    return;
+  }
+  try {
+    const v = await BoxAgentVersion(state.currentBox.host, state.currentBox.port);
+    const boxVer = v.version || t('common.unknown');
+    const boxBuild = v.build || '';
+    const appVer = state.appInfo.version;
+    const appBuild = state.appInfo.build || '';
+    // Spotify engine state. We no longer silently re-push a missing engine in the
+    // background: a box gains no NAND on its own, so a silent retry is pointless
+    // and hides the cause. If the box is otherwise up to date but the engine is
+    // missing, show a visible, actionable "install" banner below; a box that is
+    // BEHIND delivers the engine as a visible step of the normal update flow.
+    const engineMissing = !!(v && v.goLibrespot === 'missing');
+    // Direction matters. The speaker update pushes THIS app's embedded agent, so
+    // it only makes sense when the app is newer than the box. The old code fired
+    // on any difference and so offered "Aktualisieren" even when the box was
+    // newer than the app, which would have downgraded the box and confused the
+    // user (an old app v0.6.22 next to a box on v0.7.32).
+    const cmp = compareVerBuild(appVer, appBuild, boxVer, boxBuild);
+    // A missing engine gets its repair button whatever the version comparison
+    // says. It used to live only in the cmp===0 branch, so the one control that
+    // puts an engine back was hidden on exactly the speakers that had lost one:
+    // the v0.9.88 stamp skew made cmp 1 for every speaker on earth, so the only
+    // button on screen was the update, which drops the engine again. A reporter
+    // described running it "a few times on a couple of speakers", each run doing
+    // more damage, with no way to tell.
+    if (cmp === 0 || engineMissing) {
+      if (engineMissing) {
+        banner.innerHTML = `
+          <div class="update-msg">
+            <b>${escapeHtml(t('spotify.engineMissingTitle', { name: boxName }))}</b><br>
+            <small>${escapeHtml(t('spotify.engineMissingLine'))}</small>
+          </div>
+          <button class="btn btn-primary btn-mini" id="boxInstallEngineBtn"${otaElsewhere ? ' disabled' : ''}>${escapeHtml(t('spotify.engineInstallBtn'))}</button>
+        `;
+        banner.classList.remove('hidden');
+        const eb = $('boxInstallEngineBtn');
+        if (eb && !otaElsewhere) eb.onclick = () => installSpotifyEngineVisible(state.currentBox);
+        // A speaker that is BEHIND and has no engine needs both things said.
+        // The update line below replaces this banner in that case, because an
+        // update delivers the engine as one of its steps; the repair button is
+        // for the speaker that has nothing else outstanding.
+        if (cmp === 0) return;
+      } else {
+        return;
+      }
+    }
+    // When only the build stamp differs (same version string), show the build on
+    // both sides so the line is not the confusing "v0.8.1 -> v0.8.1" (
+    // 2026-06-17). A real release bumps the version, so production never hits the
+    // same-version case; this is mainly dev builds.
+    const sameVer = boxVer === appVer;
+    const instDisp = sameVer && boxBuild ? `${boxVer} (Build ${boxBuild})` : boxVer;
+    const nextDisp = sameVer && appBuild ? `${appVer} (Build ${appBuild})` : appVer;
+    if (cmp > 0) {
+      // Loop breaker: pushes of this exact app build have already
+      // failed to take effect on this box. Re-offering the one-click push
+      // would reboot the speaker again for the same non-result, so show the
+      // diagnostic state; retrying stays possible but is an explicit choice.
+      const stuck = otaStuck(state.currentBox);
+      if (stuck) {
+        banner.innerHTML = `
+          <div class="update-msg">
+            <b>${escapeHtml(t('update.notStickingTitle', { name: boxName }))}</b><br>
+            <small>${escapeHtml(t('update.notStickingLine'))}</small>
+          </div>
+          <button class="btn btn-secondary btn-mini" id="boxUpdateRetryBtn">${escapeHtml(t('update.retryAnyway'))}</button>
+        `;
+        banner.classList.remove('hidden');
+        const rb = $('boxUpdateRetryBtn');
+        if (rb && !otaElsewhere) rb.onclick = () => { clearOTAStuck(state.currentBox); doBoxUpdate(); };
+        return;
+      }
+      banner.innerHTML = `
+        <div class="update-msg">
+          <b>${escapeHtml(t('update.speakerUpdateAvailFor', { name: boxName }))}</b><br>
+          <small>${escapeHtml(t('update.versionLine', { installed: instDisp, next: nextDisp }))}</small><br>
+          <small class="muted">${escapeHtml(t('update.rebootNote'))}</small>
+        </div>
+        ${renderUpdateBtn()}
+        ${renderUpdateAllBtn()}
+      `;
+      banner.classList.remove('hidden');
+      if (!otaElsewhere) $('boxUpdateBtn').onclick = doBoxUpdate;
+      wireUpdateAllBtn();
+    } else {
+      // Box newer than the app: an OTA would downgrade it. Point the user at the
+      // app update instead and do NOT show the "Aktualisieren" button.
+      banner.innerHTML = `
+        <div class="update-msg">
+          <b>${escapeHtml(t('update.appBehindTitle', { name: boxName }))}</b><br>
+          <small>${escapeHtml(t('update.appBehindLine', { boxVersion: boxVer, appVersion: appVer }))}</small>
+        </div>
+      `;
+      banner.classList.remove('hidden');
+    }
+  } catch {
+    // Live version fetch failed; fall back to the cached mDNS version, same
+    // direction guard so a newer box never gets a downgrade offer.
+    const cv = state.currentBox.version;
+    if (cv && compareVerBuild(state.appInfo.version, '', cv, '') > 0) {
+      if (otaStuck(state.currentBox)) {
+        // Loop breaker: same gate as the live-version branch above.
+        banner.innerHTML = `
+          <div class="update-msg">
+            <b>${escapeHtml(t('update.notStickingTitle', { name: boxName }))}</b><br>
+            <small>${escapeHtml(t('update.notStickingLine'))}</small>
+          </div>
+          <button class="btn btn-secondary btn-mini" id="boxUpdateRetryBtn">${escapeHtml(t('update.retryAnyway'))}</button>
+        `;
+        banner.classList.remove('hidden');
+        const rb = $('boxUpdateRetryBtn');
+        if (rb && !otaElsewhere) rb.onclick = () => { clearOTAStuck(state.currentBox); doBoxUpdate(); };
+        return;
+      }
+      banner.innerHTML = `
+        <div class="update-msg">
+          <b>${escapeHtml(t('update.speakerUpdateAvailFor', { name: boxName }))}</b><br>
+          <small>${escapeHtml(t('update.versionLine', { installed: cv, next: state.appInfo.version }))}</small><br>
+          <small class="muted">${escapeHtml(t('update.rebootNote'))}</small>
+        </div>
+        ${renderUpdateBtn()}
+        ${renderUpdateAllBtn()}
+      `;
+      banner.classList.remove('hidden');
+      if (!otaElsewhere) $('boxUpdateBtn').onclick = doBoxUpdate;
+      wireUpdateAllBtn();
+    }
+  }
+}
+
+// --- OTA loop breaker -------------------------------------------------
+// A box whose reported version never changes after a push used to get the
+// full push+reboot cycle re-offered forever (the banner re-armed on every
+// discovery). Remember per box how pushes of THIS app build ended; after a
+// hard "cannot help to retry" classification or two unconfirmed cycles, the
+// banner switches to a diagnostic message and re-pushing needs an explicit
+// user override. Keyed to the app build so a NEW app version resets the state.
+function otaStuckKey(box) {
+  return 'otaStuck:' + (box.deviceId || box.host);
+}
+function readOTAStuck(box) {
+  try {
+    const rec = JSON.parse(localStorage.getItem(otaStuckKey(box)) || 'null');
+    if (!rec || rec.build !== (state.appInfo && state.appInfo.build)) return null;
+    return rec;
+  } catch { return null; }
+}
+function noteOTAFailure(box, cls) {
+  try {
+    const build = state.appInfo && state.appInfo.build;
+    const cur = readOTAStuck(box) || { build, count: 0 };
+    const rec = { build, count: (cur.count || 0) + 1, cls, at: Date.now() };
+    localStorage.setItem(otaStuckKey(box), JSON.stringify(rec));
+  } catch {}
+}
+function clearOTAStuck(box) {
+  try { localStorage.removeItem(otaStuckKey(box)); } catch {}
+}
+// otaStuck returns the record when the box is in the give-up state: one
+// "re-pushing the same bytes cannot help" verdict, or 2+ unconfirmed cycles.
+function otaStuck(box) {
+  const rec = readOTAStuck(box);
+  if (!rec) return null;
+  if (rec.cls === 'landed-not-running' || rec.cls === 'swap-failed') return rec;
+  if ((rec.count || 0) >= 2) return rec;
+  return null;
+}
+
+// isEngineStreamDrop matches errors that mean the ~16 MB engine push was cut
+// mid-stream (box rebooting or its network stack folding under the write):
+// re-streaming immediately races the next reboot with the very payload that
+// cut the last one (deqw's ST20 died exactly this way, 2026-07-12).
+function isEngineStreamDrop(msg) {
+  return /broken pipe|connection reset|deadline exceeded|forcibly closed|host is down|unexpected eof|wsarecv/i.test(msg);
+}
+
+// waitForStableAgent waits (bounded by deadlineMs) until the box's agent
+// answers again and KEEPS answering for stableMs, so the next engine attempt
+// streams at a settled box instead of one mid-reboot.
+//
+// Agents that report their box uptime (uptimeSec, v0.9.20+) get two extra
+// gates, learned from the bundles where the FIRST post-confirm 16 MB push
+// reliably died with a connection reset ~107 s in while a retry minutes later
+// sailed through in ~15 s: the box must be past the reboot-prone post-OTA
+// settling window (uptime >= minUptimeSec), and an uptime DROP between two
+// probes is a reboot that plain reachability polling misses entirely (the box
+// can be back up before the next probe) - it resets the stability clock.
+// Older agents without uptimeSec keep the reachability-only behavior.
+async function waitForStableAgent(box, deadlineMs, stableMs = 30_000, minUptimeSec = 150) {
+  let up = 0;
+  let lastUptime = -1;
+  while (Date.now() < deadlineMs) {
+    await sleep(3_000);
+    try {
+      const v = await BoxAgentVersion(box.host, box.port);
+      const uptime = v && v.uptimeSec ? parseInt(v.uptimeSec, 10) : NaN;
+      if (!Number.isNaN(uptime)) {
+        if (uptime < lastUptime) up = 0; // rebooted between probes
+        lastUptime = uptime;
+        if (uptime < minUptimeSec) continue; // still in the settling window
+      }
+      if (!up) up = Date.now();
+      if (Date.now() - up >= stableMs) return true;
+    } catch { up = 0; lastUptime = -1; }
+  }
+  return false;
+}
+
+// runBoxUpdate runs the per-box OTA sequence. It is the ONE implementation of
+// that sequence: the "update all speakers" batch (updateAllBoxes) and the
+// single-speaker button (doBoxUpdate) both go through here.
+//
+// It used to be a copy of the sequence inside doBoxUpdate, carrying a
+// "KEEP THE TWO IN SYNC" note that reality did not honour: the stability
+// window and the settle-gated engine window were each fixed in the batch
+// first and only ported to the single path later, so for a while updating one
+// speaker behaved worse than updating six. The batch sequence is the one that
+// has been run across the whole fleet, so it is the one that survives, and the
+// single path now differs only in how it reports (buttons and toasts instead of
+// overlay rows).
+//
+// It owns NO UI and NO lock: the caller drives status via onPhase(phase, data)
+// and owns the lock + the live byte-progress (box:update:progress, host-tagged).
+// Resolves to { outcome, version, engineDelivered?, engineTooFull? }:
+//   'done'    agent updated (engine present, or freshly delivered)
+//   'partial' agent updated but the engine could not be delivered in-window
+//             (self-heals next time the speaker is opened)
+//   'timeout' upload accepted but the box never confirmed the new build (6 min)
+// Throws ONLY on a hard failure (UpdateBoxAgent cleanly rejected the binary); a
+// timeout-class rejection is NOT a failure (the box is usually still applying it)
+// and falls through to the version poll, the real success signal.
+// phases: 'uploading' -> 'rebooting' -> 'verifying'{remainingMs} ->
+//   'settling'{remainingMs} -> 'confirmed'{version} -> 'engineQueued' ->
+//   'engineUploading' -> 'spotify'{attempt, remainingMs, reachable, version,
+//   engine} -> resolve. 'retrying'{attempt} restarts the sequence once.
+// A caller may ignore any phase it has no use for.
+// speakerReachedTarget answers the only question that matters at the end of an
+// install or an update: is this speaker actually where it was meant to be.
+//
+// It exists because judging on one half is how a run lies. A speaker whose
+// Spotify engine survived the reboot reports the engine present within seconds,
+// while its agent is still being replaced, and anything that stops looking at
+// that moment declares success on the old software. The mirror case is just as
+// real: the agent lands and the engine is still missing. Both halves, always,
+// and the caller is told WHICH half is outstanding so it can say so rather than
+// showing a spinner with no explanation.
+//
+// Learned from a fleet run on 2026-07-29 where a Portable passed on the old
+// build and only finished minutes later. Users hit the same on slow speakers.
+function speakerReachedTarget(live, preVersion, wantEngine) {
+  if (!live) return { done: false, missing: 'unreachable' };
+  // The binary the speaker is RUNNING first, then the version string.
+  //
+  // "the version string moved" cannot be satisfied by a push of the SAME
+  // version, and such a push is not harmless: a speaker that has the Spotify
+  // engine is by definition NAND-tight, so the agent drops the engine to make
+  // the update fit. Judging by the string then returns before the engine is
+  // put back, and a working Spotify install is destroyed by a re-push that was
+  // meant to change nothing. Four of six speakers in one household ended up
+  // that way after the v0.9.88 stamp skew invited re-push after re-push.
+  const appSha = state.appInfo && state.appInfo.agentSha256;
+  const agentDone = (!!appSha && live.agentRunningSha256 === appSha) ||
+    (!!live.version && (!preVersion || live.version !== preVersion));
+  const engineDone = !wantEngine || live.goLibrespot === 'present';
+  if (!agentDone) return { done: false, missing: 'agent' };
+  if (!engineDone) return { done: false, missing: 'engine' };
+  return { done: true, missing: '' };
+}
+
+// makeUploadGate serializes the network-heavy part of an update while leaving
+// everything else free to overlap.
+//
+// Updating a house used to run two speakers at a time from start to finish, so
+// a speaker that had already been written to held its slot for the whole of its
+// restart, four to six minutes in which it needs nothing from the network and
+// nobody else may start. Six speakers took the best part of an hour, almost all
+// of it spent watching speakers reboot one pair at a time.
+//
+// Only the pushes actually compete: two concurrent ~16 MB streams saturate a
+// weak shared access point and trip the 60 s upload-stall watchdog, which is
+// what the old limit was protecting against. Restarting and waiting cost no
+// bandwidth at all. So the pushes queue here and everything else runs at once,
+// which turns a house of six into roughly one upload after another with all the
+// restarts happening in parallel behind them.
+function makeUploadGate(limit = 1) {
+  let active = 0;
+  const waiting = [];
+  const pump = () => {
+    while (active < limit && waiting.length) {
+      active++;
+      waiting.shift()();
+    }
+  };
+  return {
+    // run holds the gate for the duration of fn and always gives it back, so
+    // one speaker throwing mid-push cannot strand the queue behind it.
+    async run(fn) {
+      await new Promise((resolve) => { waiting.push(resolve); pump(); });
+      try {
+        return await fn();
+      } finally {
+        active--;
+        pump();
+      }
+    },
+  };
+}
+
+// gate is optional: a single-speaker update has nothing to queue behind.
+// spotifyPhaseText words the engine step for the user. The row used to
+// interpolate the speaker's raw "missing"/"present" report ("Spotify engine:
+// missing, waiting for the target state"), English inside a German UI and a
+// description of the speaker rather than of what is happening (fleet
+// update 2026-09-06). Missing means the engine is about to be installed;
+// present means it is being confirmed.
+function spotifyPhaseText(d) {
+  if (!d || !d.reachable) return t('updateAll.phase.spotifyUnreachable');
+  return d.engine === 'present' ? t('updateAll.phase.spotifyChecking') : t('updateAll.phase.spotifyInstalling');
+}
+
+async function runBoxUpdate(box, onPhase, attempt = 1, gate = null) {
+  const gated = (fn) => (gate ? gate.run(fn) : fn());
+  const phase = (p, d) => { try { if (onPhase) onPhase(p, d || {}); } catch {} };
+  const appBuild = state.appInfo && state.appInfo.build;
+  // Record what the box runs RIGHT NOW; the post-OTA success signal is "reachable
+  // AND no longer this pre-OTA build", which survives app/agent build-stamp drift.
+  let preBuild = '', preVersion = '';
+  try {
+    const pv = await BoxAgentVersion(box.host, box.port);
+    if (pv) { preBuild = pv.build || ''; preVersion = pv.version || ''; }
+  } catch { /* pre-OTA version unknown: fall back to the appBuild match */ }
+  phase('uploading');
+  // Serialize only the BYTE push, not the box's whole reboot. UpdateBoxAgent
+  // does not return when the bytes land: the box replies, then reboots ~1.5 s
+  // later, and that reboot usually eats the reply, so the call then sits on a
+  // dead connection for up to ~107 s before its reply window times out.
+  // Holding the upload gate for all of that keeps the next box from starting its
+  // push long after this box's bytes were delivered and it is already rebooting
+  // on its own, the serial-restart stall makeUploadGate exists to kill. So
+  // release the gate the moment the upload bytes are on the wire
+  // (box:update:progress pct>=100, the same signal the overlay uses to flip a
+  // row to "restarting") and await the real UpdateBoxAgent result OUTSIDE the
+  // gate. A box that never streams pct>=100 (a fast failure, or a chassis that
+  // does not emit progress) falls back to releasing when the call settles,
+  // exactly the old behavior, never worse. The single-box path (gate=null) has
+  // nothing to queue behind, so it runs the call directly.
+  let updatePromise;
+  if (gate) {
+    await new Promise((begun) => {
+      gate.run(() => new Promise((release) => {
+        let done = false, offProg = null;
+        const free = () => {
+          if (done) return;
+          done = true;
+          if (offProg) { try { offProg(); } catch {} }
+          release();
+        };
+        offProg = EventsOn('box:update:progress', (p) => {
+          if (p && p.host === box.host && p.pct != null && p.pct >= 100) free();
+        });
+        // try/catch so a (near-impossible) synchronous throw from the binding
+        // still lets begun() fire and the gate release, never stranding the run.
+        try { updatePromise = UpdateBoxAgent(box.host, box.port); }
+        catch (e) { updatePromise = Promise.reject(e); }
+        begun();
+        // Fallback: release on settle if pct>=100 never arrives, and give
+        // updatePromise a handler so no unhandledrejection can fire.
+        updatePromise.then(free, free);
+      })).catch(() => {});
+    });
+  } else {
+    updatePromise = UpdateBoxAgent(box.host, box.port);
+  }
+  try {
+    await updatePromise;
+  } catch (e) {
+    // A timeout-class rejection ("deadline exceeded ... while reading body",
+    // common on a slow link or with an HTTP-inspecting suite like Norton) does
+    // NOT mean the OTA failed: the box may still be applying it, so fall through
+    // to the poll. A clean reject (binary definitely refused) is a real failure.
+    if (!/deadline exceeded|client\.timeout|while reading body/i.test(String(e))) throw e;
+  }
+  phase('rebooting');
+  const deadlineMs = Date.now() + 360_000;
+  const appSha = state.appInfo && state.appInfo.agentSha256;
+  const updated = (v) => {
+    if (!v) return false;
+    // The binary the speaker is RUNNING, first, because that is the only answer
+    // a clock cannot spoil. Without it the v0.9.88 stamp skew made a successful
+    // update wait out the whole 360 s window and then report "the update did not
+    // take effect", which was false and told the user to stop trying.
+    //
+    // Not agentBinarySha256: that is what lies on the box's DISK, and the one
+    // case where the two differ is a push that landed and then did not boot
+    // Reading the disk here would report that rollback as a success.
+    if (appSha && v.agentRunningSha256 === appSha) return true;
+    if (appBuild && v.build === appBuild) return true;
+    if (preBuild && v.build && v.build !== preBuild) return true;
+    if (preVersion && v.version && v.version !== preVersion) return true;
+    return false;
+  };
+  let confirmedVer = null;
+  // Bootstrap-reboot stability window: the first boot after an OTA can
+  // deliberately reboot ONCE more (~35 s after the agent API is back) when the
+  // new agent refreshed run-override.sh/rc.local on the NAND. Reporting
+  // success on the first version match made the app say "done" while the
+  // speaker went down again and blinked through another boot with no
+  // explanation (ST300, 2026-07-09). Confirm only after the box stays
+  // reachable on the new version for a full window; a drop inside the window
+  // returns to waiting and the next match confirms immediately-ish (the
+  // bootstrap reboot is one-time and loop-guarded on the agent side).
+  const stabilityMs = 50_000;
+  let stableSince = 0, sawSecondDrop = false;
+  while (Date.now() < deadlineMs) {
+    // Only while we are still waiting for the box to come back. Once it has and
+    // we are merely holding it for the stability window, 'settling' below owns
+    // the line: emitting both every pass made the text flap between "restarting" and
+    // "back up, confirming" twice every two seconds.
+    if (!stableSince) phase('verifying', { remainingMs: deadlineMs - Date.now() });
+    await sleep(2_000);
+    try {
+      const v = await BoxAgentVersion(box.host, box.port);
+      if (updated(v)) {
+        if (!stableSince) stableSince = Date.now();
+        const windowDone = sawSecondDrop || (Date.now() - stableSince >= stabilityMs);
+        if (windowDone) { confirmedVer = v; break; }
+        // The speaker IS back on the new version; we are only holding it for
+        // the stability window before believing it. Saying "restarting" here
+        // reads as if the app had not noticed, which is exactly how it looked
+        // to Jens watching two speakers that had visibly already come back.
+        phase('settling', { remainingMs: stabilityMs - (Date.now() - stableSince) });
+      } else {
+        stableSince = 0;
+      }
+    } catch {
+      // Unreachable: either still mid-first-reboot, or the bootstrap reboot
+      // just took the box down again after we already saw the new version.
+      if (stableSince) sawSecondDrop = true;
+      stableSince = 0;
+    }
+  }
+  if (!confirmedVer) {
+    // Journal the real verdict and classify why (unreachable / not landed /
+    // landed-but-not-running), feeding the loop breaker so an update that
+    // cannot stick is not re-offered as a fresh one-click push forever.
+    let cls = '';
+    try { cls = await ClassifyOTAResult(box.host, box.port); } catch {}
+    // "confirmed" = the box IS on the new build, it just crossed the verify
+    // window late (slow boot / late reachability). Treating that as a timeout
+    // made update-all report a perfectly updated ST10 as stuck (live
+    // 2026-07-25, "confirmed late" at +6 min). Count it as updated and fall
+    // through to the engine step like any confirmed box.
+    if (cls === 'confirmed') {
+      try { confirmedVer = await BoxAgentVersion(box.host, box.port); } catch {}
+    }
+    // "not-landed" means the speaker took the whole file and the new software
+    // never reached its disk. That is the write squeezing itself into the last
+    // megabyte of a nearly full speaker: it stalls instead of failing, so the
+    // speaker reboots onto its old version. It is marginal rather than
+    // permanent, proven on two near-identical speakers where one stalled, and
+    // the very same push then succeeded on a retry. So retry once here rather
+    // than hand back a failure whose fix is "press the button again".
+    //
+    // Only this verdict. "landed-not-running" already knows an identical
+    // re-push cannot help, and an unreachable speaker is switched off or gone
+    // from the network, where retrying just hammers it.
+    if (!confirmedVer && cls === 'not-landed' && attempt < 2) {
+      try { RecordOTAOutcome(box.host, 'retrying once: the software never reached the speaker disk (marginal write)'); } catch {}
+      phase('retrying', { attempt: attempt + 1 });
+      return runBoxUpdate(box, onPhase, attempt + 1, gate);
+    }
+    if (!confirmedVer) {
+      try { noteOTAFailure(box, cls); } catch {}
+      // "agent-gone" is the speaker answering its OWN Bose web API while STM's
+      // agent is not running on it. That is not a timeout and not a network
+      // problem: the box is up, on the LAN, and reachable from this PC. It is
+      // also the one outcome with an exact, reliable fix, so it gets its own
+      // result instead of being folded into the generic "took longer than
+      // expected" line that sent a user hunting through his antivirus settings
+      // while three speakers sat there answering Bose's ports (2026-08-22).
+      if (cls === 'agent-gone') return { outcome: 'agentGone', version: null };
+      // "box-in-setup" is the speaker running Bose's OWN out-of-box setup: it
+      // leaves the network for minutes at a time while it does, so the update
+      // may well have landed and confirmLateOTA corrects the journal on its
+      // own. Its own outcome, because the advice is the opposite of
+      // agentGone's: do NOT pull the plug on a speaker mid-setup.
+      if (cls === 'box-in-setup') return { outcome: 'boxInSetup', version: null };
+      return { outcome: 'timeout', version: null };
+    }
+  }
+  clearOTAStuck(box);
+  try { RecordOTAOutcome(box.host, `confirmed: box is on build ${confirmedVer.build || '?'} (stability window passed)`); } catch {}
+  // Put back the multiroom group the update reboot took apart. This is the one
+  // point EVERY confirmed update reaches, in-window or late, which is why it
+  // lives here and not next to the late-only ClassifyOTAResult call above.
+  // Fire and forget: a speaker whose group cannot be rebuilt must not hold up
+  // the rest of the update.
+  try { RestoreGroupAfterUpdate(box.host, box.port); } catch {}
+  // The agent half is done and proven. Say so now rather than at the very end:
+  // the engine step below can run for another ten minutes, and a user watching a
+  // single speaker has earned the news that the update itself landed.
+  phase('confirmed', { version: confirmedVer });
+  // Post-reboot Spotify engine reconcile: covers the one-time pre-v0.8.22
+  // upgrade case (engine missing) AND a present-but-outdated engine on a
+  // tight box whose pre-reboot staging was deferred (the old engine's space is
+  // reclaimable only after the reboot). EnsureSpotifyEngine is cheap when the
+  // engine is already current (one version GET, returns "current").
+  if (confirmedVer.goLibrespot) {
+    // 10 min window, and every push attempt is gated on a settled box. The
+    // old 240 s window with an ungated first push burned itself on exactly
+    // two doomed ~107 s streams per OTA: the box reliably reboots or
+    // resets large uploads in its first post-OTA minutes, while a push at a
+    // genuinely settled box completes in ~15 s. Waiting out the settling
+    // window first costs a minute in the good case and wins the bad ones.
+    const engDeadlineMs = Date.now() + 600_000;
+    let attempt = 0;
+    // What actually happened to the engine, so the caller can say it. "Delivered"
+    // and "was already current" both end as a done update but only one of them is
+    // worth telling the user about, and "no room left" is the one case where the
+    // user has something to do about it.
+    let engineDelivered = false, engineTooFull = false;
+    while (Date.now() < engDeadlineMs) {
+      attempt++;
+      // Report the live state on every pass, not just "attempt 3": the user
+      // is being asked to wait, so they get to see WHAT is being waited for,
+      // whether the speaker is answering at all, which build it runs and
+      // whether the engine is there yet.
+      let live = null;
+      try { live = await BoxAgentVersion(box.host, box.port); } catch {}
+      phase('spotify', {
+        attempt,
+        remainingMs: engDeadlineMs - Date.now(),
+        reachable: !!live,
+        version: (live && live.version) || '',
+        engine: (live && live.goLibrespot) || 'unknown',
+      });
+      // Already in the target state (another pass landed it, or the agent
+      // hot-swapped it in): nothing left to do.
+      const verdict = speakerReachedTarget(live, preVersion, true);
+      if (verdict.done) {
+        try { ClearUpdateIntent(box.host, box.port); } catch {}
+        return { outcome: 'done', version: live, engineDelivered };
+      }
+      await waitForStableAgent(box, engDeadlineMs);
+      try {
+        // "Spotify engine: missing, waiting for the target state" described the
+        // speaker, not what the app was doing, so the ~16 MB delivery that
+        // follows looked like nothing was happening (watching a live run).
+        // Say that it is queued, then that it is being sent; the row's bar is
+        // already fed by the transfer's own progress events.
+        phase('engineQueued');
+        const engRes = await gated(() => {
+          phase('engineUploading');
+          return EnsureSpotifyEngine(box.host, box.port);
+        });
+        // A build that carries no engine cannot deliver one, so waiting the
+        // full window would only burn ten minutes to reach the same answer.
+        if (engRes && /no embedded engine/i.test(engRes)) {
+          try { ClearUpdateIntent(box.host, box.port); } catch {}
+          return { outcome: 'done', version: live || confirmedVer, engineDelivered };
+        }
+        // STM is being removed from this speaker: the delivery was skipped
+        // on purpose, and a "Spotify engine installed" toast in the middle
+        // of an uninstall reads as a bug (report of 2026-09-06). Finish quietly.
+        if (engRes && /^skipped:/i.test(engRes)) {
+          try { ClearUpdateIntent(box.host, box.port); } catch {}
+          return { outcome: 'done', version: live || confirmedVer, engineDelivered: false, quiet: true };
+        }
+        // "current" means nothing was sent: the engine was already the right one.
+        if (engRes !== 'current') engineDelivered = true;
+        // Do not take the delivery's word for it. The update may only be
+        // called finished when the speaker itself reports the state it was
+        // supposed to end up in.
+        const check = await BoxAgentVersion(box.host, box.port).catch(() => null);
+        if (check && check.goLibrespot === 'present') {
+          try { ClearUpdateIntent(box.host, box.port); } catch {}
+          return { outcome: 'done', version: check, engineDelivered };
+        }
+        continue; // delivered but not visible yet: stay in the loop
+      } catch (engErr) {
+        const m = String((engErr && engErr.message) || engErr || '');
+        // Too full even counting the reclaimable old engine: retrying cannot
+        // help, only freeing space can. The agent update itself succeeded, so
+        // the intent is CLEARED: keeping it "so the app finishes the job next
+        // time" made the supervisor toast a permanent per-session nag on a
+        // speaker whose state cannot change by itself (Walter's CineMate,
+        // green "unvollständig" window on every update, 2026-08-25). This
+        // run's own result already names what to free, and once space exists
+        // the next update run delivers the engine anyway.
+        if (/insufficient nand|no space|507/i.test(m)) {
+          engineTooFull = true;
+          try { ClearUpdateIntent(box.host, box.port); } catch {}
+          break;
+        }
+        try { console.warn(`spotify engine delivery attempt ${attempt} failed (will retry)`, engErr); } catch {}
+        // Mid-stream drop: the box rebooted or reset the stream. Loop straight
+        // back: the top-of-loop settle gate does the waiting (reachable,
+        // uptime past the settling window, stable for 30 s).
+        if (isEngineStreamDrop(m)) continue;
+      }
+      // Exponential backoff (2s -> 30s cap): each failed attempt costs the
+      // box a probe, and during a slow agent start hammering it every 2s
+      // just prolongs the settling.
+      await sleep(Math.min(30_000, 2_000 * Math.pow(2, attempt - 1)));
+    }
+    // The agent is on the target build but the engine is not there. The
+    // record stays, so the next time this speaker is seen the app finishes
+    // the job instead of leaving it half-done.
+    return { outcome: 'partial', version: confirmedVer, unmet: 'spotify-engine', engineTooFull };
+  }
+  try { ClearUpdateIntent(box.host, box.port); } catch {}
+  return { outcome: 'done', version: confirmedVer };
+}
+
+// showSt300PowerCycleNotice puts the SoundTouch 300 power-cycle instruction on
+// screen until the user dismisses it. After an install or agent OTA the 300
+// always sits blinking and unreachable until it is unplugged once; a toast
+// vanished before people read it and they thought the soundbar was dead
+// so this one step gets a modal, reusing the failure-report
+// overlay host.
+function showSt300PowerCycleNotice() {
+  const host = $('updateFailureReport');
+  if (!host) { showToast(t('update.st300PowerCycle')); return; }
+  host.innerHTML = `
+    <div class="failreport-inner">
+      <div class="failreport-title">${escapeHtml(t('update.st300NoticeTitle'))}</div>
+      <p>${escapeHtml(t('update.st300PowerCycle'))}</p>
+      <div class="failreport-actions">
+        <button class="btn btn-primary btn-mini" id="st300NoticeClose">${escapeHtml(t('common.close'))}</button>
+      </div>
+    </div>`;
+  host.classList.remove('hidden');
+  const c = $('st300NoticeClose');
+  if (c) c.onclick = () => { host.classList.add('hidden'); host.innerHTML = ''; };
+}
+
+// showUpdateFailureReport offers the user a copyable account of an update that
+// did not reach its goal, gathered while the evidence is still there.
+//
+// A failure the user cannot describe is a failure that gets reported as "it
+// does not work", and by the time anyone asks for a diagnostic the speaker has
+// usually been restarted and the trail is cold. Everything relevant is
+// collected at the moment it happens, shown in full so the user can read it
+// before sending, and copyable in one click.
+async function showUpdateFailureReport(box, phase, errMsg) {
+  if (!box || !box.host) return;
+  let report = '';
+  try {
+    report = await UpdateFailureReport(box.host, box.port, phase, errMsg,
+      (state.appInfo && state.appInfo.version) || '');
+  } catch { return; }
+  if (!report) return;
+  const host = $('updateFailureReport');
+  if (!host) return;
+  host.innerHTML = `
+    <div class="failreport-inner">
+      <div class="failreport-title">${escapeHtml(t('update.reportTitle', { name: getBoxLabel(box) }))}</div>
+      <p class="muted small">${escapeHtml(t('update.reportHelp'))}</p>
+      <textarea class="failreport-text" id="failReportText" readonly rows="14">${escapeHtml(report)}</textarea>
+      <div class="failreport-actions">
+        <button class="btn btn-primary btn-mini" id="failReportCopy">${escapeHtml(t('update.reportCopy'))}</button>
+        <button class="btn btn-mini" id="failReportSaveLogs">${escapeHtml(t('footer.saveLogs'))}</button>
+        <button class="btn btn-mini" id="failReportMail">${escapeHtml(t('update.reportMail'))}</button>
+        <button class="btn btn-secondary btn-mini" id="failReportClose">${escapeHtml(t('common.close'))}</button>
+      </div>
+      <p class="muted small">${escapeHtml(t('update.reportAttachHint'))}</p>
+    </div>`;
+  host.classList.remove('hidden');
+  const ta = $('failReportText');
+  // Read the textarea rather than the closure: saving the diagnostic bundle
+  // rewrites the closing block to name the file that was just written, and the
+  // copied text has to carry that path, not the version from before the save.
+  const currentText = () => (ta && ta.value) || report;
+  const copy = $('failReportCopy');
+  if (copy) copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(currentText()); }
+    catch { if (ta) { ta.select(); document.execCommand('copy'); } }
+    copy.textContent = t('update.reportCopied');
+  };
+  // The update modal gets the same one-click bundle as the install screens.
+  // A failed OTA is the other moment a user has no idea where the diagnostic
+  // file would be, and the report itself now points at this button.
+  const saveLogs = $('failReportSaveLogs');
+  if (saveLogs) saveLogs.onclick = async () => {
+    saveLogs.classList.add('working');
+    try {
+      const r = await SaveDiagnosticBundle(failReportSaveHosts(box, state.boxes), true);
+      if (r && r.savePath) {
+        showToast(t('footer.saveLogsDone', { path: r.savePath, size: Math.round((r.bytes || 0) / 1024) }));
+        if (ta) ta.value = appendSavedBundlePath(currentText(), r.savePath);
+      }
+    } catch (e) { showError(String(e)); }
+    finally { saveLogs.classList.remove('working'); }
+  };
+  const mail = $('failReportMail');
+  if (mail) mail.onclick = () => {
+    try {
+      BrowserOpenURL('mailto:jcbenitezhe@gmail.com?subject=' +
+        encodeURIComponent('SoundTouch Manager update failed') + '&body=' + encodeURIComponent(currentText()));
+    } catch {}
+  };
+  const close = $('failReportClose');
+  if (close) close.onclick = () => host.classList.add('hidden');
+}
+
+// BOX_BUSY_TOKEN is the marker the one-write-per-speaker guard puts on its
+// refusal (desktop-app/boxbusy.go). Matched instead of the prose, which is free
+// to be reworded and translated.
+const BOX_BUSY_TOKEN = 'STM_BUSY:';
+
+// Re-entrancy latch for the single-speaker update, set BEFORE the first await.
+//
+// state.otaInProgress is only raised after the stick gate and the Wi-Fi
+// preflight, two network round-trips further down, so a second click inside
+// that window sailed straight past the check at the top. Both runs then reached
+// the backend, the second was correctly refused, and the REFUSED one ran the
+// shared teardown and put a failure report on screen for the update that was
+// running fine (Sascha, SoundTouch 30, 2026-09-14). The whole-house path
+// learned this in August, see updateAllBusy; this one had not.
+let boxUpdateBusy = false;
+
+async function doBoxUpdate(targetBox) {
+  // Both latches, not just this one. The whole-house run drives runBoxUpdate
+  // directly so it does not contend here, but it holds the single-box global
+  // lock for the entire batch, and a single-speaker click during it would walk
+  // into the same duplicate-start the latch exists to stop.
+  if (boxUpdateBusy || updateAllBusy) {
+    showToast(t('update.alreadyRunning', { name: state.otaTargetName || t('updateAll.batchLabel') }));
+    return;
+  }
+  boxUpdateBusy = true;
+  try {
+    return await runSingleBoxUpdate(targetBox);
+  } finally {
+    boxUpdateBusy = false;
+  }
+}
+
+async function runSingleBoxUpdate(targetBox) {
+  // The box to update is passed explicitly by the caller (Speaker Settings
+  // passes state.settingsBox). Fall back to the music-tab box only when a
+  // caller omits it. Earlier this always used state.currentBox, so updating a
+  // speaker picked in Speaker Settings actually OTA'd whatever box the music tab
+  // was on, re-flashing the wrong (already-updated) speaker every time.
+  targetBox = targetBox || state.currentBox;
+  if (!targetBox) return;
+  // Hard-lock: while an OTA is in flight on ANY box, refuse to start
+  // a second one. The UI also renders the button disabled in that
+  // case via checkBoxUpdate(), but the redundant check here guards
+  // against races where the user clicked through a stale render.
+  // Say so out loud: returning silently made a second press look like a dead
+  // button and invited a third (live, 2026-07-27).
+  if (state.otaInProgress) {
+    showToast(t('update.alreadyRunning', { name: state.otaTargetName || t('common.unknown') }));
+    return;
+  }
+
+  // Stick gate, checked at the single OTA chokepoint so EVERY caller
+  // (the music-tab banner button and the stick-info button) is covered.
+  // A USB stick still in the speaker means rc.local re-copies the
+  // stick's (older) version on the next boot and undoes the OTA; the OTA
+  // also reboots the box. So if a stick is mounted, ask first and let
+  // Cancel abort cleanly BEFORE anything starts. Earlier this gate only
+  // sat on the stick-info button, so the banner button started the OTA
+  // (and the reboot) with no confirmation.
+  try {
+    const r = await boxFetch(targetBox, '/api/stick/status');
+    if (r.ok) {
+      const data = await r.json();
+      if (data && data.mounted) {
+        const ok = await confirmWarn(t('update.stickInTitle'), t('update.stickInBody'));
+        if (!ok) return; // user cancelled: no OTA, no reboot
+      }
+    }
+  } catch { /* status unknown: do not block the update */ }
+
+  // Wi-Fi pre-flight: a weak link can drop the OTA upload mid-transfer and
+  // leave the speaker half-updated, then rebooting. If the box reports a
+  // marginal/poor Wi-Fi signal, warn first so the user can move the speaker or
+  // router closer before committing. Ethernet/coprocessor boxes report no
+  // signal class and are never blocked; an unknown reading never blocks.
+  try {
+    const s = await BoxSettings(targetBox.host, targetBox.port);
+    const ifs = (s && s.network && s.network.interfaces) || [];
+    // Only a real WIFI_INTERFACE reading gates the update: that class comes
+    // from the firmware live. Coprocessor boxes (ETHERNET-presented Wi-Fi)
+    // carry only the agent's last gabbo snapshot - a display hint, not a
+    // current measurement, and it false-alarmed on a Portable sitting next
+    // to the router (2026-07-12).
+    const conn = ifs.find(i => i.type === 'WIFI_INTERFACE' && i.state === 'NETWORK_WIFI_CONNECTED');
+    const sig = conn && conn.signal;
+    if (sig === 'MARGINAL_SIGNAL' || sig === 'POOR_SIGNAL') {
+      const ok = await confirmWarn(t('update.weakWifiTitle'), t('update.weakWifiBody'));
+      if (!ok) return; // user chose to improve the signal first
+    }
+  } catch { /* signal unknown: do not block the update */ }
+
+  // Storage pre-flight (v0.9.7): a tight NAND makes the update the
+  // riskiest thing the app can do to a speaker — on rollout day two boxes went
+  // down mid-update with 5-8 MB free while the app proceeded silently. The
+  // user stays in control: show the real numbers and what will happen (more
+  // than one restart, Spotify engine reinstalled after the restart) and let
+  // them decide. An unknown free figure (older agent) never blocks.
+  //
+  // The verdict AND the numbers come from BoxStoragePreflight, i.e. from the
+  // same Go gate the push itself goes through. This used to be computed here
+  // in JavaScript and it disagreed with the Go side twice: it compared the raw
+  // embedded agent size instead of the compression-credited need, so a user was
+  // told his update needed 13.9 MB when the real need was about 10.7 MB
+  // (screenshot, 2026-08-22), and it credited a present engine only when the
+  // agent reported goLibrespotSizeBytes, so an older agent with a full engine
+  // on the box got no reclaim credit at all. Nothing is derived here any more:
+  // this renders what the gate says.
+  try {
+    const pf = await BoxStoragePreflight(targetBox.host, targetBox.port);
+    if (pf && pf.tight) {
+      const fmtMB = (n) => ((n || 0) / 1048576).toFixed(1);
+      // Only one thing here is ever the user's to act on: other SoundTouch
+      // software occupying the storage. Name it when it is there, because then
+      // the warning carries an instruction instead of a decision they have no
+      // basis to make. The label mapping stays here; the preflight carries the
+      // agent's raw conflictingMod/foreignDirs fields through untouched.
+      const foreign = foreignSoftwareLabel(pf);
+      const ok = await confirmWarn(
+        t('update.tightNandTitle'),
+        foreign
+          ? t('update.tightNandNamedBody', { freeMB: fmtMB(pf.freeBytes), needMB: fmtMB(pf.needBytes), software: foreign })
+          : t('update.tightNandBody', { freeMB: fmtMB(pf.freeBytes), needMB: fmtMB(pf.needBytes) })
+      );
+      if (!ok) return; // user cancelled: no OTA, no reboot
+    }
+  } catch { /* headroom unknown: do not block the update */ }
+
+  // Drive both update buttons together (banner up top + stick info section)
+  const buttons = () => ['boxUpdateBtn', 'stickInfoUpdateBtn'].map(id => $(id)).filter(Boolean);
+  // Mutate the DOM buttons only when the user is still LOOKING at
+  // the box being updated. If they switched to another box,
+  // checkBoxUpdate() has rendered a fresh button for that other
+  // box — overwriting it with our progress text would lie about
+  // what the other box is doing. The state.otaTargetHost guard
+  // below in checkBoxUpdate() takes care of rendering the right
+  // "Update running on <name>" label there.
+  // "Looking at the target box" means the SETTINGS view (where the update
+  // buttons and progress live since they moved out of the music view) or the
+  // music selection. Comparing against state.currentBox alone was a leftover
+  // from the music-view era: updating any speaker other than the currently
+  // selected one silently suppressed every progress line, so the settings
+  // page just sat there and users pressed Update again (live, 2026-07-27).
+  const lookingAtTarget = () => {
+    const t = state.otaTargetHost;
+    if (!t) return false;
+    return (state.settingsBox && state.settingsBox.host === t) ||
+           (state.currentBox && state.currentBox.host === t);
+  };
+  // The progress text used to be written INTO the button. These messages are
+  // whole sentences (up to 124 characters in German), so a btn-mini wrapped
+  // them over several lines, grew to fit, and shoved the surrounding layout
+  // around every time the phase changed. A button is a label; the status
+  // belongs beside it. Both buttons now have an .op-status line under them
+  // with a reserved height, so the panel stays still while the text changes.
+  const statusLines = () => ['boxUpdateStatus', 'stickInfoUpdateStatus'].map(id => $(id)).filter(Boolean);
+  const setStatus = (text) => {
+    if (!lookingAtTarget()) return;
+    // Idempotent: only touch the DOM when a value actually changes. The 1 s
+    // countdown tick called this every second during the post-update wait, and
+    // re-setting `disabled` each time re-triggered the button's CSS transition,
+    // which read as a per-second flicker through the whole 2nd (Spotify) upload.
+    const busy = t('update.runningBtn');
+    buttons().forEach(b => {
+      if (b.textContent !== busy) b.textContent = busy;
+      if (!b.disabled) b.disabled = true;
+    });
+    statusLines().forEach(el => {
+      if (el.textContent !== text) el.textContent = text;
+      // The full sentence stays reachable on hover for anything the two
+      // reserved lines cannot hold.
+      if (el.title !== text) el.title = text;
+    });
+  };
+  const reset = () => {
+    if (!state.currentBox || state.currentBox.host !== state.otaTargetHost) return;
+    buttons().forEach(b => { b.disabled = false; b.textContent = t('update.refreshBtnSpeaker'); });
+    statusLines().forEach(el => { el.textContent = ''; el.title = ''; });
+  };
+  // Mark this box as the OTA target AND flip the global in-flight
+  // flag BEFORE first setStatus() so checkBoxUpdate() and the
+  // setStatus guard both see a consistent (target, in-flight)
+  // pair at every point in this flow. Reset together in finally{}.
+  // Write down what this speaker is supposed to end up running BEFORE any of
+  // it happens. From here on the target survives this app process: if the
+  // window is closed during the reboot, or the machine goes to sleep, the
+  // next run compares the speaker against this record and finishes the job.
+  try {
+    RecordUpdateIntent(targetBox.host, targetBox.port, (state.appInfo && state.appInfo.version) || '',
+      targetBox.deviceID || '', getBoxLabel(targetBox), true);
+  } catch {}
+  // Tell the backend an update owns the app now, so the window asks before
+  // closing. Cleared in the finally below.
+  try { SetOTARunning(true); } catch {}
+  state.otaTargetHost = targetBox.host;
+  state.otaTargetName = getBoxLabel(targetBox);
+  // Suppress the SSH "remove stick and reboot" banner for the whole
+  // OTA window. The agent restarts mid-OTA and SSH is briefly open
+  // during that restart; the banner's "Reboot now" button would
+  // interrupt the agent exec and may leave the box half-flashed.
+  state.otaInProgress = true;
+  setStatus(t('update.uploading'));
+  // The post-reboot Spotify engine delivery streams its ~16 MB through this
+  // same channel. It does NOT restart the speaker (a current agent swaps the
+  // engine in place), so the progress line must not promise one.
+  let engineStreaming = false;
+  // Live upload progress + throughput while the ~10 MB agent streams to the box,
+  // so a slow link shows movement instead of a frozen "Uploading...".
+  const offBoxUp = EventsOn('box:update:progress', (p) => {
+    if (!p || typeof p !== 'object' || p.pct == null || p.pct < 0) return;
+    // At 100% the whole binary is on the box; it now writes NAND and reboots,
+    // and its reply is usually lost in that reboot (BCO/taigan especially), so
+    // the backend's UpdateBoxAgent call hangs another ~minute. Flip the label
+    // to "restarting" the moment the upload completes instead of leaving the
+    // user on "uploading" through the reboot the app cannot yet see.
+    if (p.pct >= 100 && !engineStreaming) { setStatus(t('update.rebooting')); return; }
+    const rate = p.bytesPerSec ? ' (' + fmtRate(p.bytesPerSec) + ')' : '';
+    setStatus(t('update.uploadingPct', { pct: p.pct }) + rate);
+  });
+  checkSshBanner();
+  // Swap the banner heading to "updating" right away (the otaHere branch in
+  // checkBoxUpdate), so it no longer reads "update available" while the OTA runs.
+  checkBoxUpdate();
+  let boxWasTouched = false;
+  // From here on the speaker itself is involved: anything that fails after the
+  // transfer started may leave it mid-restart, which is when the power-cycle
+  // advice below is genuinely useful. Everything BEFORE this point (no embedded
+  // agent in this build, box unreachable, a gate the user cancelled) never
+  // touched the speaker, and telling those users to pull the plug is both
+  // pointless and alarming.
+  boxWasTouched = true;
+  // Countdown ticker for the phases that carry a deadline. runBoxUpdate reports
+  // about every two seconds; the seconds in between are ticked here so the
+  // remaining time counts down smoothly instead of jumping in steps.
+  let tickHandle = null, tickRender = null;
+  const stopTick = () => {
+    if (tickHandle) { clearInterval(tickHandle); tickHandle = null; }
+    tickRender = null;
+  };
+  const startTick = (render) => {
+    tickRender = render;
+    render();
+    if (!tickHandle) tickHandle = setInterval(() => { if (tickRender) tickRender(); }, 1000);
+  };
+  const countdown = (remainingMs, key, step) => {
+    const dl = Date.now() + (remainingMs || 0);
+    startTick(() => {
+      const text = t(key, { remaining: formatRemaining(dl - Date.now()) });
+      setStatus(step ? withStep(text, step) : text);
+    });
+  };
+  let uploadedToastShown = false;
+  try {
+    // One speaker and a whole house run the SAME sequence: runBoxUpdate. This
+    // path only differs in how it reports - a button, a status line and toasts
+    // instead of the overlay's rows. No upload gate is passed: a single speaker
+    // has nothing to queue behind.
+    const result = await runBoxUpdate(targetBox, (ph, d) => {
+      switch (ph) {
+        case 'uploading':
+          stopTick();
+          setStatus(withStep(t('update.uploading'), UPDATE_STEPS.send));
+          break;
+        case 'rebooting':
+          stopTick();
+          // The binary is on the speaker now. Said once, at the moment it
+          // becomes true, so the user knows the transfer is behind them: the
+          // agent detaches, waits out TIME_WAIT on its listener ports (see
+          // internal/webui handleAgentUpdate) and only then execs the new
+          // binary, so the speaker is away for minutes with nothing to show.
+          if (!uploadedToastShown) { uploadedToastShown = true; showToast(t('update.uploadedToast')); }
+          setStatus(withStep(t('update.rebooting'), UPDATE_STEPS.restart));
+          break;
+        case 'verifying': countdown(d.remainingMs, 'update.waitingForSpeaker', UPDATE_STEPS.restart); break;
+        // The speaker IS back on the new version and is only being held for the
+        // stability window before we believe it (a BCO box can reboot a second
+        // time on its own). Saying "restarting" through that window reads as if
+        // the app had not noticed the speaker was back.
+        case 'settling': countdown(d.remainingMs, 'updateAll.phase.settling', UPDATE_STEPS.confirm); break;
+        case 'retrying':
+          stopTick();
+          uploadedToastShown = false;
+          showToast(t('update.retrying'));
+          setStatus(t('update.retrying'));
+          break;
+        case 'confirmed':
+          stopTick();
+          // Not "update done": the Spotify-engine half may still follow (the
+          // grey Updating button stays for it), and calling the whole update
+          // done here while the card visibly kept working confused a reporter
+          // The single final "done" comes when the flow resolves.
+          showToast(t('update.agentDoneToast'));
+          break;
+        case 'engineQueued': stopTick(); setStatus(withStep(t('updateAll.phase.engineQueued'), UPDATE_STEPS.engine)); break;
+        case 'engineUploading':
+          stopTick();
+          engineStreaming = true;
+          setStatus(withStep(t('updateAll.phase.engineUploading'), UPDATE_STEPS.engine));
+          break;
+        case 'spotify':
+          engineStreaming = false;
+          countdown(d.remainingMs, 'update.spotifyFinalStep');
+          break;
+      }
+    });
+    stopTick();
+    const confirmedVer = (result && result.version) || null;
+    const confirmed = !!confirmedVer;
+    if (result && result.outcome === 'done') {
+      // THE done moment: everything, engine half included, is finished. One
+      // toast, here and only here; the confirm phase above announced
+      // only the speaker-software half.
+      if (!result.quiet) showToast(result.engineDelivered ? t('update.spotifyDoneToast') : t('update.doneToast'));
+    } else if (result && result.outcome === 'partial') {
+      // Agent updated, Spotify engine outstanding.
+      if (result.engineTooFull) {
+        // Retrying cannot help, only freeing space can. Name the OTHER
+        // SoundTouch software eating the NAND so the user knows what to remove.
+        // With no name (nothing foreign reported, or no version to read) there
+        // is nothing to point at, so that branch asks for the diagnostic logs
+        // rather than sending the owner of a clean speaker hunting for add-ons
+        // that are not there (user mail, 2026-08-22). See
+        // installSpotifyEngineVisible for the full note.
+        const foreign = foreignSoftwareLabel(confirmedVer);
+        showToast(foreign
+          ? t('spotify.engineTooFullNamed', { software: foreign })
+          : t('spotify.engineTooFull'));
+      } else {
+        // No silent retry: the speaker's own screen now carries a visible
+        // "Install Spotify engine" action.
+        showToast(t('spotify.engineDeferredVisible'));
+      }
+    } else if (result && result.outcome === 'boxInSetup') {
+      // The speaker was busy with its own setup. Nothing is wrong with the
+      // network and nothing needs pulling out of the wall.
+      showToast(t('update.boxInSetupNote', { name: getBoxLabel(targetBox) }));
+    } else if (result && result.outcome === 'agentGone') {
+      // The speaker is up and answering its own Bose web API; only STM is not
+      // running on it. That has one exact fix and the user can do it in ten
+      // seconds, so say it plainly instead of "took longer than expected".
+      showToast(t('update.agentGoneToast', { name: getBoxLabel(targetBox) }));
+    } else {
+      // Timed out. runBoxUpdate has already journaled the verdict, classified
+      // why, retried the one class of failure a retry actually fixes, and fed
+      // the loop breaker, so all that is left here is to say so.
+      showToast(t('update.tookLongerToast'));
+    }
+    // The SoundTouch 300 drops into its blinking update-pending state after an
+    // OTA and needs a manual power-cycle to finish; the agent cannot clear it, so
+    // tell the user (#ST300 blink). As a modal, not a
+    // toast: it stays up until read.
+    if ((targetBox.model || '').includes('300')) showSt300PowerCycleNotice();
+    // Refresh app state regardless of confirmation so the user sees current
+    // truth (either updated or still in OTA). This is BEST-EFFORT and must never
+    // surface as "Update failed": the box is typically still mid-reboot here, so
+    // discoverBoxes / loadBoxSettings hit it while it is unreachable and can throw
+    // "context deadline exceeded (... while reading body)". That throw used to land
+    // in the outer catch and report a failed update even though the upload
+    // succeeded and the version poll already decided the real outcome (reported by
+    // the toast above). So swallow refresh errors here.
+    try {
+      await discoverBoxes();
+      // Force the confirmed new version onto the box record(s) so the view
+      // shows the updated version immediately instead of a stale "outdated"
+      // glitch until the next clean discovery cycle (
+      // after OTA the screen kept the old version until a manual refresh).
+      // This also overrides a discovery-stickiness cache entry that might
+      // still carry the pre-OTA version for a box that just rebooted.
+      if (confirmed) {
+        const patchVer = (b) => {
+          if (b && b.host === targetBox.host) {
+            if (confirmedVer.version) b.version = confirmedVer.version;
+            if (confirmedVer.build) b.build = confirmedVer.build;
+          }
+        };
+        patchVer(state.currentBox);
+        if (Array.isArray(state.boxes)) state.boxes.forEach(patchVer);
+      }
+      checkBoxUpdate();
+      if (state.view === 'settings') loadBoxSettings();
+    } catch (refreshErr) {
+      try { console.warn('post-update refresh failed (non-fatal, box likely still rebooting)', refreshErr); } catch {}
+    }
+    reset();
+  } catch (e) {
+    // A timeout-class rejection ("context deadline exceeded ... while reading
+    // body", common on slow links or with an HTTP-inspecting security suite like
+    // Norton) does NOT mean the OTA failed: the box may still be applying it and
+    // rebooting. Show an actionable "still working" hint and let the user
+    // re-check the version shortly, instead of a raw Go error toast that two
+    // reporters hit while their speaker actually updated fine.
+    const msg = String(e);
+    if (msg.includes(BOX_BUSY_TOKEN)) {
+      // The backend turned this start away because a write is already running
+      // on this speaker. Nothing failed: the run that IS going is fine, and its
+      // owner must not be handed an error report with a copyable Go error for
+      // an update that finishes a minute later (Sascha, ST30, 2026-09-14).
+      showToast(t('update.alreadyRunning', { name: getBoxLabel(targetBox) }));
+    } else if (/deadline exceeded|client\.timeout|while reading body/i.test(msg)) {
+      showToast(t('update.stillWorking'));
+    } else {
+      showError(boxWasTouched
+        ? t('update.failed', { err: msg })
+        : t('update.failedNoChange', { err: msg }));
+      // The update could not put this speaker into the state it was meant to
+      // reach, so hand the user everything needed to report it instead of
+      // making them describe a failure they cannot see.
+      if (noNetworkHere(msg)) {
+        // The app already knows this: the same predicate greys the speaker
+        // list out for it. The update path just never asked, so pulling the
+        // router mid-update produced a full copyable fault report about a
+        // speaker that was fine, and the reporter had to work out for
+        // themselves that it was their own router.
+        showUpdateNoNetworkNotice();
+      } else {
+        showUpdateFailureReport(targetBox, 'update', msg);
+      }
+    }
+    reset();
+  } finally {
+    // Stop the countdown ticker on every exit, including a throw mid-poll:
+    // an interval left running keeps writing status into a finished update.
+    stopTick();
+    if (typeof offBoxUp === 'function') offBoxUp();
+    // Always clear the OTA-in-flight gate so the SSH banner can
+    // come back if it still applies, even if we threw mid-poll.
+    try { SetOTARunning(false); } catch {}
+    state.otaInProgress = false;
+    state.otaTargetHost = null;
+    state.otaTargetName = null;
+    checkSshBanner();
+    // Force a re-render of the current view's update button so any
+    // other-box "Update running on …" placeholder is replaced with
+    // the regular Update button immediately.
+    checkBoxUpdate();
+  }
+}
+
+// updateAllBoxes updates every eligible speaker in one click with a live
+// per-box multi-progress overlay. Built for a household with several speakers,
+// some on weak Wi-Fi: it asks ONCE up front, runs a BOUNDED pool (2 at a time, so
+// concurrent ~16 MB Spotify-engine pushes do not saturate a weak shared AP and
+// trip the 60 s upload-stall watchdog), and never lets one slow/failed box block
+// the rest. Calls runBoxUpdate directly (not doBoxUpdate) so it does not contend
+// on the single-box global lock, which it holds for the whole batch.
+//
+// Returns true when a batch was actually started, false when it backed out
+// (already running, nothing to do, user cancelled). Callers that took a button
+// or a card off screen for it need that answer to put it back. onStart fires
+// the moment the batch is committed, for callers that want to get out of the
+// way then rather than minutes later when the whole batch is done.
+// Re-entrancy latch, set BEFORE the first await and cleared in the finally at
+// the very bottom. state.otaInProgress is not enough: it is only raised AFTER
+// the confirmation, and everything before it (a version read per speaker, a
+// stick check and a Wi-Fi read per target) is seconds of network work during
+// which a second click sails straight past that check. Two overlapping runs
+// then queue two confirmations on a modal that keeps ONE resolver, so the
+// second prompt arrived after the batch was already done and asked the user to
+// update speakers they had just updated.
+let updateAllBusy = false;
+async function updateAllBoxes(onStart) {
+  // Saying so out loud, not returning silently: a second press on a dead-looking
+  // button is exactly what the single-box path already learned to answer.
+  if (updateAllBusy || boxUpdateBusy || state.otaInProgress) {
+    showToast(t('update.alreadyRunning', { name: state.otaTargetName || t('updateAll.batchLabel') }));
+    return false;
+  }
+  updateAllBusy = true;
+  try {
+    return await runUpdateAllBoxes(onStart);
+  } finally {
+    updateAllBusy = false;
+  }
+}
+
+// runUpdateAllBoxes is the body; updateAllBoxes above is the guard around it.
+async function runUpdateAllBoxes(onStart) {
+  // Offline speakers are excluded up front: probing them burns the pre-flight
+  // budget, and counting them as "nothing to do" is how an all-offline fleet
+  // produced "already up to date".
+  const candidates = (state.boxes || []).filter(b => b && b.kind !== 'stock' && b.host && !b.offline && !otaStuck(b));
+  // Everything from here to the confirmation is network work: one version read
+  // per speaker, then a stick check and a Wi-Fi read per update target. On a
+  // busy LAN, or right after start while discovery is still sweeping, that is
+  // several seconds in which the click produced nothing at all on screen. Keep
+  // a line up for the whole pre-flight so the app is visibly working.
+  showToast(t('updateAll.checking'), 0);
+  // Ask every speaker that is NOT behind whether it still has its Spotify
+  // engine, so one that quietly lost it is repaired by this run instead of
+  // being skipped (splitUpdateTargets carries the reasoning). One version read
+  // per speaker; one in deep standby does not answer and is left alone, as a
+  // read must.
+  const rows = [];
+  for (const b of candidates) {
+    const needsUpdate = boxNeedsUpdate(b);
+    let engineMissing = false;
+    if (!needsUpdate) {
+      try {
+        const v = await BoxAgentVersion(b.host, b.port);
+        engineMissing = !!(v && v.goLibrespot === 'missing');
+      } catch { /* asleep or unreachable: leave it untouched */ }
+    }
+    rows.push({ box: b, needsUpdate, engineMissing });
+  }
+  const { updateTargets, engineTargets, targets } = splitUpdateTargets(rows);
+  if (targets.length === 0) {
+    hideToast();
+    // "Already up to date" is only an honest claim when reachable speakers
+    // were actually inspected; a fleet that is offline gets the truth.
+    const anyOnline = (state.boxes || []).some(b => b && b.kind !== 'stock' && !b.offline);
+    showToast(anyOnline ? t('updateAll.noneToUpdate') : t('speakerUpdate.notReachable'));
+    return false;
+  }
+  // Hosts that only need the engine put back, not a whole agent update.
+  const engineOnly = new Set(engineTargets.map(b => b.host));
+
+  // Pre-scan for sticks / weak Wi-Fi so the user is warned ONCE up front, not
+  // once per speaker (the per-box prompts the single-box path shows).
+  const notes = [];
+  for (const b of updateTargets) {
+    try {
+      const r = await boxFetch(b, '/api/stick/status');
+      if (r.ok) { const d = await r.json(); if (d && d.mounted) notes.push(t('updateAll.noteStick', { name: getBoxLabel(b) })); }
+    } catch { /* stick status unknown: do not block */ }
+    try {
+      const s = await BoxSettings(b.host, b.port);
+      const ifs = (s && s.network && s.network.interfaces) || [];
+      // Firmware-reported Wi-Fi class only, same rule as doBoxUpdate: the
+      // coprocessor boxes' agent-relayed snapshot is not a live measurement.
+      const conn = ifs.find(i => i.type === 'WIFI_INTERFACE' && i.state === 'NETWORK_WIFI_CONNECTED');
+      const sig = conn && conn.signal;
+      if (sig === 'MARGINAL_SIGNAL' || sig === 'POOR_SIGNAL') notes.push(t('updateAll.noteWeakWifi', { name: getBoxLabel(b) }));
+    } catch { /* signal unknown: do not block */ }
+    try {
+      // Storage, the one thing this pre-scan never looked at. The single-box
+      // update has asked since #ST30 and stops to confirm when it is tight;
+      // the batch wrote the same speakers without ever mentioning it, so the
+      // owner of a tight box got a warning or no warning depending purely on
+      // which button he pressed. Same Go gate, so the two paths cannot drift:
+      // nothing is computed here, this renders what BoxStoragePreflight says.
+      //
+      // A note and not a confirm: the batch already asks once for the whole
+      // run, and the update is the right thing to do anyway. Tight NAND costs
+      // a re-delivered engine after the reboot, which the flow handles by
+      // itself, so the user needs to KNOW rather than to decide.
+      const pf = await BoxStoragePreflight(b.host, b.port);
+      if (pf && pf.tight) {
+        const mb = (n) => ((n || 0) / 1048576).toFixed(1);
+        notes.push(t('updateAll.noteTightNand', {
+          name: getBoxLabel(b), freeMB: mb(pf.freeBytes), needMB: mb(pf.needBytes),
+        }));
+      }
+    } catch { /* headroom unknown (older agent): never block a batch */ }
+  }
+  hideToast();
+  // The prompt used to be one plain string with "\n" separators pushed through
+  // innerHTML, where HTML collapses newlines: four speakers plus two notes
+  // arrived as a single unbroken paragraph under a red warning triangle and a
+  // red "proceed anyway" button. Updating the speakers is the normal,
+  // recommended thing to do, so it gets a calm heading, one short sentence per
+  // group, the speakers as an actual list, and a primary "update now" button.
+  // Names come from the speakers themselves and are escaped: they end up in
+  // innerHTML.
+  const nameList = (arr, cls) =>
+    `<ul${cls ? ` class="${cls}"` : ''}>` +
+    arr.map(x => `<li>${escapeHtml(typeof x === 'string' ? x : getBoxLabel(x))}</li>`).join('') +
+    '</ul>';
+  // Two groups with two different promises: the first restarts, the second
+  // normally does not. Saying which is which up front is the difference between
+  // a run the user can predict and one that surprises them.
+  let body = '';
+  if (updateTargets.length) {
+    body += `<p>${escapeHtml(t('updateAll.confirmLead'))}</p>`
+      + nameList(updateTargets);
+  }
+  if (engineTargets.length) {
+    body += `<p>${escapeHtml(t('updateAll.confirmLeadEngine'))}</p>`
+      + nameList(engineTargets);
+  }
+  if (notes.length) body += nameList(notes, 'warn-notes');
+  const confirmTitle = updateTargets.length ? t('updateAll.confirmTitle') : t('updateAll.confirmTitleEngine');
+  const confirmed = await confirmWarn(confirmTitle, body, {
+    icon: null,
+    calm: true,
+    rich: true,
+    confirmLabel: updateTargets.length ? t('updateAll.confirmBtn') : t('updateAll.confirmBtnEngine'),
+    confirmClass: 'btn btn-primary',
+  });
+  if (!confirmed) return false;
+  // The prompt can sit on screen for a while. Anything that started an OTA in
+  // the meantime (the single-speaker button, a resumed update intent) owns the
+  // speakers now, so do not push a second batch over it.
+  if (state.otaInProgress) {
+    showToast(t('update.alreadyRunning', { name: state.otaTargetName || t('updateAll.batchLabel') }));
+    return false;
+  }
+  try { if (onStart) onStart(); } catch { /* caller's UI concern only */ }
+
+  // Hold the single-box global lock for the whole batch: the single-speaker
+  // buttons then render "update running" and the SSH "remove stick" banner stays
+  // suppressed. The sentinel host makes every real box's button show that state.
+  state.otaInProgress = true;
+  state.otaTargetHost = '__batch__';
+  state.otaTargetName = t('updateAll.batchLabel');
+  checkSshBanner();
+  checkBoxUpdate();
+
+  // Build one overlay row per box.
+  const rowState = new Map(); // host -> { box, el, barFill, phaseEl, outcome }
+  const listEl = $('uaList');
+  if (listEl) listEl.innerHTML = '';
+  for (const b of targets) {
+    const row = document.createElement('div');
+    row.className = 'ua-row';
+    row.innerHTML = `
+      <div class="ua-row-head">
+        <span class="ua-name">${escapeHtml(getBoxLabel(b))}</span>
+        <span class="ua-model">${escapeHtml(b.model || '')}</span>
+        <span class="ua-status" data-role="phase">${escapeHtml(t('updateAll.phase.queued'))}</span>
+      </div>
+      <div class="ua-bar"><div class="ua-bar-fill" data-role="bar"></div></div>`;
+    if (listEl) listEl.appendChild(row);
+    rowState.set(b.host, { box: b, el: row, barFill: row.querySelector('[data-role=bar]'), phaseEl: row.querySelector('[data-role=phase]'), outcome: null });
+  }
+  const counts = () => {
+    let done = 0, fail = 0, defer = 0, busy = 0;
+    for (const r of rowState.values()) {
+      if (r.outcome === 'done') done++;
+      else if (r.outcome === 'failed') fail++;
+      else if (r.outcome === 'agentGone') fail++;
+      // A speaker in its own setup is deferred, not failed: it is very likely
+      // updated and simply off the network while the firmware finishes.
+      else if (r.outcome === 'partial' || r.outcome === 'timeout' || r.outcome === 'boxInSetup') defer++;
+      else busy++;
+    }
+    return { done, fail, defer, busy };
+  };
+  const renderSummary = () => {
+    const c = counts();
+    const sum = $('uaSummary');
+    if (sum) sum.textContent = t('updateAll.summary', { done: c.done, deferred: c.defer, failed: c.fail, total: targets.length });
+  };
+  // Row visuals, three live states and no marching bar anywhere: a row that
+  // WAITS for its turn (queued behind another speaker) shows an empty track and
+  // faint text; a row whose speaker is BUSY on its own (rebooting, settling,
+  // the engine being confirmed) shows a still, dim fill that breathes slowly;
+  // only a real transfer moves a bar, driven by its byte progress. Six rows of
+  // sliding stripes competed with the one transfer that was actually running
+  // and hid it (fleet update 2026-09-06).
+  const setRow = (host, { phaseText, pct, barClass, wait, busy } = {}) => {
+    const r = rowState.get(host); if (!r) return;
+    if (phaseText != null && r.phaseEl) r.phaseEl.textContent = phaseText;
+    if (pct != null && r.barFill) { r.barFill.style.width = Math.max(0, Math.min(100, pct)) + '%'; r.el.classList.remove('ua-wait', 'ua-busy'); }
+    if (wait) { r.el.classList.remove('ua-busy'); r.el.classList.add('ua-wait'); }
+    if (busy) { r.el.classList.remove('ua-wait'); r.el.classList.add('ua-busy'); }
+    if (barClass) { r.el.classList.remove('ua-wait', 'ua-busy', 'ua-done', 'ua-failed', 'ua-defer'); r.el.classList.add(barClass); }
+  };
+
+  const overlay = $('updateAllOverlay');
+  if (overlay) overlay.classList.remove('hidden');
+  renderSummary();
+  // Route the host-tagged live byte-progress to the right row's bar.
+  const offProg = EventsOn('box:update:progress', (p) => {
+    if (!p || typeof p !== 'object' || !p.host || p.pct == null || p.pct < 0) return;
+    // An engine-only repair streams its bytes through this same channel, but a
+    // current agent swaps the engine in place and does NOT restart. Its row
+    // therefore only follows the bar and never claims a restart it will not make.
+    if (engineOnly.has(p.host)) { setRow(p.host, { pct: p.pct }); return; }
+    // At 100% the binary is on the box and it reboots; its reply is often lost
+    // in that reboot, so runBoxUpdate's own 'rebooting' phase does not fire for
+    // another ~minute. Flip the row to "restarting" on upload completion so it
+    // does not sit at "uploading" through a reboot the app cannot yet see.
+    if (p.pct >= 100) { setRow(p.host, { phaseText: withStep(t('updateAll.phase.rebooting'), UPDATE_STEPS.restart), busy: true }); return; }
+    // The first byte is what turns a queued row into an uploading one: the
+    // 'uploading' phase itself fires before the batch gate, while the row is
+    // still waiting for another speaker's transfer to finish.
+    setRow(p.host, { phaseText: withStep(t('updateAll.phase.uploading'), UPDATE_STEPS.send), pct: p.pct });
+  });
+  const mini = $('uaMini');
+  // Reopening is the whole point of the strip, so it is a button, not a label.
+  if (mini) mini.onclick = () => { mini.classList.add('hidden'); if (overlay) overlay.classList.remove('hidden'); };
+  const showMiniIfStillRunning = () => {
+    if (!mini) return;
+    const c = counts();
+    // c.fail and c.defer, not c.failed/c.deferred: counts() has never returned
+    // those names, so the sum was NaN, `left <= 0` was false (every NaN
+    // comparison is), and closing the panel mid-run put up a strip reading
+    // "Still updating NaN speaker(s)" (reported with a bundle, 2026-09-15).
+    //
+    // targets.length, not rows.length: rows holds every speaker the run
+    // INSPECTED, including the ones that turned out to need nothing. Counting
+    // those made the strip claim more speakers were still going than were ever
+    // being updated. renderSummary already uses targets.length for this reason.
+    const left = targets.length - (c.done + c.fail + c.defer);
+    if (left <= 0) { mini.classList.add('hidden'); return; }
+    mini.textContent = t('updateAll.stillRunning', { n: left });
+    mini.classList.remove('hidden');
+  };
+  if ($('uaClose')) {
+    $('uaClose').onclick = () => {
+      if (overlay) overlay.classList.add('hidden');
+      showMiniIfStillRunning();
+    };
+  }
+
+  // The batch writes software to speakers exactly like the single update,
+  // so it carries the same guarantees: the window asks before closing for
+  // the whole run, every speaker's target is written down before its turn,
+  // and a speaker that does not get there produces the copyable report
+  // instead of a red row nobody can act on.
+  try { SetOTARunning(true); } catch {}
+
+  let uaReportShown = false;
+  // runEngineOnly puts the Spotify engine back on a speaker whose agent is
+  // already current. Nothing else is written to it, and a current agent
+  // hot-swaps the engine the moment it lands, so this normally costs no restart
+  // at all. It still records the target first, like every other speaker in the
+  // run, so a window closed halfway is noticed afterwards instead of looking
+  // like nothing ever happened.
+  const runEngineOnly = async (b, gate) => {
+    setRow(b.host, { phaseText: t('updateAll.phase.engineOnly'), busy: true });
+    let outcome = 'failed';
+    try {
+      RecordUpdateIntent(b.host, b.port, (state.appInfo && state.appInfo.version) || '',
+        b.deviceID || '', getBoxLabel(b), true);
+    } catch {}
+    try {
+      const res = await gate.run(() => EnsureSpotifyEngine(b.host, b.port));
+      if (/no embedded engine/i.test(String(res || ''))) {
+        // This app build carries no engine, so there is nothing to deliver.
+        outcome = 'partial';
+        setRow(b.host, { phaseText: t('updateAll.phase.deferred'), pct: 100, barClass: 'ua-defer' });
+      } else {
+        // The same honesty check the update path does: a speaker can lose the
+        // engine again to a reboot right after it was delivered, so confirm it
+        // is really there before the row goes green.
+        let stillMissing = false;
+        try {
+          const fv = await BoxAgentVersion(b.host, b.port);
+          stillMissing = !!(fv && fv.goLibrespot === 'missing');
+        } catch { /* still settling: trust the delivery */ }
+        outcome = stillMissing ? 'partial' : 'done';
+        if (stillMissing) {
+          setRow(b.host, { phaseText: t('updateAll.phase.engineMissing'), pct: 100, barClass: 'ua-defer' });
+        } else {
+          setRow(b.host, { phaseText: t('updateAll.phase.engineDone'), pct: 100, barClass: 'ua-done' });
+          try { ClearUpdateIntent(b.host, b.port); } catch {}
+        }
+      }
+    } catch (e) {
+      outcome = 'failed';
+      const m = String((e && e.message) || e || '');
+      // A full NAND is not something to retry blindly, so it gets its own row
+      // text instead of a bare "failed"; the speaker's own screen names the
+      // other SoundTouch software eating the space.
+      if (/insufficient nand|no space|507/i.test(m)) {
+        setRow(b.host, { phaseText: t('updateAll.phase.engineTooFull'), barClass: 'ua-failed' });
+      } else {
+        setRow(b.host, { phaseText: t('updateAll.phase.failed'), barClass: 'ua-failed' });
+        if (!uaReportShown) {
+          uaReportShown = true;
+          // The engine repair row reaches the speaker the same way, so it
+          // loses the network the same way.
+          if (noNetworkHere(m)) showUpdateNoNetworkNotice();
+          else showUpdateFailureReport(b, 'update-all-engine', String(e));
+        }
+      }
+      try { console.warn('update all: engine repair failed', b.host, e); } catch {}
+    } finally {
+      const r = rowState.get(b.host); if (r) r.outcome = outcome;
+      renderSummary();
+    }
+  };
+
+  const runOne = async (b, gate) => {
+    if (engineOnly.has(b.host)) return runEngineOnly(b, gate);
+    setRow(b.host, { phaseText: t('updateAll.phase.queued'), wait: true });
+    let outcome = 'failed';
+    try {
+      RecordUpdateIntent(b.host, b.port, (state.appInfo && state.appInfo.version) || '',
+        b.deviceID || '', getBoxLabel(b), true);
+    } catch {}
+    try {
+      const result = await runBoxUpdate(b, (ph, d) => {
+        switch (ph) {
+          // 'uploading' fires before the batch gate: the row keeps waiting
+          // until its first progress byte arrives (the progress handler above).
+          case 'uploading': setRow(b.host, { phaseText: t('updateAll.phase.queued'), wait: true }); break;
+          case 'rebooting': setRow(b.host, { phaseText: t('updateAll.phase.rebooting'), busy: true }); break;
+          case 'verifying': setRow(b.host, { phaseText: withStep(t('updateAll.phase.verifying', { remaining: formatRemaining(d.remainingMs) }), UPDATE_STEPS.restart), busy: true }); break;
+          case 'retrying': setRow(b.host, { phaseText: t('updateAll.phase.retrying'), busy: true }); break;
+          case 'settling': setRow(b.host, { phaseText: withStep(t('updateAll.phase.settling', { remaining: formatRemaining(d.remainingMs) }), UPDATE_STEPS.confirm), busy: true }); break;
+          case 'engineQueued': setRow(b.host, { phaseText: t('updateAll.phase.engineQueued'), wait: true }); break;
+          case 'engineUploading': setRow(b.host, { phaseText: t('updateAll.phase.engineUploading'), pct: 0 }); break;
+          case 'spotify': setRow(b.host, { phaseText: spotifyPhaseText(d), busy: true }); break;
+        }
+      }, 1, gate);
+      outcome = result.outcome;
+      // Honesty check: a box can LOSE its just-delivered engine to an extra
+      // reboot AFTER the engine step returned (tight-NAND ST30, the Portable's
+      // battery/fd-leak reboot). So before calling it "done", confirm the engine
+      // is actually present; if it is gone, report "Spotify pending" (deferred)
+      // instead of a green "done". Nothing re-delivers it later on its own any
+      // more, so the record of what this speaker should be running stays, and
+      // the user is told once the next time they open it.
+      if (outcome === 'done') {
+        try {
+          const fv = await BoxAgentVersion(b.host, b.port);
+          if (fv && fv.goLibrespot === 'missing') outcome = 'partial';
+        } catch { /* box still settling: keep the reported outcome */ }
+      }
+      // The SoundTouch 300 drops into its blinking update-pending state after an
+      // OTA and is non-functional until it is unplugged; the agent cannot clear
+      // it. Tell the user that on the row rather than a misleading plain "done".
+      if (outcome !== 'failed' && (b.model || '').includes('300')) {
+        setRow(b.host, { phaseText: t('update.st300PowerCycle'), pct: 100, barClass: 'ua-defer' });
+      } else if (outcome === 'done') setRow(b.host, { phaseText: t('updateAll.phase.done'), pct: 100, barClass: 'ua-done' });
+      else if (outcome === 'partial') setRow(b.host, { phaseText: t('updateAll.phase.engineMissing'), pct: 100, barClass: 'ua-defer' });
+      else if (outcome === 'agentGone') setRow(b.host, { phaseText: t('updateAll.phase.agentGone'), barClass: 'ua-failed' });
+      else if (outcome === 'boxInSetup') setRow(b.host, { phaseText: t('updateAll.phase.boxInSetup'), pct: 100, barClass: 'ua-defer' });
+      else setRow(b.host, { phaseText: t('updateAll.phase.timeout'), barClass: 'ua-defer' });
+    } catch (e) {
+      outcome = 'failed';
+      setRow(b.host, { phaseText: t('updateAll.phase.failed'), barClass: 'ua-failed' });
+      // Same account of the failure the single update gives, for the
+      // FIRST speaker that fails: a wall of reports would help nobody, and
+      // the rest stay on record for the next time each is opened.
+      //
+      // Including the no-network case. The single-speaker button learned to
+      // say "your own network went away" in one line instead of opening a
+      // fault report about a speaker that was fine, and the batch did not,
+      // although the batch is what the reporter ran: his report header reads
+      // "failed at: update-all".
+      if (!uaReportShown) {
+        uaReportShown = true;
+        if (noNetworkHere(String(e))) showUpdateNoNetworkNotice();
+        else showUpdateFailureReport(b, 'update-all', String(e));
+      }
+      try { console.warn('update all: box failed', b.host, e); } catch {}
+    } finally {
+      const r = rowState.get(b.host); if (r) r.outcome = outcome;
+      renderSummary();
+    }
+  };
+
+  // Every speaker starts at once and they queue only for the push itself, so
+  // the restarts, which are the long part and need no network, all happen
+  // together instead of two at a time (see makeUploadGate).
+  const uploadGate = makeUploadGate(1);
+  await Promise.allSettled(targets.map(b => runOne(b, uploadGate)));
+
+  // Batch done: release the global lock, refresh, summarize.
+  offProg();
+  if (mini) mini.classList.add('hidden');
+  try { SetOTARunning(false); } catch {}
+  state.otaInProgress = false;
+  state.otaTargetHost = null;
+  state.otaTargetName = null;
+  renderSummary();
+  try { await discoverBoxes(); checkBoxUpdate(); if (state.view === 'settings') loadBoxSettings(); } catch { /* boxes still rebooting */ }
+  checkSshBanner();
+  const c = counts();
+  // A batch with failures or unconfirmed boxes must not lead with "Done": the
+  // run had every update fail and still read like a success. Timeouts
+  // (the version poll expired without the box confirming) are reported as
+  // unconfirmed, not as deferred work.
+  let unconfirmed = 0;
+  for (const r of rowState.values()) if (r.outcome === 'timeout') unconfirmed++;
+  if (c.fail > 0 || unconfirmed > 0) {
+    showToast(t('updateAll.problemToast', { failed: c.fail, unconfirmed, done: c.done, deferred: c.defer - unconfirmed }));
+  } else {
+    showToast(t('updateAll.doneToast', { done: c.done, deferred: c.defer, failed: c.fail }));
+  }
+  // Any SoundTouch 300 that got this far is now blinking and unreachable until
+  // someone unplugs it once. The row already says so, but the row scrolls away
+  // with the panel, so the instruction also gets the stays-until-dismissed
+  // treatment.
+  if (targets.some(b => (b.model || '').includes('300') && ((rowState.get(b.host) || {}).outcome !== 'failed'))) {
+    showSt300PowerCycleNotice();
+  }
+  return true;
+}
+
+function updateBoxUiVisibility() {
+  const hasBox = !!state.currentBox;
+  const hasSTM = state.boxes.some(b => b.kind !== 'stock');
+  const stockOnly = !hasSTM && (state.boxes || []).some(b => b && b.kind === 'stock');
+  $('boxControls').classList.toggle('hidden', !hasBox);
+  const hint = $('boxHint');
+  if (!hint) return;
+  // Three states, not two. The third is somebody's FIRST time: their speaker is
+  // on the network and still runs the Bose firmware, so there is nothing to
+  // control yet. That used to leave the page blank with no hint of what to do,
+  // which is the one moment a new user decides whether this product works.
+  if (stockOnly && !hasBox) {
+    hint.innerHTML = `<p><b>${escapeHtml(t('speaker.stockConfirmTitle'))}</b></p>`
+      + `<p class="muted">${escapeHtml(t('speaker.stockTooltip'))}</p>`
+      + `<button class="btn btn-primary" id="boxHintSetup">${escapeHtml(t('speaker.stockConfirmCta'))}</button>`;
+    hint.classList.remove('hidden');
+    const go = $('boxHintSetup');
+    if (go) go.onclick = () => switchView('setup');
+    return;
+  }
+  hint.innerHTML = `<p>${escapeHtml(t('speaker.choose'))}</p>`;
+  hint.classList.toggle('hidden', !hasSTM || hasBox);
+}
+
+let loadedPresetsBoxKey = null;
+// presetSignature reduces the preset list to what a tile actually draws, so a
+// re-read that returns the same thing costs one comparison and no redraw.
+function presetSignature(list) {
+  return (list || [])
+    .map(p => [p.slot, p.type || '', p.name || '', p.stream_url || '', p.art || ''].join(''))
+    .join('');
+}
+
+let _lastPresetCheck = 0;
+// How often the preset list is re-read from the speaker. Deliberately slower
+// than the status poll: this only has to catch a change made somewhere else,
+// which is a human pressing save on their phone, and nothing here is worth
+// another request per status tick.
+const PRESET_RECHECK_MS = 15000;
+
+// refreshPresetsIfChanged re-reads the presets and redraws only when they
+// differ from what is on screen. Fired from the status poll, never awaited.
+//
+// It reads the agent's own preset store, not the Bose firmware, so it does not
+// add to the :8090 load that keeps the status cadence deliberately slow.
+async function refreshPresetsIfChanged() {
+  const box = state.currentBox;
+  if (!box || state.view !== 'box') return;
+  if (Date.now() - _lastPresetCheck < PRESET_RECHECK_MS) return;
+  _lastPresetCheck = Date.now();
+  let fresh;
+  try {
+    fresh = await GetPresets(box.host, box.port) || [];
+  } catch {
+    return; // a missed poll changes nothing; the next one tries again
+  }
+  if (state.currentBox !== box) return; // speaker switched while we were reading
+  // Same transient-empty guard loadPresets uses: a busy speaker can answer
+  // with zero presets while its store reloads, and taking that at face value
+  // is what used to make the whole grid vanish.
+  if (fresh.length === 0 && state.presets.length > 0) return;
+  if (presetSignature(fresh) === presetSignature(state.presets)) return;
+  state.presets = fresh;
+  renderPresets();
+  healPresetLogos();
+  loadBoxPresets();
+}
+
+// isMeasurableStreamPreset reports whether a measured bitrate is worth storing
+// on this key at all.
+//
+// It is worth it for a live radio stream, where the rate is a property of the
+// broadcast and the directory often has none. It is meaningless for a file on a
+// media server, whose rate is a property of the file and which the library
+// already reads, and it is actively harmful there: persisting it runs the key
+// through a radio-shaped write that drops the source field, so the next press
+// went through the radio relay instead of fetching the file. On one
+// reporter's speaker that rewrote the same slot about twenty times in
+// twenty-five minutes, which is flash wear for a number that means nothing.
+function isMeasurableStreamPreset(p) {
+  if (!p) return false;
+  if (p.type === 'spotify' || p.type === 'queue') return false;
+  if (p.source) return false;                       // from a media server
+  if (p.items && p.items.length) return false;      // a saved folder
+  return true;
+}
+
+// setPresetIfUnchanged persists a METADATA self-heal (a measured bitrate, a
+// healed logo) for a slot, but only after re-reading the store and proving the
+// slot still holds the station the patch was computed for. The cached preset
+// list can be up to PRESET_RECHECK_MS behind, and a fire-and-forget SetPreset
+// built from that cache silently reverts a save another client made in
+// between: the reporter saved a station from the phone page and this app
+// wrote the previous station back over it six seconds later, every time, for
+// six rounds. A metadata write must never decide WHICH station a key holds,
+// so on any mismatch it adopts the fresh list and walks away.
+async function setPresetIfUnchanged(box, cached, patch) {
+  let fresh;
+  try {
+    fresh = await GetPresets(box.host, box.port) || [];
+  } catch { return false; }
+  if (state.currentBox !== box) return false;
+  const live = fresh.find(x => x.slot === cached.slot);
+  // A metadata heal must not be able to change WHAT a key is. SetPreset sends a
+  // fixed type=radio and exactly seven fields, so writing it onto a key that
+  // carries anything else silently flattens it: a media-library key lost the
+  // source field that decides whether the track is fetched from the server or
+  // pulled through the radio relay, and a folder key would lose its track list.
+  // Guarded here rather than at each caller, because this is the only place
+  // that has the LIVE preset in hand.
+  const flattenable = live && (live.type === 'spotify' || live.type === 'queue' ||
+    live.source || live.uri || (live.items && live.items.length));
+  const held = live && !flattenable &&
+    live.stream_url === cached.stream_url && live.name === cached.name;
+  if (!held) {
+    // The slot changed under us (or the read raced a save): show reality
+    // instead of overwriting it. Same transient-empty guard the pollers use.
+    if (fresh.length > 0 || state.presets.length === 0) {
+      state.presets = fresh;
+      _lastPresetCheck = Date.now();
+      renderPresets();
+    }
+    return false;
+  }
+  try {
+    await SetPreset(box.host, box.port, live.slot, live.name, live.stream_url,
+      patch.art !== undefined ? patch.art : (live.art || ''),
+      patch.bitrate !== undefined ? patch.bitrate : (live.bitrate || 0),
+      live.homepage || '', live.codec || '');
+    return true;
+  } catch { return false; }
+}
+
+async function loadPresets(retry = 0) {
+  if (!state.currentBox) return;
+  // Drop another box's box-native presets the moment we switch, so a Deezer tile
+  // from the previous speaker never flashes on this one's empty slot. Kept across
+  // same-box refreshes so the tiles don't flicker on every reload.
+  const boxKey = state.currentBox.host + ':' + state.currentBox.port;
+  // The previous speaker's STORE tiles go too. They used to stay clickable on
+  // the new speaker until its own read landed (1.5 s, longer when the read
+  // threw), and a click in that window sent play(slot) to a speaker whose
+  // store had nothing on that key: the "slot rejected ... preset not
+  // configured" 404 in the bundle. The transient-empty retry below still
+  // applies to same-box refreshes, which this does not touch.
+  if (boxKey !== loadedPresetsBoxKey) {
+    state.boxPresets = []; state.boxSnapshot = null; state.presets = []; loadedPresetsBoxKey = boxKey;
+  }
+  if (state.presets.length === 0) {
+    $('presets').innerHTML = `<div class="muted small grid-loading">${escapeHtml(t('preset.loading'))}</div>`;
+  }
+  try {
+    const fresh = await GetPresets(state.currentBox.host, state.currentBox.port) || [];
+    // Guard against a transient empty result. The box can briefly return zero
+    // presets while it is busy (switching source for a play) or its store is
+    // reloading, even though presets.json is intact. Overwriting with [] made all
+    // presets "vanish" from the grid after playing a radio, then reappear on the
+    // next save (a display-only loss; the box never lost them). If we suddenly
+    // read empty but currently have presets, retry once before trusting it and
+    // keep the current presets meanwhile, so the grid never flashes empty. A
+    // genuinely empty box (or an empty result that persists past the retry) is
+    // still taken at face value.
+    if (fresh.length === 0 && state.presets.length > 0 && retry < 1) {
+      setTimeout(() => loadPresets(retry + 1), 1500);
+      return;
+    }
+    state.presets = fresh;
+    // This IS a fresh read, so the background re-check starts its interval
+    // from here instead of firing again right after a box switch or a save.
+    _lastPresetCheck = Date.now();
+    renderPresets();
+    healPresetLogos();
+    loadBoxPresets();
+    loadBoxSnapshot();
+  } catch {
+    if (retry < 1) {
+      setTimeout(() => loadPresets(retry + 1), 1500);
+      return;
+    }
+    if (state.presets.length > 0) {
+      renderPresets();
+    } else {
+      $('presets').innerHTML = `<div class="muted small">${escapeHtml(t('preset.speakerUnreachable'))}</div>`;
+    }
+  }
+}
+
+// loadBoxPresets reads the box's OWN presets (including foreign sources like
+// Deezer that STM did not set) so a slot STM does not manage can still be shown
+// and recalled. Best-effort: on error or empty, the grid just shows no
+// box-native tiles. The box reports these over gabbo; the agent serves the
+// cached list, so this is one cheap app-side read, no box poll.
+async function loadBoxPresets() {
+  if (!state.currentBox) { state.boxPresets = []; return; }
+  try {
+    state.boxPresets = await BoxPresets(state.currentBox.host, state.currentBox.port) || [];
+  } catch { state.boxPresets = []; return; }
+  renderPresets();
+  renderPresetLossNotice();
+}
+
+let loadedSnapshotBoxKey = null;
+
+// loadBoxSnapshot reads the agent's pre-takeover snapshot of the box (presets +
+// sources captured before STM took over the box's cloud endpoints). It is the
+// only record of account-linked cloud sources (e.g. Deezer) that STM cannot
+// carry over yet: once STM is on the box, the box's next account sync drops
+// those sources and the presets bound to them. One cheap app-side read per box
+// (the agent serves a cached NAND file); on error the notice simply never shows.
+async function loadBoxSnapshot() {
+  if (!state.currentBox) { state.boxSnapshot = null; renderPresetLossNotice(); return; }
+  const boxKey = state.currentBox.host + ':' + state.currentBox.port;
+  if (boxKey === loadedSnapshotBoxKey && state.boxSnapshot) { renderPresetLossNotice(); return; }
+  loadedSnapshotBoxKey = boxKey;
+  let snap = null;
+  try { snap = await BoxSnapshot(state.currentBox.host, state.currentBox.port); } catch { snap = null; }
+  if (snap && snap.captured === false) snap = null;
+  if (snap) {
+    const dev = snap.deviceID || boxKey;
+    try { snap._dismissed = await GetAppFlag('box-loss-notice:' + dev); } catch { snap._dismissed = false; }
+  }
+  state.boxSnapshot = snap;
+  renderPresetLossNotice();
+}
+
+// lostPresetsNow returns the snapshot's account-linked presets that are no
+// longer present on the box (the slot is empty in both STM's presets and the
+// box's own presets), i.e. the ones STM's takeover dropped. A Deezer preset that
+// still shows as a box-native tile is intentionally NOT reported.
+function lostPresetsNow() {
+  const snap = state.boxSnapshot;
+  if (!snap || !Array.isArray(snap.lostPresets)) return [];
+  return snap.lostPresets.filter((lp) => {
+    const live = state.presets.find((x) => x.slot === lp.slot) ||
+      (state.boxPresets || []).find((x) => x.slot === lp.slot);
+    return !live;
+  });
+}
+
+// lostStrKey reports whether a speaker-side preset is a key STM itself wrote
+// that the store no longer backs. The decision is isLostStrKey in
+// utils.js, where it can be tested: the agent's verdict when it sends one
+// (it alone knows the webhook-only keys, which look exactly like dead
+// keys from the location), the location otherwise. Called only for slots the
+// store has nothing on, so a true answer means a dead key.
+function lostStrKey(bp) {
+  return isLostStrKey(bp);
+}
+
+// lostStrKeysNow lists the dead STM keys of the current speaker: speaker-side
+// slots STM wrote whose store slot is empty.
+function lostStrKeysNow() {
+  return (state.boxPresets || []).filter((bp) =>
+    lostStrKey(bp) && !state.presets.find((x) => x.slot === bp.slot));
+}
+
+// The dead-key banner is dismissed per speaker for this app run only. A
+// persisted flag would hide it after the NEXT reinstall too, and the keys it
+// names are gone from the grid anyway once they are copied back (or once the
+// agent prunes them), so it stops showing by itself.
+const lostKeysDismissed = new Set();
+
+// renderPresetLossNotice shows a dismissible banner above the preset grid when
+// the box dropped account-linked presets STM cannot carry over (e.g. Deezer),
+// listing the affected slots so the user knows what was there. Since it
+// also covers dead STM keys: speaker-side slots STM wrote before a reinstall
+// whose store slot is now empty, with the way to get them back. Idempotent:
+// re-creates or removes a single #preset-loss-notice element each call.
+function renderPresetLossNotice() {
+  const grid = $('presets');
+  if (!grid || !grid.parentNode) return;
+  let el = document.getElementById('preset-loss-notice');
+  const snap = state.boxSnapshot;
+  const lost = lostPresetsNow();
+  const services = (snap && Array.isArray(snap.lostServices)) ? snap.lostServices : [];
+  const showSnapshot = !!snap && !snap._dismissed && lost.length > 0 && services.length > 0;
+  const boxKey = state.currentBox ? (state.currentBox.host + ':' + state.currentBox.port) : '';
+  const lostKeys = lostKeysDismissed.has(boxKey) ? [] : lostStrKeysNow();
+  if (!showSnapshot && lostKeys.length === 0) {
+    if (el) el.remove();
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'preset-loss-notice';
+    el.className = 'loss-notice';
+    grid.parentNode.insertBefore(el, grid);
+  }
+  let title, body;
+  if (showSnapshot) {
+    const svc = services.map((s) => boxSourceLabel(s)).join(', ');
+    const slots = lost.map((lp) => `${lp.slot} (${lp.name || boxSourceLabel(lp.source)})`).join(', ');
+    title = t('preset.lossTitle', { service: svc });
+    body = t('preset.lossBody', { service: svc, slots });
+  } else {
+    const slots = lostKeys.map((bp) => `${bp.slot} (${bp.name || boxSourceLabel(bp.source)})`).join(', ');
+    title = t('preset.lostKeysTitle', { n: lostKeys.length });
+    body = t('preset.lostKeysBody', { slots });
+  }
+  el.innerHTML =
+    `<div class="loss-notice-body">` +
+      `<strong>${escapeHtml(title)}</strong>` +
+      `<div class="small">${escapeHtml(body)}</div>` +
+    `</div>` +
+    `<button type="button" class="loss-notice-dismiss" aria-label="${escapeAttr(t('preset.lossDismiss'))}">&times;</button>`;
+  const btn = el.querySelector('.loss-notice-dismiss');
+  if (btn) {
+    btn.addEventListener('click', async () => {
+      if (showSnapshot) {
+        if (state.boxSnapshot) state.boxSnapshot._dismissed = true;
+        const dev = (snap && snap.deviceID) ||
+          (state.currentBox && (state.currentBox.host + ':' + state.currentBox.port));
+        try { await SetAppFlag('box-loss-notice:' + dev); } catch { /* best-effort */ }
+      } else {
+        lostKeysDismissed.add(boxKey);
+      }
+      el.remove();
+    });
+  }
+}
+
+// boxSourceLabel turns the box's raw source enum (DEEZER, LOCAL_INTERNET_RADIO,
+// ...) into a friendly name for the tile badge.
+function boxSourceLabel(source) {
+  const s = String(source || '').toUpperCase();
+  const map = {
+    DEEZER: 'Deezer', SPOTIFY: 'Spotify', AMAZON: 'Amazon Music',
+    TUNEIN: 'TuneIn', LOCAL_INTERNET_RADIO: 'Internet radio',
+    INTERNET_RADIO: 'Internet radio', LOCAL_MUSIC: 'Library', STORED_MUSIC: 'Library',
+    BLUETOOTH: 'Bluetooth', AIRPLAY: 'AirPlay',
+  };
+  if (map[s]) return map[s];
+  // Unknown: title-case the first token (DEEZER_HIFI -> Deezer).
+  const first = s.split('_')[0] || s;
+  return first ? first.charAt(0) + first.slice(1).toLowerCase() : '';
+}
+
+// recallBoxPreset plays one of the box's own presets by pressing its hardware
+// preset key (the box plays it through its own cached account, e.g. Deezer).
+async function recallBoxPreset(slot) {
+  if (!state.currentBox) return;
+  try {
+    await RecallBoxPreset(state.currentBox.host, state.currentBox.port, slot);
+  } catch (err) {
+    showError(t('preset.boxRecallFailed', { err: String((err && err.message) || err) }));
+  }
+}
+
+// healPresetLogos searches radio-browser for the station name of any
+// preset that has no logo (legacy presets from the pre-logo era or
+// presets added via hardware) and adopts the favicon. Persists the
+// result back to the stick so it also shows up on the speaker
+// display.
+let healingInProgress = false;
+async function healPresetLogos() {
+  if (healingInProgress) return;
+  if (!state.currentBox) return;
+  // "No logo" includes two shapes older saves left behind (aftermath):
+  // art that is ONLY box-local (the agent's /icon.png stand-in or a broken
+  // art-proxy wrapper), which renders artless on every machine but this box,
+  // and art still CARRYING any box-form candidate (see artCarriesBoxForm).
+  // The latter must be re-looked-up, not merely unwrapped at render:
+  // unwrapping yields the single URL the agent had picked as box-drawable,
+  // and on the reporter's playing key that is a DuckDuckGo icon URL answering
+  // 404 with the grey-chevron image body (probed 2026-08-24), which the
+  // webview draws without firing onerror, so the tile's cascade ends on the
+  // chevron anyway. Healing writes a full real chain once and the filter goes
+  // false, so this adds no recurring work for healthy keys.
+  const missing = state.presets.filter(p =>
+    p.name && (!appArtFromBoxArt(p.art) || artCarriesBoxForm(p.art)));
+  if (missing.length === 0) return;
+  healingInProgress = true;
+  try {
+    await Promise.all(missing.map(async (p) => {
+      try {
+        // Intentionally tolerant: NO onlyok filter (even a station
+        // flagged broken usually still has a logo). The limit is
+        // high enough to find an exact name match among several
+        // stations sharing the same name.
+        const list = await RadioSearch({ q: p.name, limit: 12, order: 'votes', top: false }) || [];
+        const wanted = p.name.toLowerCase().trim();
+        // 1) Exact name match.
+        let pick = list.find(s => (s.name || '').toLowerCase().trim() === wanted);
+        // 2) Substring match in either direction (e.g. "NDR2" vs
+        //    "NDR 2").
+        if (!pick) {
+          pick = list.find(s => {
+            const n = (s.name || '').toLowerCase().trim();
+            return n && (n.includes(wanted) || wanted.includes(n));
+          });
+        }
+        // 3) Same stream host implies the same station.
+        if (!pick && p.stream_url) {
+          const wantHost = extractHost(p.stream_url);
+          if (wantHost) {
+            pick = list.find(s => {
+              return extractHost(s.url) === wantHost || extractHost(s.url_resolved) === wantHost;
+            });
+          }
+        }
+        if (!pick) return;
+        const logo = stationLogoChain(pick);
+        if (!logo) return;
+        // Radio-only: SetPreset sends type=radio with no uri, so never persist
+        // onto a Spotify preset or its URI is lost. Guarded: the heal must not
+        // revert a slot another client re-saved meanwhile.
+        if (p.type === 'spotify') return;
+        p.art = logo;
+        await setPresetIfUnchanged(state.currentBox, p, { art: logo });
+      } catch {}
+    }));
+  } finally {
+    healingInProgress = false;
+    renderPresets();
+  }
+}
+
+// ---------- Preset Render mit Long Press Support ----------
+
+// BOX_LOOPBACK is the agent's own host:port as seen from the box (the agent runs
+// on the box). It is the single source for the loopback URLs the frontend builds
+// to optimistically reflect what the box is about to play; the Go side mirrors
+// these in internal/boxurl. Keep the two in sync.
+const BOX_LOOPBACK = 'http://127.0.0.1:8888';
+const boxSpotifyDefaultUrl = () => `${BOX_LOOPBACK}/spotify/stream.ogg`;
+
+// decodeProxyUrl unwraps a stream-proxy URL
+// (http://<host>:8888/stream/raw?u=<base64url real URL>) back to the real
+// upstream URL it wraps; returns the input unchanged otherwise. A preset MUST
+// store the real station URL, never the proxy wrapper: since v0.7.16 ad-hoc radio
+// plays through the proxy, so the box's now-playing location is the wrapper.
+// Saving that made the box, on recall, ask the proxy to fetch its own loopback
+// URL, which the agent's SSRF guard blocks, so nothing played (the ST20 "plays
+// nothing" regression).
+function decodeProxyUrl(loc) {
+  if (!loc) return loc;
+  try {
+    const u = new URL(loc);
+    if (u.pathname !== '/stream/raw') return loc;
+    const enc = u.searchParams.get('u');
+    if (!enc) return loc;
+    const real = atob(enc.replace(/-/g, '+').replace(/_/g, '/'));
+    if (/^https?:\/\//i.test(real)) return real;
+  } catch { /* not a parseable proxy URL: fall through */ }
+  return loc;
+}
+
+// spotifyURIFromContainer recovers the spotify: context URI from a box
+// now-playing location of the form "/playback/container/<base64 spotify:...>"
+// (STM writes this when it plays a Spotify selection; the agent encodes it
+// URL-safe, see internal/webui legacySpotifyURI). Used as a save-time fallback
+// when go-librespot's /spotify/info reports no context even though a real
+// playlist is playing. Returns "" when the location is not a container or
+// does not decode to a spotify: URI.
+function spotifyURIFromContainer(loc) {
+  const marker = '/playback/container/';
+  const i = (loc || '').indexOf(marker);
+  if (i < 0) return '';
+  let enc = loc.slice(i + marker.length);
+  const j = enc.search(/[/?#]/);
+  if (j >= 0) enc = enc.slice(0, j);
+  try {
+    const uri = atob(enc.replace(/-/g, '+').replace(/_/g, '/'));
+    return uri.startsWith('spotify:') ? uri : '';
+  } catch { return ''; }
+}
+
+// SPOTIFY_LOGO moved to logos.js (shared with the Recently-played view).
+
+// presetStateLabel returns the small state line shown on a preset tile: an
+// error, or the now-playing state when this preset is the active one. Keeps the
+// play-state -> CSS-class + i18n-key mapping in one place.
+function presetStateLabel(slot, isActive, hasErr) {
+  if (hasErr) {
+    return `<div class="preset-state state-err">&#9888; ${escapeHtml(state.presetErrors[slot])}</div>`;
+  }
+  if (!isActive) return '';
+  const map = {
+    PLAY_STATE: ['state-play', 'preset.statePlay'],
+    BUFFERING_STATE: ['state-buf', 'preset.stateBuf'],
+    PAUSE_STATE: ['state-pause', 'preset.statePause'],
+  };
+  const m = map[state.nowPlayState];
+  return m ? `<div class="preset-state ${m[0]}">${escapeHtml(t(m[1]))}</div>` : '';
+}
+
+// Preset transfer (music view): one button that pushes THIS speaker's six
+// presets onto another box. Clicking asks which target to send to (a picker of
+// the other STM speakers, plus an "all" option when there is more than one),
+// then reuses the same CopyPresetsAcrossBoxes backend + settingsView.copyPresets
+// strings as the Expert transfer in the speaker settings. The source agent
+// serves its live store, so only the target identity is chosen here.
+function presetTransferTargets() {
+  const box = state.currentBox;
+  if (!box || box.kind === 'stock') return [];
+  return (state.boxes || []).filter(b => b && b.kind !== 'stock' && b.host && b.host !== box.host);
+}
+
+function updatePresetTransferRow() {
+  const btn = $('presetTransferBtn');
+  if (!btn) return;
+  const targets = presetTransferTargets();
+  const ok = targets.length > 0;
+  btn.disabled = !ok;
+  btn.title = ok ? t('settingsView.copyPresetsHeading') : t('presets.transferNoTargets');
+  btn.setAttribute('aria-label', btn.title);
+}
+
+function wirePresetTransferRow() {
+  const btn = $('presetTransferBtn');
+  if (!btn || btn.dataset.wired) return;
+  btn.dataset.wired = '1';
+  btn.onclick = async () => {
+    const box = state.currentBox;
+    if (!box || box.kind === 'stock') return;
+    const targets = presetTransferTargets();
+    if (!targets.length) { showToast(t('presets.transferNoTargets')); return; }
+    const opts = targets
+      .map(b => `<option value="${escapeAttr(b.host)}|${b.port || 0}">${escapeHtml(getBoxLabel(b))}</option>`)
+      .join('');
+    const allOpt = targets.length > 1
+      ? `<option value="__ALL__">${escapeHtml(t('settingsView.copyPresetsAllTargets'))}</option>`
+      : '';
+    const body = `<p>${escapeHtml(t('settingsView.copyPresetsHelp'))}</p>`
+      + `<select id="presetXferTarget" class="preset-xfer-select" style="width:100%;box-sizing:border-box;">${opts}${allOpt}</select>`;
+    const ok = await confirmWarn(t('settingsView.copyPresetsHeading'), body, {
+      confirmLabel: t('presets.transferBtn'),
+      confirmClass: 'btn btn-warning',
+    });
+    if (!ok) return;
+    const sel = document.querySelector('#presetXferTarget');
+    const val = sel ? sel.value : '';
+    if (!val) return;
+    btn.disabled = true;
+    const origLabel = btn.textContent;
+    btn.textContent = t('settingsView.copyPresetsBusyBtn');
+    // Persistent progress toast: the copy also carries the Spotify login and
+    // restarts the target's engine, which takes a few seconds over the LAN.
+    // Without a visible "running" state the row looks idle and invites a
+    // second press (same trap as the STM install button).
+    showToast(t('settingsView.copyPresetsProgress'), 0);
+    try {
+      if (val === '__ALL__') {
+        let done = 0;
+        const failed = [];
+        for (const tb of targets) {
+          try {
+            await CopyPresetsAcrossBoxes(box.host, box.port || 0, tb.host, tb.port || 0);
+            done++;
+          } catch { failed.push(getBoxLabel(tb)); }
+        }
+        if (failed.length) showError(t('settingsView.copyPresetsAllPartial', { done, total: targets.length, failed: failed.join(', ') }));
+        else showToast(t('settingsView.copyPresetsAllDone', { n: targets.length }));
+      } else {
+        const [thost, tportRaw] = val.split('|');
+        const tport = parseInt(tportRaw, 10) || 0;
+        const target = targets.find(b => b.host === thost);
+        const n = await CopyPresetsAcrossBoxes(box.host, box.port || 0, thost, tport);
+        showToast(t('settingsView.copyPresetsDone', { n, target: target ? getBoxLabel(target) : thost }));
+      }
+    } catch (e) {
+      // The target already holds one of the stations on a key this transfer
+      // does not rewrite, so it refused the whole set and wrote nothing. That
+      // used to surface as the agent's raw 409 JSON in an error dialog.
+      const conflict = presetCopyConflict(e);
+      if (conflict) showError(t('settingsView.copyPresetsConflict', { name: conflict.name, n: conflict.slot }));
+      else showError(e);
+    } finally {
+      btn.textContent = origLabel;
+      updatePresetTransferRow();
+    }
+  };
+}
+
+// ---- Group control (below the presets, next to Transfer) ----
+// Chips to add/remove the other speakers to a multiroom group led by the
+// selected speaker, plus one volume slider for the whole group. Bose forms the
+// zone natively; the group's name comes from the master (see the Multi-Room tab).
+
+// currentGroupSlaves returns the speakers currently following the selected box
+// in a live zone (the shared groups.js view of the same state.zoneLive the
+// group frames use).
+function currentGroupSlaves() {
+  const box = groupControlBox();
+  if (!box || !box.deviceID) return [];
+  return followersOf(box.deviceID, state.zoneLive, state.boxes).filter(b => b.host !== box.host);
+}
+
+// effectivePlayTarget returns the box a play command must actually go to: a
+// zone FOLLOWER rejects direct UPnP control (the firmware answers 501 "Can't
+// control member of group"), so when the selected box follows a master,
+// the play belongs on that master and it distributes the audio to the group.
+// Falls back to the selected box (standalone, master, or master not found).
+// The decision itself is groups.js's resolvePlayTarget; this wraps it around
+// the app state and logs the retarget.
+function effectivePlayTarget() {
+  const box = state.currentBox;
+  const target = resolvePlayTarget(box, state.zoneLive, state.boxes);
+  if (target !== box && target) {
+    try { console.info(`play retargeted to group lead ${target.host} (selected box is a zone follower)`); } catch {}
+  }
+  return target;
+}
+
+// groupControlBox returns the box the group controls operate on. A zone FOLLOWER
+// has no followers of its own and the firmware rejects zone edits aimed at it, so
+// the group panel used to render empty for a selected member: membership could
+// only be changed while the master was selected, and picking a member to adjust
+// its volume dropped the group controls with no hint the box was still grouped
+// (akuethe, 8-box zone, 2026-07-14). Resolve to the master so the chips + group
+// volume work from any selected member. A standalone or master box returns itself.
+function groupControlBox() {
+  return resolvePlayTarget(state.currentBox, state.zoneLive, state.boxes) || state.currentBox;
+}
+
+let _groupVolTimer = null;
+// setGroupVolume moves the master AND every follower to pct, so the slider
+// controls the whole group. Debounced so a slider drag does not flood the boxes.
+// groupVol holds the per-member levels the user set, plus the group slider
+// position they were captured at.
+//
+// The group slider is RELATIVE, and that is the whole point of: speakers of
+// different types need different levels to sound equally loud, and the old
+// behaviour of writing one absolute value to every member destroyed that balance
+// on the first group adjustment. Now the group slider shifts every member by the
+// same offset, and the offset is always computed against the captured baseline
+// rather than against the current levels. That matters at the ends: without it,
+// members that hit 0 or 100 would silently lose their spacing and never get it
+// back. Computing from the baseline means returning the slider to where it was
+// restores exactly the levels the user dialled in.
+const groupVol = { base: {}, at: null, members: {} };
+
+// captureGroupBaseline snapshots the members' current levels as the reference
+// the group slider offsets from.
+function captureGroupBaseline(anchor) {
+  groupVol.base = {};
+  Object.keys(groupVol.members).forEach(h => { groupVol.base[h] = groupVol.members[h]; });
+  groupVol.at = anchor;
+}
+
+function setGroupVolume(pct) {
+  if (_groupVolTimer) clearTimeout(_groupVolTimer);
+  _groupVolTimer = setTimeout(() => {
+    const box = groupControlBox();
+    if (!box) return;
+    const all = [box, ...currentGroupSlaves()];
+    if (groupVol.at === null) captureGroupBaseline(pct);
+    const delta = pct - groupVol.at;
+    all.forEach(b => {
+      const base = typeof groupVol.base[b.host] === 'number' ? groupVol.base[b.host] : pct;
+      const v = Math.max(0, Math.min(100, Math.round(base + delta)));
+      groupVol.members[b.host] = v;
+      SetBoxVolume(b.host, b.port, v).catch(() => {});
+      const el = document.getElementById('memberVol-' + cssId(b.host));
+      if (el && document.activeElement !== el) {
+        el.value = String(v);
+        const lbl = document.getElementById('memberVolVal-' + cssId(b.host));
+        if (lbl) lbl.textContent = String(v);
+      }
+    });
+  }, 120);
+}
+
+// setMemberVolume sets ONE speaker in the group and makes that the new balance:
+// the baseline is re-captured so the next group move offsets from what the user
+// just dialled in.
+function setMemberVolume(host, port, pct) {
+  groupVol.members[host] = pct;
+  const slider = $('groupVolume');
+  captureGroupBaseline(slider ? parseInt(slider.value, 10) : pct);
+  SetBoxVolume(host, port, pct).catch(() => {});
+}
+
+// cssId makes a host safe to embed in an element id.
+function cssId(host) { return String(host).replace(/[^a-zA-Z0-9]/g, '_'); }
+
+// loadGroupMemberVolumes reads each member's current level so the per-speaker
+// sliders start where the speakers actually are, not at a guess.
+async function loadGroupMemberVolumes(members) {
+  await Promise.all(members.map(async b => {
+    try {
+      const data = await BoxSettings(b.host, b.port);
+      const v = data && data.volume && data.volume.actual;
+      if (typeof v !== 'number') return;
+      groupVol.members[b.host] = v;
+      const el = document.getElementById('memberVol-' + cssId(b.host));
+      if (el && document.activeElement !== el) {
+        el.value = String(v);
+        const lbl = document.getElementById('memberVolVal-' + cssId(b.host));
+        if (lbl) lbl.textContent = String(v);
+      }
+    } catch {}
+  }));
+  // Re-anchor from the freshly read levels, but never while the user is
+  // touching the panel: doing that mid-drag measured the next move against
+  // levels our own writes had already changed, which is how a drag gave away
+  // most of its travel.
+  if (groupPanelBusy()) return;
+  // Position the group slider at the members' ACTUAL level (the loudest member)
+  // and anchor there. The slider is relative, so if it sits at 0 while the
+  // members are at 29 it can only ADD an offset, never subtract, and the group
+  // cannot be turned down at all (screenshot 2026-09-03: group slider 0, members
+  // 29, and every box had to be lowered by hand). Anchoring from the loudest
+  // member means dragging the slider down lowers every speaker.
+  const levels = Object.values(groupVol.members).filter(v => typeof v === 'number' && v >= 0);
+  const rep = levels.length ? Math.max(...levels) : null;
+  const slider = $('groupVolume');
+  if (slider && rep !== null && document.activeElement !== slider) {
+    slider.value = String(rep);
+    captureGroupBaseline(rep);
+  } else {
+    captureGroupBaseline(slider ? parseInt(slider.value, 10) : 0);
+  }
+}
+
+// toggleGroupMember adds/removes the speaker at host to/from the group led by
+// the selected box. Removing the last one dissolves the zone; a removed
+// speaker is stopped so the music stops on it too. The edit starts from
+// groups.js's groupMembersOf — the union of the followers' self-reports and
+// the master's own member list — so a follower whose single zone poll failed
+// or that briefly dropped out of discovery is preserved instead of being
+// silently kicked by an unrelated add/remove.
+// Group edits run strictly one at a time.
+//
+// Forming a zone drives the master's firmware and takes a few seconds: eleven
+// speakers took eighteen. Nothing stopped a second click starting a second
+// drive on top of the first, and an owner who taps again because nothing has
+// visibly happened is the normal case, not an unusual one. A field log from a
+// twelve-speaker household (2026-08-08) shows the shape exactly: the group of
+// twelve formed perfectly, then ten overlapping requests for a smaller group
+// inside nineteen seconds, after which the master's /setZone stopped answering
+// at all and every attempt after that timed out.
+//
+// Serialising is most of the fix: each edit still happens, it just waits its
+// turn, and the queued one recomputes the membership when it actually runs, so
+// it sees the result of the edit before it.
+//
+// The rest is refusing a repeat for a speaker whose edit has not finished. That
+// is a toggle, so without it a second impatient tap on the same speaker would
+// faithfully undo the first, and the owner who tapped twice because it felt
+// slow would end up with the speaker they wanted OUT of the group. A later tap,
+// once the first has completed, is a real change of mind and still works.
+const groupOpPending = new Set();
+let groupOpChain = Promise.resolve();
+
+// Several chips clicked in a row become ONE group edit.
+//
+// Each click used to drive its own zone form, and a zone form takes seconds and
+// interrupts the audio, so adding three speakers meant three interruptions and
+// three repaints while the owner was still clicking. The phone remote already
+// behaves the way people expect: every press is acknowledged at once and the
+// speakers join together.
+//
+// So a click marks the chip immediately and records the intent, and the edit
+// runs once the clicking stops. The window is short enough that a single click
+// still feels immediate.
+const GROUP_EDIT_COALESCE_MS = 600;
+const pendingGroupEdits = new Map(); // host -> port
+let groupEditTimer = null;
+
+function toggleGroupMember(host, port) {
+  if (groupOpPending.has(host)) return groupOpChain;
+  // Toggling the same speaker twice before the edit runs is a change of mind,
+  // and the two cancel out rather than queueing.
+  if (pendingGroupEdits.has(host)) pendingGroupEdits.delete(host);
+  else pendingGroupEdits.set(host, port);
+  markGroupChipPending();
+  if (groupEditTimer) clearTimeout(groupEditTimer);
+  groupEditTimer = setTimeout(runPendingGroupEdits, GROUP_EDIT_COALESCE_MS);
+  return groupOpChain;
+}
+
+// markGroupChipPending gives the click its feedback straight away: the chip
+// shows the state it is about to have, so a second click is never made because
+// the first looked ignored.
+function markGroupChipPending() {
+  document.querySelectorAll('.group-chip').forEach(chip => {
+    // Marked while the click is WAITING for the batch AND while the batch is
+    // running. Keying it on the waiting list alone made the mark disappear at
+    // the very moment the work started, which is when the user most needs to
+    // see that something is happening: forming a group across five speakers
+    // takes several seconds.
+    const h = chip.dataset.host;
+    chip.classList.toggle('pending', pendingGroupEdits.has(h) || groupOpPending.has(h));
+  });
+}
+
+function runPendingGroupEdits() {
+  groupEditTimer = null;
+  const edits = [...pendingGroupEdits.entries()];
+  pendingGroupEdits.clear();
+  if (edits.length === 0) return;
+  edits.forEach(([h]) => groupOpPending.add(h));
+  markGroupChipPending();
+  groupOpChain = groupOpChain
+    .then(() => runGroupMemberToggle(edits))
+    .catch(() => {})
+    .finally(() => {
+      edits.forEach(([h]) => groupOpPending.delete(h));
+      markGroupChipPending();
+    });
+  return groupOpChain;
+}
+
+// showUpdateNoNetworkNotice is the short, dismissible version of the failure
+// report, for the one cause that is not about the speaker at all.
+//
+// The full report exists so a real fault can be sent to me, and it earns its
+// weight then. A computer that lost its network produces nothing worth reading
+// in it: the speaker is untouched, nothing needs unplugging, and the whole
+// answer is one sentence that the app already owns for the speaker list.
+function showUpdateNoNetworkNotice() {
+  showError(t('settingsView.noNetworkTitle') + ' ' + t('settingsView.noNetworkHelp'));
+}
+
+// step numbers the phases a speaker goes through, because the middle of the
+// sequence looks exactly like the end of it.
+//
+// The order is: send the software, restart, confirm, then the Spotify engine.
+// "Restarting" is roughly halfway, and it is the phase that sits on screen the
+// longest, so a row reading "Rebooting (usually 2-4 min)" with a full bar reads
+// as finished. It is not: the confirm and the ~16 MB engine delivery still have
+// to happen, and a run interrupted there leaves a speaker on the new version
+// with no Spotify engine, which is exactly what happened to one owner's
+// speaker.
+const UPDATE_STEPS = { send: 1, restart: 2, confirm: 3, engine: 4 };
+
+function withStep(text, n) {
+  return text + t('updateAll.phase.step', { n });
+}
+
+// dissolveIncompleteMessage turns the agent's refusal into something the user
+// can act on. "remaining" is how many speakers the master still reports after
+// every teardown route was tried, and naming it is the difference between "it
+// did not work" and "four speakers are still in this group".
+function dissolveIncompleteMessage(res) {
+  const left = res && Number(res.remaining) > 0 ? Number(res.remaining) : 0;
+  return left
+    ? t('multiroom.dissolveIncompleteN', { n: left })
+    : t('multiroom.dissolveIncomplete');
+}
+
+// runGroupMemberToggle applies a whole batch of toggles as ONE zone edit.
+// edits is [[host, port], ...]; a single click is simply a batch of one.
+async function runGroupMemberToggle(edits) {
+  // Edit the group the selection belongs to: when a follower is selected, its
+  // master is the box that must receive the FormZone/DissolveZone (a follower
+  // rejects zone control), so resolve to it first.
+  const box = groupControlBox();
+  if (!box || box.kind === 'stock') return;
+  const targets = edits
+    .map(([h]) => (state.boxes || []).find(b => b.host === h))
+    .filter(Boolean);
+  if (targets.length === 0) return;
+  // A live stereo pair's halves are not groupable: the picker-side
+  // exclusion lives in the multiroom grid, this is the same rule for the
+  // player's group chips. Say it instead of failing later with a generic
+  // error after the zone budget.
+  const pairIDs = new Set(
+    stereoPairsOf(state.zoneLive || {}).flatMap(pp => (pp.members || []).map(m => String(m.deviceID || '').toUpperCase())));
+  const inPair = targets.filter(tgt => pairIDs.has(String(tgt.deviceID || '').toUpperCase()));
+  if (inPair.length) {
+    showError(t('multiroom.pairNotGroupable'));
+    if (inPair.length === targets.length) return;
+  }
+  const members = groupMembersOf(box, state.zoneLive, state.boxes);
+  // Apply every toggle to one membership list, so the speakers join or leave
+  // together instead of one zone form per click.
+  const next = targets.reduce((acc, tgt) => acc.some(m => m.ip === tgt.host)
+    ? acc.filter(m => m.ip !== tgt.host)
+    : [...acc, { deviceID: tgt.deviceID, ip: tgt.host, box: tgt }], members);
+  const removed = targets.filter(tgt => members.some(m => m.ip === tgt.host) && !next.some(m => m.ip === tgt.host));
+  // The speakers that just JOINED, symmetric with `removed` and derived from
+  // the same two lists so it stays right for a coalesced batch where some chips
+  // add and some remove in one edit.
+  const added = targets.filter(tgt => !members.some(m => m.ip === tgt.host));
+  const target = targets[0];
+  const wasIn = removed.length > 0 && targets.length === 1;
+  try {
+    if (next.length === 0) {
+      // Same rule as the group frame's x: a refusal from the speaker must not
+      // come out as a green tick, or the group the user is looking at keeps
+      // playing while the app says it is gone.
+      const res = await DissolveZone(box.host, box.port);
+      if (res && res.ok === false) {
+        showToast(dissolveIncompleteMessage(res));
+      } else {
+        // Stop the ex-followers we can reach (their agent port is only known
+        // for discovered boxes).
+        await Promise.allSettled(members.filter(m => m.box).map(m => Stop(m.box.host, m.box.port)));
+        showToast(t(res && res.nothing ? 'multiroom.nothingToUngroup' : 'group.dissolvedToast'));
+      }
+    } else {
+      // Preserve the group's mode when the agent reports one (a mirror group
+      // must not be silently converted to native by an add/remove); older
+      // agents carry no mode field, then native is what today's zones are.
+      const own = (state.zoneLive || {})[box.deviceID];
+      const mode = (own && typeof own.mode === 'string' && own.mode) ? own.mode : 'native';
+      // Wake every member before enrolling it: a box a user switched off at
+      // the speaker still answers STM (the agent stays up in standby), so the
+      // firmware would add it to the zone but it stays silent. Waking an
+      // already-awake box is a fast no-op, so this is safe to do for all members.
+      //
+      // All at once, then a single retry for the ones that did not take it.
+      // One wake per speaker with no retry meant a speaker that was busy at
+      // that moment was enrolled asleep and stayed silent, and doing them in
+      // sequence would add every speaker's wake time to the wait before the
+      // group even starts forming.
+      // ... except a member the app itself lists as offline: it cannot be
+      // woken, and with the port fallback a dead address costs up to two 6 s
+      // transport timeouts PER ROUND, so one unplugged speaker held every
+      // group edit for over 20 seconds before the zone even started forming
+      // (field, 2026-08-29). FormZone's preflight still drops an unreachable
+      // member cleanly (notReady), so skipping its wake loses nothing.
+      const wakeTargets = next.filter(m => m.box && !m.box.offline);
+      // Bounded per speaker: a box that neither answers nor refuses (agent
+      // wedged, just unplugged, offline flag not set yet) must not hold the
+      // whole batch for the full transport timeouts either. A wake slower
+      // than this window counts as failed and gets the one retry below;
+      // enrolment continues either way.
+      const WAKE_WAIT_MS = 4000;
+      const wakeOne = (m) => Promise.race([
+        WakeBox(m.box.host, m.box.port),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('wake window elapsed')), WAKE_WAIT_MS)),
+      ]);
+      const wakeOnce = (list) => Promise.allSettled(list.map(wakeOne))
+        .then(rs => list.filter((_, i) => rs[i].status === 'rejected'));
+      const failed = await wakeOnce(wakeTargets);
+      if (failed.length) {
+        console.warn('group: retrying wake for', failed.map(m => m.ip));
+        await wakeOnce(failed);
+      }
+      const res = await FormZone(box.host, box.port, {
+        master: { deviceID: box.deviceID, ip: box.host },
+        slaves: next.map(m => ({ deviceID: m.deviceID, ip: m.ip })),
+        stereo: false, mode,
+      });
+      if (res && res.ok === false) {
+        // HTTP 200 with ok:false means the firmware formed NOTHING.
+        // Treating it as success painted checked chips and a group volume
+        // slider that controlled a phantom group.
+        //
+        // But ok:false is not always the firmware shrugging. FormZone also
+        // REFUSES on purpose, with a reason, when a participant is half of a
+        // live stereo pair: that shape starves the audio, so the app
+        // never even asks the box. The Multi-Room view has said so since then;
+        // this one did not, and answered a deliberate refusal with "try Mirror
+        // mode, hit Refresh, or update the speakers, then send logs". A user
+        // with a stereo pair on his terrace followed exactly that advice and
+        // sent the logs (mail 2026-09-25), which is a round trip he should
+        // never have been sent on.
+        const inPair = Array.isArray(res.inPair) && res.inPair.length;
+        showError(inPair
+          ? t('multiroom.pairNotGroupable')
+          : ((res.error && String(res.error)) || t('multiroom.formedNone')));
+        refreshMusicZones(true);
+        renderGroupControl();
+        return;
+      }
+      // Every speaker taken out of the group stops, not only the first one.
+      await Promise.allSettled(removed.map(tgt => Stop(tgt.host, tgt.port)));
+      // Speakers that just joined start at the group's volume. The master's own
+      // agent does this too and is the authority (it can tell a confirmed join
+      // from a failed one, which the app cannot); this covers a group whose
+      // master still runs an older agent, and seeds the panel so the new
+      // member's slider shows the right number straight away instead of the
+      // level it happened to wake up at.
+      //
+      // Never the speakers that were already in the group: the group slider is
+      // relative on purpose, and one absolute number written across every
+      // member destroys the per-speaker balance behind it.
+      if (added.length) {
+        try {
+          const ms = await BoxSettings(box.host, box.port);
+          // Target over actual, matching the agent: a muted or mid-ramp master
+          // reports actual 0 while target still carries the real level.
+          const mv = (ms && ms.volume && (ms.volume.target || ms.volume.actual)) || 0;
+          // A master that reports nothing usable must not silence the joiner:
+          // a speaker that is provably in the group and provably silent is the
+          // hardest thing there is to tell apart from one that never joined.
+          if (mv > 0) {
+            // Two different "did not join" answers, and both have to be
+            // subtracted. notReady is the app's own pre-flight drop: the agent
+            // never answered, so the speaker was not sent to the firmware at
+            // all. missing is the master's verify-first verdict for a slave it
+            // DID send but whose own zone read never named the master. The
+            // agent skips exactly that set in its own applier, so writing it
+            // here would hand the group's level to a speaker sitting in another
+            // room in no group at all.
+            //
+            // missing carries deviceIDs, not addresses, and on a two-chip
+            // chassis the firmware's id is not the one discovery knows, so it
+            // is resolved through the members list the agent returned.
+            const notReady = new Set((res && Array.isArray(res.notReady) ? res.notReady : [])
+              .map(nr => (nr && nr.ip) || nr).filter(Boolean));
+            const missingIDs = new Set((res && Array.isArray(res.missing) ? res.missing : [])
+              .map(id => String(id).toLowerCase()));
+            const missingIPs = new Set((res && Array.isArray(res.members) ? res.members : [])
+              .filter(m => m && m.deviceID && missingIDs.has(String(m.deviceID).toLowerCase()))
+              .map(m => m.ip).filter(Boolean));
+            const joined = added.filter(tgt =>
+              !notReady.has(tgt.host) &&
+              !missingIPs.has(tgt.host) &&
+              !missingIDs.has(String(tgt.deviceID || '').toLowerCase()));
+            await Promise.allSettled(joined.map(tgt => SetBoxVolume(tgt.host, tgt.port, mv)));
+            joined.forEach(tgt => { groupVol.members[tgt.host] = mv; });
+          }
+        } catch { /* the agent is the authority; this is only the seed */ }
+      }
+      if (targets.length === 1) {
+        showToast(t(wasIn ? 'group.removedToast' : 'group.addedToast', { name: getBoxLabel(target) }));
+      } else {
+        showToast(t('group.batchToast', { count: targets.length }));
+      }
+    }
+    // Optimistic zone update so the chips + frames + Multi-Room summary
+    // reflect the change at once, in the same shape a real poll returns
+    // (including the master's OWN entry); the confirming poll below
+    // corrects it shortly after.
+    state.zoneLive = applyOptimisticZone(state.zoneLive, box, next);
+    notifyZoneLive();
+    renderBoxSelect();
+  } catch (e) {
+    showError(String(e));
+  }
+  // Confirming fetch: force past the 8s debounce, which used to swallow this
+  // call entirely and left the optimistic state on screen until the next
+  // unrelated discovery cycle. Slightly delayed because a follower's own
+  // zone self-report can lag the form/removal by around a second.
+  setTimeout(() => refreshMusicZones(true), 1200);
+  renderGroupControl();
+}
+
+// groupPanelState remembers what the panel currently shows and whether the user
+// is touching it, so a repaint cannot happen underneath a finger.
+//
+// The panel used to be rebuilt from scratch on every call, and it is called
+// from the zone poll AND from renderPresets, which fires on things as unrelated
+// as a Spotify cover change. A rebuild replaces the slider element, reseeds it
+// from the master's own volume slider, and re-anchors the balance from levels
+// our in-flight writes have already moved. Dragging to 53 across five speakers
+// arrived at 39. The phone got these guards on 2026-08-15; this is the same
+// treatment for the desktop.
+const groupPanelState = { signature: '', dragging: false, wroteAt: 0 };
+const GROUP_PANEL_SETTLE_MS = 1500;
+
+// groupPanelBusy reports whether a rebuild would land on top of the user. A
+// drag in progress is obvious; the settle window covers the moment between our
+// write and the poll that reflects it.
+function groupPanelBusy() {
+  return groupPanelState.dragging || (Date.now() - groupPanelState.wroteAt < GROUP_PANEL_SETTLE_MS);
+}
+
+// noteGroupPanelWrite marks the moment a volume left the app, so the next poll
+// does not overrule it.
+function noteGroupPanelWrite() { groupPanelState.wroteAt = Date.now(); }
+
+// renderGroupControl paints the group chips + (when a group is active) the group
+// volume slider into #groupControl, based on the selected box.
+function renderGroupControl() {
+  const cont = $('groupControl');
+  if (!cont) return;
+  const sel = state.currentBox;
+  if (!sel || sel.kind === 'stock') { cont.innerHTML = ''; return; }
+  // Manage the group through its master: when the selected speaker is a zone
+  // follower, box is its master (so chips + volume act on the real group and the
+  // member can be removed from any selection); otherwise box is the selection.
+  const box = groupControlBox();
+  const isMember = !!box && box.host !== sel.host;
+  // Chips are every other STM speaker relative to the MASTER (not the selection),
+  // so the selected follower itself appears as an in-group chip that can be removed.
+  // A live stereo pair's two halves are excluded here: a pair cannot join a group
+  // as a unit yet, so offering its halves only produced a "not groupable" error on
+  // click and left them cluttering the +N row (reported on the music tab,
+  // 2026-08-31). This is the same exclusion the Multi-room grid applies, via the
+  // shared stereoPairsOf helper; the click-time guard in runGroupMemberToggle stays
+  // as a defensive fallback for a pair that forms while the row is stale.
+  const pairMemberIDs = new Set(
+    stereoPairsOf(state.zoneLive || {}).flatMap(pp => (pp.members || []).map(m => String(m.deviceID || '').toUpperCase())));
+  const others = (state.boxes || []).filter(b =>
+    b && b.kind !== 'stock' && b.host && b.host !== box.host
+    && !pairMemberIDs.has(String(b.deviceID || '').toUpperCase()));
+  if (others.length === 0) { cont.innerHTML = ''; return; }
+  const slaves = currentGroupSlaves();
+  // The tick must come from the SAME list the click acts on. It used to be
+  // painted from each speaker's own zone self-report while toggleGroupMember
+  // works from groupMembersOf, which is the union of that and the master's
+  // member list. A follower the master knows about but which does not report
+  // itself therefore drew a "+", and pressing it re-formed the group WITHOUT
+  // that speaker and stopped its music: the button did the opposite of what it
+  // showed. Three of five speakers were in exactly that state on 2026-08-15.
+  const editable = groupMembersOf(box, state.zoneLive, state.boxes);
+  const inGroup = new Set(editable.map(m => m.ip).filter(Boolean));
+  const chips = others.map(b => {
+    const on = inGroup.has(b.host);
+    const label = getBoxLabel(b);
+    return `<button class="group-chip${on ? ' in-group' : ''}" data-host="${b.host}" data-port="${b.port}" `
+      + `title="${escapeAttr(t(on ? 'group.removeTitle' : 'group.addTitle', { name: label }))}">`
+      + `<span class="group-chip-mark" aria-hidden="true">${on ? '&#10003;' : '&#43;'}</span>${escapeHtml(label)}</button>`;
+  }).join('');
+  // One slider per member below the group slider: speakers of different
+  // types need different levels to sound equally loud, and the group slider then
+  // moves them together while keeping that balance.
+  const members = slaves.length > 0 ? [box, ...slaves] : [];
+  const memberRows = members.map(b => {
+    const id = cssId(b.host);
+    const v = typeof groupVol.members[b.host] === 'number' ? groupVol.members[b.host] : 0;
+    return `<div class="group-member-vol">`
+      + `<span class="group-member-name" title="${escapeAttr(getBoxLabel(b))}">${escapeHtml(getBoxLabel(b))}</span>`
+      + `<input type="range" id="memberVol-${id}" data-host="${b.host}" data-port="${b.port}" min="0" max="100" step="1" value="${v}" aria-label="${escapeAttr(t('group.memberVolumeLabel', { name: getBoxLabel(b) }))}" />`
+      + `<span class="vol-val" id="memberVolVal-${id}">${v}</span></div>`;
+  }).join('');
+  const volRow = slaves.length > 0
+    ? `<div class="group-vol-row"><span class="vol-icon" aria-hidden="true">&#128266;</span>`
+      + `<input type="range" id="groupVolume" min="0" max="100" step="1" aria-label="${escapeAttr(t('group.volumeLabel'))}" />`
+      + `<span class="muted small">${escapeHtml(t('group.volumeLabel'))}</span></div>`
+      + `<div class="group-member-vols">${memberRows}</div>`
+    : '';
+  // When a member is selected, name the group it belongs to so it is clear the
+  // panel below now manages that group (not the empty state it used to show).
+  const memberNote = isMember
+    ? `<div class="group-member-note muted small">${escapeHtml(t('group.memberOf', { name: getBoxLabel(box) }))}</div>`
+    : '';
+  // Rebuild only when the panel would actually look different, and never while
+  // the user is touching it. Everything below re-binds handlers to elements the
+  // rebuild creates, so skipping here keeps the live ones and their state.
+  const signature = JSON.stringify([box.host, isMember, others.map(b => b.host), slaves.map(b => b.host)]);
+  if (signature === groupPanelState.signature && cont.querySelector('.group-chips')) {
+    // Same speakers as last time: only write the values into the rows that
+    // already exist, and not even that while a finger is on a slider.
+    if (!groupPanelBusy() && members.length) loadGroupMemberVolumes(members);
+    return;
+  }
+  if (groupPanelBusy() && cont.querySelector('.group-chips')) return;
+  groupPanelState.signature = signature;
+  cont.innerHTML = `<span class="group-label muted small">${escapeHtml(t('group.label'))}</span>`
+    + memberNote
+    + `<div class="group-chips">${chips}</div>${volRow}`;
+  cont.querySelectorAll('.group-chip').forEach(chip => {
+    chip.onclick = () => toggleGroupMember(chip.dataset.host, parseInt(chip.dataset.port, 10));
+  });
+  const vol = $('groupVolume');
+  const seed = $('musicVolume');
+  if (vol && seed && seed.value && !groupPanelBusy()) vol.value = seed.value; // start at the master's level
+  if (vol) {
+    vol.onpointerdown = () => {
+      groupPanelState.dragging = true;
+      captureGroupBaseline(parseInt(vol.value, 10));
+    };
+    const endDrag = () => { groupPanelState.dragging = false; noteGroupPanelWrite(); };
+    vol.onpointerup = endDrag;
+    vol.onpointercancel = endDrag;
+    vol.onblur = endDrag;
+    vol.oninput = () => { noteGroupPanelWrite(); setGroupVolume(parseInt(vol.value, 10)); };
+  }
+  cont.querySelectorAll('.group-member-vol input[type=range]').forEach(el => {
+    el.onpointerdown = () => { groupPanelState.dragging = true; };
+    const endMemberDrag = () => { groupPanelState.dragging = false; noteGroupPanelWrite(); };
+    el.onpointerup = endMemberDrag;
+    el.onpointercancel = endMemberDrag;
+    el.onblur = endMemberDrag;
+    el.oninput = () => {
+      noteGroupPanelWrite();
+      const lbl = document.getElementById('memberVolVal-' + cssId(el.dataset.host));
+      if (lbl) lbl.textContent = el.value;
+      setMemberVolume(el.dataset.host, parseInt(el.dataset.port, 10), parseInt(el.value, 10));
+    };
+  });
+  if (members.length) loadGroupMemberVolumes(members);
+}
+
+function renderPresets() {
+  const grid = $('presets');
+  grid.innerHTML = '';
+  // The transfer row lives right under the grid and follows the selection.
+  wirePresetTransferRow();
+  updatePresetTransferRow();
+  renderGroupControl();
+  const activeSlot = activeSlotFromLocation(state.nowLocation);
+  // Remember the active Spotify slot from the per-slot /spotify/stream-<slot>.ogg
+  // URL. A hardware next/prev advances go-librespot but can drop the slot from
+  // the box's now-playing location, leaving only the generic "Spotify" name. We
+  // keep the last known slot so the right tile stays lit. We must NOT fall back
+  // to matching the preset NAME: a preset literally named "Spotify" (the generic
+  // source name) would otherwise falsely light up, e.g. preset 1 lit up instead
+  // of the playing preset 6 after pressing next on the remote.
+  const spotifyPlaying = !!state.nowLocation && /\/spotify\/stream/.test(state.nowLocation);
+  if (!spotifyPlaying) state.nowSpotifySlot = null;
+  else if (activeSlot !== null) state.nowSpotifySlot = activeSlot;
+  // If the speaker is playing through the stream proxy, resolve the
+  // real stream URL of the source slot. That lets us mark sibling
+  // slots with the same station as active too. Otherwise only the
+  // single slot named in /stream/<n> would light up.
+  // The station the speaker is ACTUALLY playing, decoded from the native ORION
+  // descriptor (null for Spotify or a bare /stream/<n> proxy). While the box's
+  // own preset list is re-synced under a stale recall, this is the only reliable
+  // identity of the live audio, so a slot whose stored station has since changed
+  // can be told apart from the one still coming out of the speaker.
+  const orionNow = orionStationPayload(state.nowLocation);
+  const playingURL = orionNow && orionNow.streamUrl ? decodeProxyUrl(orionNow.streamUrl) : '';
+  const playingName = orionNow && typeof orionNow.name === 'string' ? orionNow.name : '';
+  let activeStreamURL = null;
+  if (activeSlot !== null) {
+    const ap = state.presets.find(x => x.slot === activeSlot);
+    if (ap) activeStreamURL = ap.stream_url;
+  } else if (playingURL) {
+    // A native preset whose descriptor carries the RAW proxy form rather than a
+    // per-slot one: the slot lookup finds nothing, and the location is the
+    // descriptor rather than a URL, so neither of the matches above can fire
+    // and no tile lit up while the speaker was plainly playing one of them.
+    // The real station URL is inside the descriptor, and that does match what
+    // the key holds.
+    activeStreamURL = playingURL;
+  }
+  for (let i = 1; i <= 6; i++) {
+    const p = state.presets.find(x => x.slot === i);
+    // A slot STM does not manage may still hold one of the box's own presets
+    // (e.g. a Deezer playlist set on the speaker). Show it so the user sees and
+    // can recall it, instead of a misleading "empty" tile.
+    const bp = !p ? (state.boxPresets || []).find(x => x.slot === i) : null;
+    const baseActive = p && state.nowLocation && (
+      p.stream_url === state.nowLocation ||
+      (activeSlot !== null && p.slot === activeSlot) ||
+      (activeStreamURL && p.stream_url === activeStreamURL) ||
+      // Spotify: light the slot we recalled (remembered from the per-slot URL),
+      // which survives a next/prev that drops the slot from the now-playing
+      // location. Never match on the preset name (see nowSpotifySlot note above).
+      (p.type === 'spotify' && spotifyPlaying && state.nowSpotifySlot != null && p.slot === state.nowSpotifySlot)
+    );
+    // While a native descriptor is playing, drop a slot whose stored station no
+    // longer matches the live audio: a preset list re-synced from the box remote
+    // must not leave the freshly-changed tile lit as "playing". Only bites
+    // when the speaker plays native radio (orionNow set) and the identity is
+    // known and differs; otherwise baseActive stands unchanged.
+    const isActive = baseActive && !(orionNow && nativeSlotStale({
+      presetName: p && p.name,
+      presetUrl: p && p.stream_url,
+      playingName,
+      playingUrl: playingURL,
+    }));
+    const hasErr = !!state.presetErrors[i];
+    const div = document.createElement('div');
+    div.className = 'preset' + (p || bp ? '' : ' empty') + (isActive ? ' playing' : '') + (hasErr ? ' error' : '') + (bp ? ' box-native' : '');
+    div.dataset.slot = i;
+    if (p) {
+      const stateLabel = presetStateLabel(i, isActive, hasErr);
+      const hint = state.nowLocation && !isActive
+        ? `<div class="preset-hint">${escapeHtml(t('preset.longPressHint'))}</div>`
+        : '';
+      // Preset logo fallback chain:
+      //   1. p.art candidates (pipe-separated if present).
+      //   2. state.nowIcon ONLY when p.art is empty and the preset
+      //      is currently active. Otherwise a logo from the actively
+      //      playing station could leak onto an inactive preset
+      //      button whose p.art is broken and falls through.
+      //   3. DDG / Google service for stream host and its root
+      //      domain.
+      const presetCandidates = [];
+      const addCands = (val) => {
+        if (!val) return;
+        for (const c of String(val).split('|')) {
+          const t = c.trim();
+          if (t && !presetCandidates.includes(t)) presetCandidates.push(t);
+        }
+      };
+      // For a native play the box's <art> tag is the agent's own loopback
+      // art-proxy URL (built for the speaker's display); adopting THAT would
+      // persist a URL that is dead from this machine and hand the tile to the
+      // DDG grey-chevron fallback, the exact poisoning the hold-save had
+      // Unwrap first, and gate + persist on the unwrapped value.
+      const adoptIcon = appArtFromBoxArt(state.nowIcon);
+      if (p.type === 'spotify') {
+        // Show the Spotify logo so the tile is instantly recognisable as a
+        // Spotify playlist; the account name is shown small under the title.
+        // (Chosen over the album/playlist cover, which changes or lags.)
+        addCands(SPOTIFY_LOGO);
+      } else if (p.art) {
+        // Same unwrap on the STORED art: keys hold-saved by v0.9.56 and older
+        // already carry the box-loopback wrapper (the reporter's six keys in
+        // the bundle do), so unwrapping at render gives them back their
+        // real image URL without rewriting the store.
+        addCands(appArtFromBoxArt(p.art));
+      } else if (isActive && shouldAdoptPresetArt(adoptIcon, p)) {
+        // Same gate refreshStatus uses to decide whether a late-arriving logo
+        // is worth a redraw, so the two cannot drift apart.
+        addCands(adoptIcon);
+        // Auto-persist so the preset has its logo on the next load. Guarded:
+        // skipped when the slot changed on the box since this list was loaded,
+        // so the adopt never reverts a save from another client.
+        p.art = adoptIcon;
+        setPresetIfUnchanged(state.currentBox, p, { art: adoptIcon });
+      }
+      // Render through the same Go-validated hydration the search and
+      // Recently-played tiles use (logoImgTag + ResolveStationLogo): the raw
+      // data-fallbacks cascade cannot reject DuckDuckGo's grey "no icon"
+      // chevron, which the icon service serves as a real image on its 404, so
+      // a station with no logo anywhere wore the chevron on its key while the
+      // search row for the same station correctly fell back to the letter
+      // tile (EPIC CLASSICAL). Spotify keeps its self-contained glyph, a
+      // data URI that needs no resolution. The first DIRECT art candidate is
+      // handed over as the favicon to validate; icon-service entries stored in
+      // older chains are dropped here because the resolver rederives them from
+      // the hosts, status-checked.
+      let logo;
+      if (p.type === 'spotify') {
+        logo = `<img class="preset-logo" alt="" src="${escapeAttr(presetCandidates[0] || SPOTIFY_LOGO)}"/>`;
+      } else {
+        const directArt = presetCandidates.find(
+          (c) => /^https?:\/\//i.test(c) && !c.startsWith('https://icons.duckduckgo.com/')
+        ) || '';
+        logo = logoImgTag({
+          name: p.name,
+          favicon: directArt,
+          homepage: p.homepage || '',
+          url: p.stream_url || '',
+          url_resolved: p.stream_url || '',
+        }, 'preset-logo');
+      }
+      // The active tile mirrors the live now-playing bitrate even when the
+      // stored preset bitrate is still 0 (preset saved before the bitrate
+      // feature, or radio-browser had none). Persist it so the tile keeps
+      // the value after a reload and the other clients see it too.
+      let tileBitrate = p.bitrate || 0;
+      if (isActive && state.nowBitrate > 0) {
+        tileBitrate = state.nowBitrate;
+        // Persist the corrected bitrate, but NEVER for Spotify presets:
+        // SetPreset is radio-only and would overwrite the Spotify URI.
+        if ((p.bitrate || 0) !== state.nowBitrate && isMeasurableStreamPreset(p)) {
+          p.bitrate = state.nowBitrate;
+          // Guarded: never rewrite a slot another client changed meanwhile.
+          setPresetIfUnchanged(state.currentBox, p, { bitrate: state.nowBitrate });
+        }
+      }
+      // A key shows what is SAVED on it: a short, static name, plus the markers
+      // that say it is the one playing (the green .playing tile and the
+      // Playing/Buffering/Paused line from presetStateLabel). It deliberately
+      // carries NO live track line. Until 2026-08-23 the active key also
+      // rendered state.nowTitle and marqueed it, but a tile is one third of the
+      // window minus a 32px logo, so practically every "Artist - Title"
+      // overflowed and scrolled, while the now-playing bar a few centimetres
+      // above scrolled the identical string ("the app looks busy ... why
+      // display the same information in two places? The song title/artist
+      // almost always scrolls in the preset key area because the space is not
+      // wide enough for the string", user report 2026-08-23). The running title
+      // now lives only in that bar, which is the full window wide.
+      div.innerHTML = `
+        <div class="preset-head"><span class="num">${escapeHtml(t('preset.key', { n: i }))}</span><span class="preset-acts"><span class="ren" data-slot="${i}" title="${escapeAttr(t('preset.renameTitle'))}">&#9998;</span><span class="del" data-slot="${i}" title="${escapeAttr(t('preset.deleteTitle'))}">&times;</span></span></div>
+        <div class="preset-body">
+          ${logo}
+          <div class="preset-text">
+            <div class="name">${escapeHtml(p.name || t('preset.key', { n: i }))}</div>
+            ${p.type === 'spotify' && p.account ? `<div class="preset-account">${escapeHtml(p.account)}</div>` : ''}
+            ${p.source ? `<div class="preset-source" title="${escapeAttr(p.source)}">${escapeHtml(t('preset.sourceBadge', { source: p.source }))}</div>` : ''}
+            <div class="preset-bitrate">${tileBitrate ? tileBitrate + ' kbit/s' : '- kbit/s'}</div>
+            ${stateLabel}
+          </div>
+        </div>
+        ${hint}
+        <div class="long-press-bar" id="lp-bar-${i}"></div>
+      `;
+    } else if (bp && lostStrKey(bp)) {
+      // A key STM itself wrote that the store no longer backs: the firmware
+      // kept it across a removal and reinstall of STM, the stream behind it
+      // went with the store, and a press plays nothing. It used to render as
+      // the box-native tile below, i.e. as a playable speaker-side preset,
+      // which is how the desktop showed six stations on a speaker whose store
+      // had been empty for a day. Shown and named, not offered: the
+      // hint says where the key comes back from, the banner above the grid
+      // says it for all of them.
+      div.classList.add('lost');
+      const srcLabel = boxSourceLabel(bp.source);
+      const logo =
+        `<img class="preset-logo" alt="" src="${escapeAttr(monogramDataUri(bp.name || srcLabel || '?'))}"/>`;
+      div.innerHTML = `
+        <div class="preset-head"><span class="num">${escapeHtml(t('preset.key', { n: i }))}</span></div>
+        <div class="preset-body">
+          ${logo}
+          <div class="preset-text">
+            <div class="name">${escapeHtml(bp.name || srcLabel || t('preset.onSpeaker'))}</div>
+            ${srcLabel ? `<div class="preset-source" title="${escapeAttr(srcLabel)}">${escapeHtml(t('preset.sourceBadge', { source: srcLabel }))}</div>` : ''}
+            <div class="preset-box-hint">${escapeHtml(t('preset.lostOnSpeaker'))}</div>
+          </div>
+        </div>
+        <div class="long-press-bar" id="lp-bar-${i}"></div>
+      `;
+    } else if (bp) {
+      // The box's own preset (a source STM does not manage, e.g. Deezer). Tap to
+      // recall it via the hardware key; the box plays it through its own account.
+      const bpActive = !!state.nowLocation && !!bp.location && state.nowLocation === bp.location;
+      if (bpActive) div.classList.add('playing');
+      const srcLabel = boxSourceLabel(bp.source);
+      const logo =
+        `<img class="preset-logo" alt="" src="${escapeAttr(monogramDataUri(bp.name || srcLabel || '?'))}"/>`;
+      div.innerHTML = `
+        <div class="preset-head"><span class="num">${escapeHtml(t('preset.key', { n: i }))}</span></div>
+        <div class="preset-body">
+          ${logo}
+          <div class="preset-text">
+            <div class="name">${escapeHtml(bp.name || srcLabel || t('preset.onSpeaker'))}</div>
+            ${srcLabel ? `<div class="preset-source" title="${escapeAttr(srcLabel)}">${escapeHtml(t('preset.sourceBadge', { source: srcLabel }))}</div>` : ''}
+            <div class="preset-box-hint">${escapeHtml(t('preset.boxNativeHint'))}</div>
+          </div>
+        </div>
+      `;
+    } else {
+      const hint = state.nowLocation
+        ? `<div class="preset-hint">${escapeHtml(t('preset.longPressHint'))}</div>`
+        : `<div class="url">${escapeHtml(t('preset.searchHint'))}</div>`;
+      div.innerHTML = `
+        <div class="num">${escapeHtml(t('preset.key', { n: i }))}</div>
+        <div class="name">${escapeHtml(t('preset.empty'))}</div>
+        ${hint}
+        <div class="long-press-bar" id="lp-bar-${i}"></div>
+      `;
+    }
+    if (bp && lostStrKey(bp)) {
+      // A dead STM key: a tap explains, it never sends a recall the speaker
+      // cannot fulfil. The long-press save stays allowed, it is one of the
+      // two ways the key comes back (the other is the copy the toast names).
+      attachPresetHandlers(div, i, bp, { onPlay: () => showToast(t('preset.lostOnSpeakerToast')) });
+    } else if (bp) {
+      // Box-native preset: click recalls it; no long-press save so the user's
+      // own (e.g. Deezer) preset can't be clobbered by STM's current station.
+      attachPresetHandlers(div, i, bp, { onPlay: () => recallBoxPreset(i), allowSave: false });
+    } else {
+      attachPresetHandlers(div, i, p);
+    }
+    grid.appendChild(div);
+  }
+  grid.querySelectorAll('.ren').forEach(el => {
+    el.onclick = (e) => {
+      e.stopPropagation();
+      renamePresetKey(parseInt(el.dataset.slot, 10));
+    };
+  });
+  grid.querySelectorAll('.del').forEach(el => {
+    el.onclick = async (e) => {
+      e.stopPropagation();
+      const slot = parseInt(el.dataset.slot, 10);
+      const p = state.presets.find(x => x.slot === slot);
+      const senderName = p && p.name ? escapeHtml(p.name) : t('preset.placeholderSender');
+      const ok = await confirmWarn(
+        t('preset.confirmClearTitle'),
+        t('preset.confirmClearBody', { n: slot, name: senderName })
+      );
+      if (!ok) return;
+      try {
+        await DeletePreset(state.currentBox.host, state.currentBox.port, slot);
+        loadPresets();
+      } catch (err) { showError(err); }
+    };
+  });
+  // No marquee pass here: nothing in a tile scrolls any more (see the tile
+  // template above). The saved name wraps and the badge lines clip, so a
+  // rebuilt grid needs no measuring frame.
+}
+
+// PRESET_NAME_MAX mirrors maxPresetNameRunes in the agent, so the field stops
+// where the speaker's own preset entry does and a typed name is never handed
+// back shortened.
+const PRESET_NAME_MAX = 64;
+
+// renamePresetKey lets the user call a key whatever they want. Station
+// names arrive from the radio directory shouted in capitals, misspelled, or long
+// enough to fill the whole tile, and the key is the user's own. Only the name is
+// written: the station, its logo, a Spotify preset's playlist and account all
+// stay exactly as they are.
+async function renamePresetKey(slot) {
+  if (!state.currentBox) return;
+  const p = state.presets.find(x => x.slot === slot);
+  if (!p) return;
+  const current = p.name || '';
+  const answer = confirmWarn(
+    t('preset.renameHeading'),
+    `<p>${escapeHtml(t('preset.renameBody', { n: slot }))}</p>`
+    + `<input id="presetRenameInput" class="rename-input" type="text" maxlength="${PRESET_NAME_MAX}" />`,
+    {
+      icon: null,
+      calm: true,
+      rich: true,
+      confirmLabel: t('common.save'),
+      confirmClass: 'btn btn-primary',
+    },
+  );
+  // Filled and focused only once the modal is on screen, and the value is set
+  // from JS so an apostrophe or a quote in a station name cannot break out of
+  // the markup.
+  const input = $('presetRenameInput');
+  if (input) {
+    input.value = current;
+    input.focus();
+    input.select();
+    // Enter is what a person presses after typing a name. Without this the
+    // modal's two buttons are the only way out of the field.
+    input.onkeydown = (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const confirmBtn = $('warnConfirm');
+      if (confirmBtn) confirmBtn.click();
+    };
+  }
+  if (!await answer) return;
+  const name = (input ? input.value : '').trim();
+  if (!name || name === current) return;
+  try {
+    await RenamePreset(state.currentBox.host, state.currentBox.port, slot, name);
+  } catch (err) {
+    showError(err);
+    return;
+  }
+  showToast(t('preset.renamedKey', { n: slot, name }));
+  loadPresets();
+}
+
+// applyTrackScroll turns an overflowing line into a gentle marquee: it pauses
+// at the start, scrolls left until the end is visible, pauses, then jumps back
+// to the start and repeats. Lines that fit are left static. Since 2026-08-23
+// the now-playing bar above the preset grid is the only marquee in the app;
+// the preset keys stay still (user report, same date), so this measures one
+// element.
+function applyTrackScroll(selector = '.status-bar .now') {
+  document.querySelectorAll(selector).forEach(box => {
+    const inner = box.querySelector('.track-inner');
+    if (!inner) return;
+    inner.classList.remove('scrolling');
+    inner.style.removeProperty('--track-scroll');
+    inner.style.removeProperty('--track-dur');
+    const overflow = inner.scrollWidth - box.clientWidth;
+    if (overflow > 4) {
+      // Brisk ~100 px/s scroll plus the built-in pauses, floored so a
+      // slightly-too-long line still scrolls slowly enough to read.
+      const dur = Math.max(3, Math.round(overflow / 75 + 1.5));
+      inner.style.setProperty('--track-scroll', overflow + 'px');
+      inner.style.setProperty('--track-dur', dur + 's');
+      inner.classList.add('scrolling');
+    }
+  });
+}
+
+// attachPresetHandlers wires click (short = play) and long press
+// (hold = save the current station to this slot). LONG_PRESS_MS =
+// 1100 ms: a clearly deliberate hold, so a normal tap never saves by accident.
+// VISUAL_HOLD_DELAY = 180 ms: only after this hold time do we show the
+// scale(0.96) visual. A short click avoids the mini jiggle that a transition
+// scale-down + scale-up would otherwise produce on the logo.
+//
+// opts.onPlay overrides the short-click action (box-native presets recall the
+// box's hardware key instead of STM's play). opts.allowSave=false disables the
+// long-press save so a box-native preset can't be overwritten by a hold.
+const LONG_PRESS_MS = 1100;
+const VISUAL_HOLD_DELAY = 180;
+// isKeyChrome reports whether an event landed on one of the small icons in a
+// key's header (clear, rename) rather than on the key itself. Those icons sit
+// INSIDE the element that carries the play click and the hold-to-save, so
+// without this a tap on the pencil would also start the station, and holding it
+// would save over the key the user only wanted to rename.
+function isKeyChrome(target) {
+  const cl = target && target.classList;
+  return !!cl && (cl.contains('del') || cl.contains('ren'));
+}
+
+function attachPresetHandlers(el, slot, preset, opts = {}) {
+  const onPlay = opts.onPlay || (() => play(slot));
+  const allowSave = opts.allowSave !== false;
+  let timer = null;
+  let visualTimer = null;
+  let armed = false;
+  let firedLong = false;
+  let startedAt = 0;
+  const bar = el.querySelector('.long-press-bar');
+  const animateBar = () => {
+    if (!armed) return;
+    const elapsed = Date.now() - startedAt;
+    // The bar only represents the deliberate-hold window: it fills 0 -> 100%
+    // between VISUAL_HOLD_DELAY and LONG_PRESS_MS, so it never shows for the
+    // first 180 ms (a normal click). Starting it at elapsed/LONG_PRESS_MS made
+    // a quick click flash the "save station" bar before mouseup.
+    const pct = Math.min(100, Math.max(0,
+      ((elapsed - VISUAL_HOLD_DELAY) / (LONG_PRESS_MS - VISUAL_HOLD_DELAY)) * 100));
+    if (bar) bar.style.width = pct + '%';
+    if (armed) requestAnimationFrame(animateBar);
+  };
+  const start = (e) => {
+    if (e.button !== undefined && e.button !== 0) return; // left click only
+    // A press on one of the icons in the key's header is not a press on the key.
+    if (isKeyChrome(e.target)) return;
+    armed = true; // we start the hold
+    firedLong = false; // true once long press fires
+    startedAt = Date.now();
+    visualTimer = setTimeout(() => {
+      if (!armed) return;
+      el.classList.add('long-press');
+      // Only start filling the save-progress bar once the hold is deliberate, so
+      // a normal short click never flashes it.
+      requestAnimationFrame(animateBar);
+    }, VISUAL_HOLD_DELAY);
+    if (allowSave) {
+      timer = setTimeout(async () => {
+        if (!armed) return;
+        firedLong = true;
+        await saveCurrentToSlot(slot);
+        armed = false;
+        el.classList.remove('long-press');
+        if (bar) bar.style.width = '0%';
+      }, LONG_PRESS_MS);
+    }
+  };
+  const cancel = () => {
+    if (!armed) return;
+    armed = false;
+    if (timer) { clearTimeout(timer); timer = null; }
+    if (visualTimer) { clearTimeout(visualTimer); visualTimer = null; }
+    el.classList.remove('long-press');
+    if (bar) bar.style.width = '0%';
+  };
+  const finish = (e) => {
+    if (isKeyChrome(e.target)) return;
+    const wasArmed = armed;
+    cancel();
+    if (!wasArmed) return;
+    if (firedLong) return;
+    if (preset) onPlay();
+  };
+  el.addEventListener('mousedown', start);
+  el.addEventListener('mouseup', finish);
+  el.addEventListener('mouseleave', cancel);
+  el.addEventListener('touchstart', (e) => { start(e); }, { passive: true });
+  el.addEventListener('touchend', (e) => { finish(e); });
+  el.addEventListener('touchcancel', cancel);
+}
+
+// APP_PLAY_FRESH_MS is how long the app trusts its own record of an ad-hoc
+// station it started (state.lastAppPlay) over the box-reported now-playing
+// when saving to a key. Short on purpose: it only needs to cover the
+// play-then-save gesture and the wake window in which an agent-side resume
+// could have raced the play; after that, whatever the box reports IS
+// what the user hears, so the box report wins again.
+const APP_PLAY_FRESH_MS = 2 * 60 * 1000;
+
+// showPresetSaveError turns a failed preset save into the right message. The
+// agent refuses (409 already-on-slot) a save whose station already sits on
+// another key rather than silently deleting that key; that is a question,
+// not an error, so it becomes the note naming the collision plus the offer to
+// move the station onto the key the user pressed. slot is that key;
+// without one there is nothing to move to and the plain note is all that is left.
+function showPresetSaveError(err, slot) {
+  const conflict = parsePresetConflict(err);
+  if (conflict) {
+    if (slot >= 1 && slot <= 6 && state.currentBox) {
+      presetMoveOffer(conflict, slot);
+    } else {
+      showToast(presetConflictNote(conflict, t));
+    }
+    return;
+  }
+  showError(t('preset.saveFailed', { err: String(err) }));
+}
+
+// presetMoveOffer hands offerPresetMove the app's own modal, agent call and grid
+// repaint. The decision itself stays in presetmove.js where it is unit-tested.
+function presetMoveOffer(conflict, slot, onBox) {
+  const box = onBox || state.currentBox;
+  return offerPresetMove({
+    conflict,
+    toSlot: slot,
+    t,
+    // confirmWarn writes the body as HTML and a station name comes from the
+    // directory, so it is escaped here.
+    confirm: (title, body, opts) => confirmWarn(title, escapeHtml(body), opts),
+    move: (from, to) => MovePreset(box.host, box.port, from, to),
+    toast: showToast,
+    fail: showError,
+    done: loadPresets,
+  });
+}
+
+// saveCurrentToSlot saves the currently playing station onto the
+// given slot (overwrites whatever was there before). Uses the
+// now_playing data state.nowLocation + state.nowName plus the last
+// known logo.
+async function saveCurrentToSlot(slot) {
+  // Refresh from the speaker first. On a hardware key press,
+  // state.nowLocation / nowName often lag behind (the boxws event
+  // arrives late). Without the refresh we would save "Station" as
+  // the name or the previous station.
+  try { await refreshStatus(); } catch {}
+  if (!state.nowLocation) {
+    showToast(t('preset.noCurrentStation'));
+    return;
+  }
+
+  // Which save path applies is a pure decision (savePresetCase in utils.js,
+  // unit-tested): spotify / app-play / copy-slot / direct.
+  const sourceSlot = activeSlotFromLocation(state.nowLocation);
+  // A fresh app play is authoritative regardless of what the box reports right
+  // now (native-switch lag / wake-resume race). savePresetCase decides;
+  // the 'app-play' branch below saves state.lastAppPlay with its real logo chain.
+  const saveCase = savePresetCase(state.nowLocation, sourceSlot, state.lastAppPlay, Date.now(), APP_PLAY_FRESH_MS);
+
+  // Case Spotify: the speaker is playing a Spotify playlist. Save a REAL
+  // Spotify preset (type=spotify with the playlist URI), not a radio link to
+  // the raw stream. The latter showed the album cover instead of the Spotify
+  // logo and could not recall/shuffle the playlist. Needs the current context
+  // (playlist URI) from /spotify/info.
+  if (saveCase === 'spotify') {
+    // We can only save a real, recallable Spotify preset when we know the
+    // playlist/album/track context URI. state.nowSpotifyContext is only
+    // refreshed by a throttled (>3s) background poll, so at save time it can
+    // lag or be momentarily empty even while a real playlist is playing. That
+    // made a legitimate save fail with a false "no replayable playlist" (Pierre,
+    // was on Premium playing a playlist). Re-read the live context from the
+    // speaker now instead of trusting the cache.
+    let ctxUri = state.nowSpotifyContext;
+    let acct = state.nowSpotifyAccount || '';
+    // Whether a key on THIS speaker could play at all. The same read already
+    // happens here, so asking costs nothing. undefined means the speaker's
+    // agent predates the field, and "cannot tell" must never become a warning.
+    let canRecall;
+    // And whether the account behind it can do an on-demand recall at all. A free
+    // Spotify account cannot, so the key stores fine and then never plays: that is
+    // the entitlement half of, which the login check alone never covered.
+    let premiumRequired;
+    let gateRead = 'unknown';
+    try {
+      const np = await SpotifyNowPlaying(state.currentBox.host, state.currentBox.port);
+      if (np) {
+        gateRead = 'yes';
+        if (np.context) ctxUri = np.context;
+        if (np.account) acct = np.account;
+        if (np.canRecall !== null && np.canRecall !== undefined) canRecall = !!np.canRecall;
+        if (np.premiumRequired !== null && np.premiumRequired !== undefined) premiumRequired = !!np.premiumRequired;
+      }
+    } catch { gateRead = 'no'; }
+    // Fallback: go-librespot's /spotify/info can report an empty context even
+    // while a real playlist is playing (it depends on how playback was started).
+    // The box's own now-playing still carries the URI STM wrote into its
+    // /playback/container/<base64 spotify:...> location, so decode that before
+    // giving up (Pierre: Premium, a playlist was playing, the box location
+    // held spotify:playlist:..., but np.context came back empty so the save
+    // wrongly failed).
+    if (!ctxUri) ctxUri = spotifyURIFromContainer(state.nowLocation);
+    if (!ctxUri) {
+      // Spotify is playing but the speaker reported no playlist/album/track
+      // context. This is NOT the same as a non-replayable station: a real
+      // station carries a (non-replayable) context that the agent rejects on
+      // save below. An empty context almost always means an out-of-date speaker
+      // agent that cannot capture the context yet (the app updates separately
+      // from the on-box agent) or a will_play event the agent missed. Guide the
+      // user to update the speaker and replay the playlist rather than falsely
+      // claiming there is no playlist.
+      showError(t('preset.spotifyContextUnknown'));
+      return;
+    }
+    const sname = state.nowName || 'Spotify';
+    try {
+      await SaveSpotifyPreset(
+        state.currentBox.host, state.currentBox.port,
+        slot, sname, ctxUri, acct
+      );
+      showToast(t('preset.savedToKey', { n: slot, name: sname }));
+      // The speaker already knows this key will be refused when it is pressed:
+      // both recall paths gate on the same question, and only the SAVE side had
+      // no gate, so the app reported success for a key that cannot play.
+      // Said after the save, not instead of it: the key becomes good the moment
+      // the speaker is picked in Spotify once, so refusing to store it would
+      // throw away work the user will want.
+      // Same order the speaker applies when the key is pressed (recallgate.go):
+      // picked-once first, then the plan. Both stay silent when the speaker could
+      // not be asked, because "cannot tell" must never become a warning.
+      let notice = 'none';
+      if (canRecall === false) {
+        notice = 'needs-login';
+        showToast(t('preset.spotifyKeyNeedsLogin'), 12000);
+      } else if (premiumRequired === true) {
+        notice = 'needs-premium';
+        showToast(t('preset.spotifyKeyNeedsPremium'), 12000);
+      }
+      // Which notice was shown, and what it was decided from. Without this a
+      // report of "two different notices for one long press" cannot be read out
+      // of a bundle at all.
+      // An older build has no such binding, and logging must never be the reason
+      // a save reports a failure, so the rejection is swallowed.
+      try {
+        LogSpotifySaveGate(state.currentBox.host, slot,
+          canRecall === undefined ? 'unknown' : (canRecall ? 'yes' : 'no'),
+          premiumRequired === undefined ? 'unknown' : (premiumRequired ? 'yes' : 'no'),
+          gateRead === 'yes' ? notice : notice + ' (speaker not readable)')?.catch(() => {});
+      } catch {}
+      await loadPresets();
+      return;
+    } catch (err) {
+      // The agent validates the context and returns 422 spotify-uri-unplayable
+      // for a genuinely non-replayable selection (a Spotify radio/station). Show
+      // the precise "no replayable playlist" message for that; a generic failure
+      // otherwise.
+      const msg = String(err);
+      if (/spotify-uri-unplayable|replayable playlist/i.test(msg)) {
+        showError(t('preset.spotifyNotSaveable'));
+      } else {
+        showPresetSaveError(err, slot);
+      }
+      return;
+    }
+  }
+
+  // Case A: speaker is playing a proxy item
+  // (location = /stream/<sourceSlot>). That happens when the
+  // station was triggered via a hardware key or by selecting
+  // another soft slot. In that case we copy the source preset
+  // directly onto the target slot: name, URL, art logo one to one.
+  // That bypasses state.nowIcon / state.nowName completely; on
+  // hardware press both often still hold the previous station.
+  // Same-slot saves (sourceSlot === slot) must take this path too: falling
+  // through to Case B would store the box-visible /stream/<n> proxy URL and
+  // permanently clobber the preset's origin URL.
+  if (saveCase === 'app-play' || saveCase === 'copy-slot') {
+    // The app itself started an ad-hoc station moments ago, yet the box
+    // reports a /stream/<slot> location: on a speaker that was asleep, an
+    // agent-side wake resume racing the play can have put the PREVIOUS
+    // preset back on. Copying that preset here saved the OLD station
+    // onto the key while the user's chosen one silently vanished. The app
+    // knows exactly which station the user picked, so save its own record;
+    // the plain copy below remains for the true hardware-key case, where the
+    // app has no record of the play.
+    const app = state.lastAppPlay;
+    if (saveCase === 'app-play') {
+      const aname = app.name || t('preset.placeholderSender');
+      try {
+        await SetPreset(
+          state.currentBox.host, state.currentBox.port,
+          slot, aname, app.url, app.icon || '', app.bitrate || 0, app.homepage || '', app.codec || ''
+        );
+        showToast(t('preset.savedToKey', { n: slot, name: aname }));
+        await loadPresets();
+        if (app.uuid) {
+          RadioVote(app.uuid).catch(() => {});
+        }
+      } catch (err) {
+        showPresetSaveError(err, slot);
+      }
+      return;
+    }
+    const src = state.presets.find(p => p.slot === sourceSlot);
+    if (src && src.stream_url) {
+      try {
+        await SetPreset(
+          state.currentBox.host, state.currentBox.port,
+          slot, src.name, src.stream_url, src.art || '', src.bitrate || 0, src.homepage || '', src.codec || ''
+        );
+        showToast(t('preset.copiedToKey', { n: slot, name: src.name }));
+        await loadPresets();
+        return;
+      } catch (err) {
+        showPresetSaveError(err, slot);
+        return;
+      }
+    }
+    // No stored preset to copy from (empty source slot) and no fresh app
+    // play record: the only URL available is the box's own /stream/<n>
+    // proxy location, which must never be saved as a preset.
+    showError(t('preset.saveFailed', { err: 'source preset empty' }));
+    return;
+  }
+
+  // Case B: speaker is playing a stream that does NOT go through
+  // our proxy (for example a station started directly via the radio
+  // search). Use state.nowLocation / nowName / nowIcon as before.
+  //
+  // Unless it is a NATIVE radio preset, where the speaker fetches the stream
+  // itself and its location is the ORION descriptor rather than a URL. Saving
+  // that verbatim posts "/station?data=..." as the stream, which the speaker
+  // rightly refuses:
+  //
+  //   status 422 {"code":"stream-url-invalid","error":"This selection can't be
+  //   saved as a preset (no playable stream)."}
+  //
+  // Reported, and it hit every hold-to-save on a speaker whose presets
+  // had migrated to the native form: the "+" button kept working because that
+  // path uses the app's own record of the station instead of the speaker's.
+  // The descriptor carries the name, the logo and the stream URL, so unwrap it
+  // and save what is actually playing. slotFromOrionStation already handles
+  // the case where that stream URL is a per-slot proxy; this is the rest of
+  // them, above all the /stream/raw form.
+  const orion = orionStationPayload(state.nowLocation);
+  if (orion && orion.streamUrl) {
+    const oname = orion.name || state.nowName || t('preset.placeholderSender');
+    // The descriptor's imageUrl is built for the SPEAKER, not for us: it is
+    // the agent's loopback art proxy (or its /icon.png stand-in), which only
+    // resolves on the box itself. Persisting it verbatim was the bug:
+    // every hold-saved key held art that is dead from the user's machine, the
+    // tile's <img> fell through to the DuckDuckGo stream-host icon, and DDG's
+    // 404 body is the grey chevron the webview renders without firing onerror
+    // (see app_library.go). Unwrap to the real image URL; when that leaves
+    // nothing (stand-in logo), try the now-playing icon the same way.
+    const oart = appArtFromBoxArt(orion.imageUrl) || appArtFromBoxArt(state.nowIcon);
+    try {
+      await SetPreset(
+        state.currentBox.host, state.currentBox.port,
+        slot, oname, decodeProxyUrl(orion.streamUrl), oart,
+        state.nowBitrate || 0, '', ''
+      );
+      showToast(t('preset.savedToKey', { n: slot, name: oname }));
+      await loadPresets();
+    } catch (err) {
+      showPresetSaveError(err, slot);
+    }
+    return;
+  }
+
+  const name = state.nowName || t('preset.placeholderSender');
+  // The codec is only known when this stream is the one the app itself
+  // started (radio-browser reported it at play time); the box does not
+  // report one.
+  const appRec = state.lastAppPlay;
+  const codec = (appRec && appRec.url === decodeProxyUrl(state.nowLocation)) ? (appRec.codec || '') : '';
+  try {
+    // state.nowIcon carries the box's <art> tag, which for anything the agent
+    // wrapped is its loopback art-proxy URL: unwrap so the store keeps the
+    // real image URL, never a URL only the box can fetch (same poison
+    // shape as the orion branch above).
+    await SetPreset(
+      state.currentBox.host, state.currentBox.port,
+      slot, name, decodeProxyUrl(state.nowLocation), appArtFromBoxArt(state.nowIcon), state.nowBitrate || 0, '', codec
+    );
+    showToast(t('preset.savedToKey', { n: slot, name }));
+    await loadPresets();
+    if (state.nowUUID) {
+      RadioVote(state.nowUUID).catch(() => {});
+    }
+  } catch (err) {
+    showPresetSaveError(err, slot);
+  }
+}
+
+// reapplyDesiredVolume re-sends the user's chosen volume after the box
+// has woken from standby to play. Waking from standby resets the box to
+// its own stored volume (often 30), which silently discards the level the
+// user set while it was idle. We push the desired level again a couple of
+// times across the wake window, reflect it in the slider right away, and
+// hold off the slider-from-box sync for a few seconds so it cannot snap
+// back to 30 in between. No-op until the user has actually set a volume.
+function reapplyDesiredVolume() {
+  const v = state.desiredVolume;
+  const box = state.currentBox;
+  if (v == null || !box) return;
+  // Reflect the level in the slider right away and hold off the
+  // slider-from-box sync. Send the volume early, while the box is still
+  // buffering (before audio output), so the stream is not briefly audible
+  // at the box's woken default (30). This is safe now that the agent
+  // serializes box commands (boxCmdMu): a volume PUT can no longer race the
+  // play and waits for it via the mutex instead of colliding. A second PUT
+  // a bit later makes sure it sticks if the first landed before the box
+  // had fully woken.
+  state.musicVolUntil = Date.now() + 5000;
+  if (musicVolEl) {
+    musicVolEl.value = String(v);
+    if (musicVolValEl) musicVolValEl.textContent = String(v);
+  }
+  const apply = () => { if (state.currentBox === box) throttledSetVolume(box.host, box.port, v); };
+  setTimeout(apply, 250);
+  setTimeout(apply, 1500);
+}
+
+async function play(slot) {
+  // Was the box idle/standby before this play? Waking resets its volume,
+  // so we re-apply the user's chosen level afterwards only in that case
+  // (a normal preset switch while already playing keeps the live volume).
+  const wasIdle = !state.nowPlayState || state.nowSource === 'STANDBY';
+  // A preset recall supersedes any ad-hoc station the app started: drop the
+  // record so a later long-press save goes back to trusting the box report.
+  state.lastAppPlay = null;
+  const p = state.presets.find(x => x.slot === slot);
+  if (p) {
+    // Optimistic UI: set BUFFERING_STATE immediately so the user
+    // gets feedback. Sticky for 6 s. During that window refreshStatus
+    // must not flip the preset back to grey when the speaker still
+    // reports the old stream or an empty one.
+    state.nowPlayState = 'BUFFERING_STATE';
+    // Spotify presets carry no stream_url (they recall by URI), so without
+    // this the optimistic location is empty: the tile would not light up and
+    // the click feels ignored until the box confirms several seconds later.
+    // Point it at the Spotify stream the box will report, so the highlight and
+    // the "starting" label appear instantly on click.
+    state.nowLocation = p.type === 'spotify'
+      ? boxSpotifyDefaultUrl()
+      : (p.stream_url || '');
+    state.nowName = p.name || '';
+    state.nowIcon = p.art || '';
+    state.nowBitrate = p.bitrate || 0;
+    state.nowTitle = ''; // clear so the new station does not briefly show the old track
+    scheduleLiveBitrate();
+    scheduleLiveTitle();
+    state.nowUUID = '';
+    state.optimisticUntil = Date.now() + 6000;
+    delete state.presetErrors[slot];
+    renderPresets();
+    // Also repaint the now-playing status line from the optimistic state, not
+    // just the preset tile: it reads purely from cached state, so without this
+    // the "Stream is starting" label only appeared after PlaySlot returned and
+    // the next refreshStatus ran, which on a cold soft recall lagged several
+    // seconds behind the click. Now the status line tracks the tile instantly.
+    renderNowPlayingBar();
+  }
+  try {
+    await PlaySlot(state.currentBox.host, state.currentBox.port, slot);
+    // The speaker took the command, so it is awake: any run of wake failures
+    // it had is over, and the next one starts counting from the beginning.
+    noteWakeSucceeded(state.currentBox.host);
+    delete state.presetErrors[slot];
+    if (wasIdle) reapplyDesiredVolume();
+    refreshStatus();
+    setTimeout(refreshStatus, 1500);
+  } catch (e0) {
+    let e = e0;
+    // Newer agents reject a recall sent to a grouped follower with a
+    // structured 409 ({"error":"box-grouped","master":...}): retry ONCE on
+    // the group master, which distributes the audio to the group. Older
+    // agents send a raw SOAP string and take the error path unchanged.
+    const rej = parsePlayRejection(e0);
+    if (rej.grouped) {
+      const mb = resolveBoxByRef(rej.master, state.boxes) || effectivePlayTarget();
+      if (mb && state.currentBox && mb.host !== state.currentBox.host) {
+        try {
+          await PlaySlot(mb.host, mb.port, slot);
+          noteWakeSucceeded(mb.host);
+          delete state.presetErrors[slot];
+          if (wasIdle) reapplyDesiredVolume();
+          refreshStatus();
+          setTimeout(refreshStatus, 1500);
+          return;
+        } catch (e2) {
+          e = e2; // surface the master's error, not the follower's rejection
+        }
+      }
+    }
+    const errStr = String(e);
+    state.nowPlayState = '';
+    state.nowLocation = '';
+    state.optimisticUntil = 0;
+    state.presetErrors[slot] = friendlyPlayError(errStr, (state.currentBox && state.currentBox.host) || "");
+    renderPresets();
+    // The tile label is too small for the multi-step Spotify Connect how-to, so
+    // also show it as a (localized) toast. Use the i18n help text, not the raw
+    // English backend message, so non-English users get it in their language.
+    if (errStr.toLowerCase().includes('spotify-not-logged-in')) {
+      showToast(t('play.errSpotifyLoginHelp'));
+    }
+    setTimeout(() => refreshStatus(), 2000);
+  }
+}
+
+// friendlyPlayError turns a technical error string into a short
+// user-facing hint shown on the preset label.
+//
+// host is passed so a speaker that keeps refusing to wake gets a DIFFERENT
+// sentence on the third attempt than on the first. One sentence for every
+// attempt is a dead end: a reporter read the same line over eighty times
+// (2026-09-29) and had nowhere to go from it.
+function friendlyPlayError(s, host) {
+  const l = String(s).toLowerCase();
+  if (l.includes('box_not_ready')) return t(escalationForCount(noteNotReady(host)));
+  // Spotify recall refused because the speaker was never picked as the Spotify
+  // Connect device (no go-librespot credential). Key off the stable backend code,
+  // not the English message, so rewording the backend never breaks this.
+  if (l.includes('spotify-not-logged-in')) return t('play.errSpotifyLogin');
+  if (l.includes('premium')) return t('play.errSpotifyPremium');
+  if (l.includes('no such host') || l.includes('lookup')) return t('play.errNoInternet');
+  if (l.includes('timeout') || l.includes('deadline')) return t('play.errSpeakerTimeout');
+  if (l.includes('refused')) return t('play.errSpeakerRefused');
+  if (l.includes('402') || l.includes('no uri')) return t('play.errNotPlayable');
+  if (l.includes('500')) return t('play.errServer500');
+  if (l.includes('konnte nicht') || l.includes('could not')) {
+    // Backend returns a localised 'detail' string on UPnP failures.
+    return t('play.errUnreachable');
+  }
+  return t('play.errGeneric');
+}
+
+// scheduleLiveBitrate fetches the agent's detected stream bitrate after a
+// station starts and reflects it into now-playing + the active preset tile.
+// Two delayed reads, not a timer: the first catches an icy-br value (known
+// instantly), the second catches the throughput estimate, which the agent
+// only has after it has skipped the buffer-fill and measured ~6 s of
+// steady-state playback (~10 s in). Routed through the StreamBitrate Go
+// binding so it self-heals across :8888 / :17008 like every other box call
+// (a raw fetch pinned to box.port silently failed on BCO speakers).
+let liveBitrateTimer = null;
+function scheduleLiveBitrate() {
+  if (liveBitrateTimer) { clearTimeout(liveBitrateTimer); liveBitrateTimer = null; }
+  const box = state.currentBox;
+  if (!box) return;
+  // The agent only has a throughput bitrate ~10 s after the stream itself
+  // starts, and the stream start lags the play click by a few seconds
+  // (wake + UPnP). A fixed delay therefore races the measurement and can
+  // read 0 forever. So retry every 4 s until a value appears, then stop;
+  // bounded to ~32 s so it never polls indefinitely. icy-br stations
+  // resolve on the first attempt. Routed through the StreamBitrate Go
+  // binding so it self-heals across :8888 / :17008.
+  let tries = 0;
+  const attempt = async () => {
+    liveBitrateTimer = null;
+    if (state.currentBox !== box) return;
+    tries++;
+    // Spotify streams report their measured rate through a separate agent
+    // endpoint and carry no slot in the location, so resolve the preset by
+    // name (the now-playing title is the preset name).
+    const isSpotify = /\/spotify\/stream/.test(state.nowLocation || '');
+    let br = 0;
+    try {
+      br = ((isSpotify ? await SpotifyBitrate(box.host, box.port)
+                       : await StreamBitrate(box.host, box.port)) | 0);
+    } catch {}
+    if (br > 0) {
+      if (br !== state.nowBitrate) {
+        state.nowBitrate = br;
+        // status bar repaints on its own 1 s tick; setting nowBitrate is enough.
+        // Correct the active preset's stored bitrate to the real value
+        // (radio-browser's catalogue number is often missing or wrong; a
+        // Spotify preset never had one).
+        const p = isSpotify
+          ? state.presets.find(x => x.type === 'spotify' && x.name === state.nowName)
+          : (() => { const s = activeSlotFromLocation(state.nowLocation); return s !== null ? state.presets.find(x => x.slot === s) : null; })();
+        // The slot lookup goes by NUMBER, so after a sync replaced the slot's
+        // station the rate measured from the still-playing OLD stream must not
+        // be stamped onto the NEW station (a Jazz-stream reading written
+        // onto the freshly-saved key). Same identity check the tile uses.
+        const orionNow = orionStationPayload(state.nowLocation);
+        const stale = !isSpotify && p && orionNow && nativeSlotStale({
+          presetName: p.name,
+          presetUrl: p.stream_url,
+          playingName: typeof orionNow.name === 'string' ? orionNow.name : '',
+          playingUrl: orionNow.streamUrl ? decodeProxyUrl(orionNow.streamUrl) : '',
+        });
+        if (p && !stale && p.bitrate !== br && isMeasurableStreamPreset(p)) {
+          p.bitrate = br;
+          // Persist for radio only. SetPreset is radio-only (type=radio, no
+          // uri), so persisting a Spotify preset would wipe its URI. The
+          // Spotify rate stays live via state.nowBitrate + /spotify/info.
+          // Guarded: the write is skipped when the slot changed on the box
+          // since this list was loaded.
+          if (!isSpotify) {
+            setPresetIfUnchanged(box, p, { bitrate: br });
+          }
+        }
+        renderPresets();
+      }
+      return; // got it
+    }
+    if (tries < 11) liveBitrateTimer = setTimeout(attempt, 3000);
+  };
+  // First attempt soon: a station measured earlier this session is cached
+  // agent-side and answers instantly. Fresh stations return 0 here and the
+  // retries (every 3 s, ~33 s total) pick up the value once the agent's
+  // ~10 s throughput window completes.
+  liveBitrateTimer = setTimeout(attempt, 2000);
+}
+
+// scheduleLiveTitle polls the agent's live ICY StreamTitle for the radio
+// station currently playing and reflects it into the now-playing bar above the
+// preset grid. Unlike the bitrate (stable, read once) the title changes
+// per song, so this re-polls every 12 s while a proxied radio stream is the
+// active source. It stops when the speaker changes or playback stops; Spotify
+// is skipped (it shows its own track via /spotify/info).
+// liveTitleActive guards a single running poll loop: scheduleLiveTitle may be
+// called from the play handler AND from every refreshStatus tick, so without
+// this each call would reset the timer and it would never fire. The loop
+// clears the flag when it stops (speaker change or playback stop), so the next
+// play restarts it.
+let liveTitleActive = false;
+function scheduleLiveTitle() {
+  if (liveTitleActive) return;
+  const box = state.currentBox;
+  if (!box) return;
+  liveTitleActive = true;
+  const tick = async () => {
+    if (state.currentBox !== box) { liveTitleActive = false; return; }   // speaker changed
+    const loc = state.nowLocation || '';
+    if (loc === '') { liveTitleActive = false; return; }                 // playback stopped
+    // Anything the stream proxy is serving, which is where a live title comes
+    // from. This used to ask for a preset SLOT instead, which is a narrower
+    // question: a station started from Find stations has no slot, so the poll
+    // never ran and the Play tab showed no artist or track while the speaker's
+    // own page showed both. The predicate still covers the ORION
+    // descriptor a native preset carries and still says no to a
+    // native station pointing straight at a CDN, where there is no title to get.
+    const isRadio = proxiedRadioPlaying(loc);
+    if (isRadio) {
+      let title = '';
+      try { title = (await StreamTitle(box.host, box.port)) || ''; } catch {}
+      if (state.currentBox !== box) { liveTitleActive = false; return; }
+      if (title !== state.nowTitle) {
+        state.nowTitle = title;
+        // Only the status line. The preset grid is NOT rebuilt here any more:
+        // since the keys stopped showing the live title (2026-08-23) a rebuild
+        // would re-create six <img class="preset-logo"> every 12 s for a value
+        // no tile displays. The tile's own inputs have their own triggers: the
+        // highlight from stateChanged in refreshStatus, the bitrate from
+        // scheduleLiveBitrate.
+        renderNowPlayingBar();
+      }
+    }
+    // Poll fast (every 2 s) while there is no title yet, so a just-started
+    // station or a fresh preset switch shows its track within a couple of
+    // seconds instead of waiting a full cycle; relax to 12 s once a title is
+    // showing. An empty title (station between songs / no metadata) keeps the
+    // fast cadence so it re-acquires quickly.
+    setTimeout(tick, state.nowTitle ? 12000 : 2000);
+  };
+  // First read soon: the station emits its first metadata block a moment after
+  // the stream starts.
+  setTimeout(tick, 1200);
+}
+
+async function action(kind) {
+  if (!state.currentBox) return;
+  const fn = kind === 'pause' ? Pause
+    : kind === 'resume' ? Resume
+      : kind === 'next' ? Next
+        : kind === 'prev' ? Prev
+          : Stop;
+  try { await fn(state.currentBox.host, state.currentBox.port); } catch (e) { showError(e); }
+  // Skip lands on a new track fast; poll a touch sooner so the title updates.
+  setTimeout(refreshStatus, (kind === 'next' || kind === 'prev') ? 600 : 1000);
+}
+
+// queueAction runs a queue binding for the current box, then refreshes the
+// status (which pulls a fresh GetQueue) so the transport controls reflect the
+// new position / toggle state promptly.
+async function queueAction(fn) {
+  if (!state.currentBox) return;
+  try { await fn(state.currentBox.host, state.currentBox.port); } catch (e) { showError(e); }
+  setTimeout(refreshStatus, 600);
+}
+
+// refreshQueue pulls the box's current queue state and folds it into state.queue,
+// then repaints the transport controls. Called from the status poll so it shares
+// the existing cadence. Best-effort: a failed read just leaves the controls as is.
+async function refreshQueue() {
+  const box = state.currentBox;
+  if (!box) { state.queue = null; renderQueueControls(); return; }
+  try {
+    const q = await GetQueue(box.host, box.port);
+    if (state.currentBox !== box) return; // box switched mid-fetch
+    state.queue = q || null;
+  } catch {
+    // leave the last known queue state on screen
+  }
+  renderQueueControls();
+}
+
+// renderQueueControls shows/hides the queue transport controls and reflects the
+// shuffle/repeat/position state. Purely DOM-driven from state.queue.
+function renderQueueControls() {
+  const wrap = $('queueControls');
+  if (!wrap) return;
+  const q = state.queue;
+  const active = !!(q && q.active);
+  wrap.classList.toggle('hidden', !active);
+  if (!active) return;
+  const shuffleBtn = $('queueShuffleBtn');
+  if (shuffleBtn) shuffleBtn.classList.toggle('active', !!q.shuffle);
+  const repeatBtn = $('queueRepeatBtn');
+  if (repeatBtn) {
+    const mode = q.repeat || 'off';
+    repeatBtn.classList.toggle('active', mode !== 'off');
+    // "Repeat one" gets a small superscript 1 so the two repeat modes are
+    // distinguishable at a glance.
+    repeatBtn.innerHTML = mode === 'one' ? '&#128257;¹' : '&#128257;';
+  }
+  const pos = $('queuePos');
+  if (pos) {
+    const items = q.items || [];
+    const n = (typeof q.pos === 'number' && q.pos >= 0) ? q.pos + 1 : 0;
+    pos.textContent = (n > 0 && items.length > 0)
+      ? t('queue.trackOf', { n, total: items.length })
+      : '';
+  }
+}
+
+// resetNowPlaying drops the cached now-playing line so switching speakers (in
+// particular tapping a different box / a group member) starts from a neutral
+// placeholder instead of showing the previously selected box's track until the
+// next status poll lands. Without this the marquee kept the previous speaker's
+// station + track for 5-10 s after a switch, and in a group it stuck on the
+// member's pre-group selection.
+function resetNowPlaying() {
+  state.nowLocation = '';
+  state.nowName = '';
+  state.nowTitle = '';
+  state.nowSource = '';
+  state.nowSourceAccount = '';
+  state.nowPlayState = '';
+  state.nowIcon = '';
+  state.nowBitrate = 0;
+  state.nowSpotifyTrack = '';
+  state.nowSpotifyArtist = '';
+  state.nowSpotifyCover = '';
+  state.optimisticUntil = 0;
+  state.lastStatusHTML = '';
+}
+
+// renderNowPlayingBar paints the now-playing status line purely from cached
+// state (no network), so it can be called both from the status poll and from
+// the live-title poller the moment a track arrives, instead of the track only
+// appearing on the next poll. Since 2026-08-23 this bar is the only place the
+// running title is shown. Guarded on the rendered HTML so it does not restart
+// the marquee animation when nothing changed.
+// spotifyContextLabelKey names what is playing by what the URI says it is. The
+// line used to say "Playlist" for everything, so an album played from the Spotify
+// app was announced as a playlist. Anything unrecognised keeps the old
+// word rather than inventing one.
+function spotifyContextLabelKey(uri) {
+  const kind = String(uri || '').split(':')[1] || '';
+  if (kind === 'album') return 'status.albumLabel';
+  if (kind === 'artist') return 'status.artistLabel';
+  if (kind === 'show' || kind === 'episode') return 'status.podcastLabel';
+  return 'status.playlistLabel';
+}
+
+function renderNowPlayingBar() {
+  const bar = $('statusBar');
+  if (!bar) return;
+  const ps = state.nowPlayState || '';
+  const src = state.nowSource || '';
+  const loc = state.nowLocation || '';
+  const name = state.nowName || '';
+  // Transport button doubles as Play/Pause: when the box is paused it offers
+  // Play (resume from the paused position, like the Bose remote), otherwise
+  // Pause.
+  const ppBtn = $('pauseBtn');
+  if (ppBtn) {
+    ppBtn.innerHTML = stoppedOrPaused(ps)
+      ? '&#9654;&#xFE0E; ' + escapeHtml(t('controls.play'))
+      : '&#9208; ' + escapeHtml(t('controls.pause'));
+  }
+  syncPlayNowButtons();
+  // Track skip/previous: only for a Spotify playlist (the DLNA folder queue has
+  // its own prev/next in #queueControls). The buttons flank Play/Pause and hide
+  // for radio and single sources, which have nothing to skip.
+  const isSpotify = /\/spotify\/stream/.test(loc);
+  const nextBtn = $('trackNextBtn');
+  const prevBtn = $('trackPrevBtn');
+  if (nextBtn) nextBtn.classList.toggle('hidden', !isSpotify);
+  if (prevBtn) prevBtn.classList.toggle('hidden', !isSpotify);
+  let displayName = name;
+  // Either Spotify: the one STM serves through its own proxy, or the one the
+  // speaker serves itself after a phone picked it in Connect. Same line, two
+  // sources for the song.
+  const spotifyTrack = state.nowBoxSpotify
+    ? state.nowBoxSpotify.track
+    : (/\/spotify\/stream/.test(loc) ? state.nowSpotifyTrack : '');
+  const spotifyArtist = state.nowBoxSpotify ? state.nowBoxSpotify.artist : state.nowSpotifyArtist;
+  if (spotifyTrack) {
+    const song = spotifyArtist ? `${spotifyArtist} - ${spotifyTrack}` : spotifyTrack;
+    displayName = name ? `${t(spotifyContextLabelKey(state.nowSpotifyContext || spotifyURIFromContainer(loc)))}: "${name}" · ${song}` : song;
+  } else if (proxiedRadioPlaying(loc) && state.nowTitle) {
+    // The same predicate as the title poller above, and it has to be the same
+    // one: fixing only the poll would fetch a title that this line then refused
+    // to print.
+    displayName = name ? `${t('status.stationLabel')}: "${name}" · ${state.nowTitle}` : state.nowTitle;
+  }
+  // Match the source case-insensitively: the firmware is not consistent about
+  // casing across models, and AirPlay in particular can read as AIRPLAY,
+  // AirPlay2, etc. depending on the speaker.
+  const srcU = src.toUpperCase();
+  const isAirplay = srcU.includes('AIRPLAY');
+  let stateLabel, stateClass;
+  if (ps === 'PLAY_STATE') { stateLabel = t('status.playing'); stateClass = 'play'; }
+  else if (ps === 'BUFFERING_STATE') { stateLabel = t('status.buffering'); stateClass = 'buf'; }
+  else if (ps === 'PAUSE_STATE') { stateLabel = t('status.paused'); stateClass = 'idle'; }
+  else if (srcU === 'STANDBY') { stateLabel = t('status.standby'); stateClass = 'idle'; }
+  else { stateLabel = ''; stateClass = 'idle'; }
+  // LOCAL is what a Cinemate calls the very same analogue input, so it gets
+  // the same line rather than falling through to the generic "some source is
+  // active" case, which is why a speaker playing through it showed nothing
+  // useful at all.
+  // `name || generic`, not the generic outright. The box names its own socket
+  // in <itemName> and the app had already parsed and stored it one line above,
+  // then overwrote it here, so a speaker with two or three inputs showed the
+  // same "AUX input" for all of them while the phone remote printed the real
+  // name. The generic label stays as the FALLBACK: a CineMate reported
+  // no name at all and fell through to "some source is active", which was
+  // worse than a generic one.
+  if (srcU === 'AUX' || srcU === 'LOCAL') { displayName = name || t('status.auxInput'); if (!stateLabel) { stateLabel = t('status.active'); stateClass = 'play'; } }
+  else if (srcU === 'BLUETOOTH') { displayName = t('status.bluetooth'); if (!stateLabel) { stateLabel = t('status.active'); stateClass = 'play'; } }
+  else if (isAirplay) { displayName = t('status.airplay'); if (!stateLabel) { stateLabel = t('status.active'); stateClass = 'play'; } }
+  else if (srcU && srcU !== 'STANDBY' && srcU !== 'INVALID_SOURCE' && ps !== 'STOP_STATE' && !stateLabel && !displayName) {
+    // The box has an active source STM does not specifically label (some models
+    // report AirPlay/Spotify Connect/other inputs under a different name and
+    // without a playStatus). Reflect it as active rather than letting it fall
+    // through to a misleading "ready" while audio is actually playing. An
+    // explicit STOP_STATE is excluded so a stopped box still reads as idle.
+    stateLabel = t('status.active');
+    stateClass = 'play';
+  }
+  const isStreamSrc = (ps === 'PLAY_STATE' || ps === 'BUFFERING_STATE' || ps === 'PAUSE_STATE') && srcU !== 'AUX' && srcU !== 'BLUETOOTH' && !isAirplay;
+  // The bitrate readout only means something for a measured live stream: radio
+  // through the proxy (/stream/...) or Spotify. A direct library file is played
+  // straight to the box and STM never measures its rate, so it must not show a
+  // number (a leftover radio value) or a misleading "- kbit/s".
+  const measuredStream = /\/stream\//.test(state.nowLocation || '') || /\/spotify\/stream/.test(state.nowLocation || '');
+  const brLabel = (isStreamSrc && measuredStream) ? ` <small class="now-bitrate">${state.nowBitrate ? state.nowBitrate + ' kbit/s' : '- kbit/s'}</small>` : '';
+  bar.className = 'status-bar status-' + stateClass;
+  // Glyph reflects the actual transport state so play vs pause is not conveyed
+  // by colour alone (accessibility): play arrow normally, pause bars when paused.
+  const stateGlyph = stoppedOrPaused(ps) ? '&#9208;' : '&#9654;&#xFE0E;';
+  let statusHTML;
+  if (displayName) {
+    const nowArt = isStreamSrc
+      ? appArtFromBoxArt(state.nowIcon).split('|').find(c => /^https?:\/\//i.test(c.trim())) || ''
+      : '';
+    const artHTML = nowArt ? `<img class="now-art" alt="" referrerpolicy="no-referrer" src="${escapeAttr(nowArt.trim())}"/>` : '';
+    // displayName sits in a .track-inner so a too-long "Station: ... · track"
+    // marquees inside .now. This bar is the full window wide, which is why it
+    // is the one place that carries the running title (report 2026-08-23).
+    statusHTML = `${artHTML}<span class="now"><span class="track-inner">${stateGlyph} ${escapeHtml(displayName)}</span></span>${stateLabel ? ' <small>' + escapeHtml(stateLabel) + '</small>' : ''}${brLabel}`;
+  } else if (stateLabel) {
+    statusHTML = `<span class="muted">${escapeHtml(stateLabel)}</span>`;
+  } else if (state.currentBox && state.currentBox.offline) {
+    // Not "ready". A failed poll deliberately keeps the last known
+    // now-playing rather than blanking the bar, and with nothing playing
+    // that fell through to "ready", so a speaker that had gone off the
+    // network was reported as an idle speaker waiting for input, for as long
+    // as the app stayed open. The tile greys out but the status line said the
+    // opposite. Discovery already knows; this just stops contradicting it.
+    statusHTML = `<span class="muted">${escapeHtml(t('status.unreachable'))}</span>`;
+  } else {
+    statusHTML = `<span class="muted">${escapeHtml(t('status.ready'))}</span>`;
+  }
+  // Only rewrite the DOM when the line changes, so the marquee animation is not
+  // restarted on every poll (it would never get to scroll).
+  // Written into .status-main, NOT into the bar itself: the elapsed time and
+  // the progress bar are siblings inside the same bar now, and replacing the
+  // bar's whole content would delete them on every status poll.
+  if (statusHTML !== state.lastStatusHTML) {
+    state.lastStatusHTML = statusHTML;
+    const main = $('statusMain');
+    if (main) {
+      main.innerHTML = statusHTML;
+      // CSP forbids inline onerror, so a dead cover is dropped from here.
+      const art = main.querySelector('.now-art');
+      if (art) art.addEventListener('error', () => art.remove(), { once: true });
+    }
+    requestAnimationFrame(() => applyTrackScroll('.status-bar .now'));
+  }
+}
+
+// Stereo balance, read-only.
+//
+// Balance exists only while two speakers are paired, and only the MASTER of the
+// pair reports it; ask the other one and it says it has none. The picker lists
+// the two halves of a pair individually and marks neither as the master, so
+// asking the selected speaker meant the balance simply vanished for whoever
+// picked the other half, and the feature looked absent (reported 2026-08-06).
+// balanceSourceBox therefore routes the question to the pair's master whichever
+// half is selected. Range and centre come from the speaker (-7..+7, 0 centred
+// on a SoundTouch 10) rather than from a constant, because a widely-copied
+// community value of -50..+50 does not match what the firmware actually says.
+//
+// Shown, not settable yet. Every write ATTEMPT OVER HTTP hung and left the
+// speaker's balance endpoint unresponsive until it was woken again. The
+// WebSocket bus is reported to accept it and has never been tried,
+// because STM's client there cannot send. Displaying it still earns its place, because a pair that was set
+// off-centre in the old Bose app otherwise just sounds lopsided for no visible
+// reason.
+//
+// Fetched on demand, never on the status poll: the speaker does not answer this
+// while it is in deep standby, it simply hangs.
+async function refreshBalance() {
+  const el = $('musicBalance');
+  if (!el) return;
+  const selected = state.currentBox;
+  if (!selected || selected.kind === 'stock') { el.classList.add('hidden'); return; }
+  // Resolve the pair that CONTAINS the selected box, not just the first: either
+  // half of any pair must show that pair's balance, which was only true
+  // for the first pair while stereoPairOf returned it alone.
+  const balPair = stereoPairsOf(state.zoneLive || {}).find(p => inStereoPair(selected, p)) || null;
+  const box = balanceSourceBox(selected, balPair, state.boxes) || selected;
+  if (box.kind === 'stock') { el.classList.add('hidden'); return; }
+  const v = await readBoxBalance(box);
+  if (v === null) { el.classList.add('hidden'); return; }
+  el.textContent = balanceLabel(v);
+  el.title = t('controls.balanceTitle');
+  el.classList.remove('hidden');
+}
+
+// Track progress. The speaker's own AVTransport clock is the source of
+// truth, polled on the status cadence; between polls the bar advances locally
+// so it moves smoothly instead of stepping every few seconds.
+//
+// Two rules keep it honest. It never runs backwards on its own: now_playing and
+// the transport can disagree for a second around a track change, and a bar that
+// jumps back reads as a bug even when the number is momentarily right. And a
+// track change resets it hard, because that is the one moment when going back
+// to zero is correct.
+const trackPos = { sec: 0, dur: 0, at: 0, key: '', polling: false };
+
+function fmtClock(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function resetTrackProgress(key) {
+  trackPos.sec = 0;
+  trackPos.dur = 0;
+  trackPos.at = Date.now();
+  trackPos.key = key || '';
+  renderTrackProgress();
+}
+
+function renderTrackProgress() {
+  const wrap = $('trackProgress');
+  if (!wrap) return;
+  const playing = state.nowPlayState === 'PLAY_STATE' || state.nowPlayState === 'BUFFERING_STATE';
+  if (!playing || trackPos.at === 0) { wrap.classList.add('hidden'); return; }
+  // Interpolate forward from the last reading while the speaker is playing.
+  const drift = state.nowPlayState === 'PLAY_STATE' ? (Date.now() - trackPos.at) / 1000 : 0;
+  const shown = trackPos.sec + drift;
+  wrap.classList.remove('hidden');
+  $('trackElapsed').textContent = fmtClock(shown);
+  const bar = $('trackBar');
+  const fill = $('trackBarFill');
+  if (trackPos.dur > 0) {
+    // A track with a known length: show the bar and the total.
+    bar.classList.remove('hidden');
+    fill.style.width = Math.min(100, (shown / trackPos.dur) * 100).toFixed(1) + '%';
+    $('trackTotal').textContent = fmtClock(trackPos.dur);
+  } else {
+    // Radio has no end. Elapsed time only, no bar to fill.
+    bar.classList.add('hidden');
+    $('trackTotal').textContent = '';
+  }
+}
+
+async function pollTrackPosition() {
+  if (trackPos.polling || !state.currentBox || state.view !== 'box') return;
+  const playing = state.nowPlayState === 'PLAY_STATE' || state.nowPlayState === 'BUFFERING_STATE';
+  if (!playing) { trackPos.at = 0; renderTrackProgress(); return; }
+  trackPos.polling = true;
+  try {
+    const [pos, dur] = await TrackPosition(state.currentBox.host, state.currentBox.port);
+    if (pos < 0) return; // could not ask: keep the bar where it is
+    // Only accept a backwards jump when the track itself changed, which
+    // resetTrackProgress has already handled by clearing the reading.
+    const drifted = trackPos.sec + (Date.now() - trackPos.at) / 1000;
+    if (trackPos.at !== 0 && pos + 2 < drifted && dur === trackPos.dur) return;
+    trackPos.sec = pos;
+    trackPos.dur = dur;
+    trackPos.at = Date.now();
+  } catch {
+    // leave the last reading in place
+  } finally {
+    trackPos.polling = false;
+    renderTrackProgress();
+  }
+}
+
+// spotifyKeyUsableFor answers one question for the built-in-Spotify notice:
+// could a saved Spotify key on THIS speaker play anything at all? Only the
+// speaker knows, so it is asked, once, and the answer cached per host.
+//
+// Returns true, false, or undefined while no answer has arrived yet. The caller
+// shows the notice only on true, so a speaker that has not answered stays
+// silent for a poll rather than repeating an instruction that already went out
+// wrong twice.
+//
+// canRecall absent means the agent predates the field, not "no". Reading it as
+// no would hide the notice from everyone who has not updated their speaker.
+function spotifyKeyUsableFor(box) {
+  if (!box || !box.host) return undefined;
+  const cache = state.spotifyKeyUsable || (state.spotifyKeyUsable = {});
+  if (box.host in cache) return cache[box.host];
+  if (state.spotifyKeyUsablePending === box.host) return undefined;
+  state.spotifyKeyUsablePending = box.host;
+  SpotifyNowPlaying(box.host, box.port)
+    .then(np => {
+      state.spotifyKeyUsablePending = '';
+      if (!np) return;
+      const canRecall = np.canRecall === null || np.canRecall === undefined ? true : !!np.canRecall;
+      cache[box.host] = canRecall && !np.premiumRequired;
+    })
+    .catch(() => {
+      state.spotifyKeyUsablePending = '';
+    });
+  return undefined;
+}
+
+async function refreshStatus() {
+  if (!state.currentBox || state.view !== 'box') return;
+  // Reflect hardware-button volume changes back into the slider.
+  // Fired in parallel with the Status fetch so a slow Status call
+  // does not delay the volume update. Cheap, drag-aware.
+  syncMusicTabVolumeFromBox();
+  // Keep the queue transport controls in step with the box. Fired alongside the
+  // Status fetch (not awaited) so it shares the poll cadence without delaying it.
+  refreshQueue();
+  // Track position rides the same cadence, not awaited so a slow AVTransport
+  // read cannot delay the status poll.
+  pollTrackPosition();
+  // This app is not the only thing that writes presets: the phone remote saves
+  // to the same speaker, and until now the tiles here kept whatever they were
+  // loaded with, so a key reassigned from the phone showed the old station
+  // until the speaker was reselected.
+  refreshPresetsIfChanged();
+  try {
+    const xml = await Status(state.currentBox.host, state.currentBox.port);
+    _statusFailCount = 0; // the box answered: it is reachable at its current IP
+    const name = decodeXmlEntities((xml.match(/<itemName>([^<]+)<\/itemName>/) || [])[1] || '');
+    const src = (xml.match(/source="([^"]+)"/) || [])[1] || '';
+    state.nowSource = src;
+    // A speaker with more than one socket of the same kind (an SA-5 reports
+    // three AUX inputs) says which one is playing only in the account, so the
+    // input row needs it to light the right button.
+    state.nowSourceAccount = (xml.match(/nowPlaying[^>]*sourceAccount="([^"]*)"/) || [])[1] || '';
+    // The speaker's OWN Spotify receiver names the song in the same response,
+    // and that is not true of every source: on radio <track> merely repeats the
+    // station, which is why the song has always had to come from STM's stream
+    // proxy instead. Confirmed on firmware 27.0.6 with the cloud gone
+    // and a FREE Spotify account: <track>, <artist>, <album> and the cover are
+    // all filled while <itemName> carries the playlist. So a phone-started
+    // Connect session can show the song with no extra request, and STM's own
+    // engine must not be asked about it, because it is not the one playing.
+    state.nowBoxSpotify = null;
+    if (src === 'SPOTIFY') {
+      const bt = decodeXmlEntities((xml.match(/<track>([^<]*)<\/track>/) || [])[1] || '');
+      if (bt) {
+        state.nowBoxSpotify = {
+          track: bt,
+          artist: decodeXmlEntities((xml.match(/<artist>([^<]*)<\/artist>/) || [])[1] || ''),
+          cover: (xml.match(/<art\b[^>]*>([^<]*)<\/art>/) || [])[1] || '',
+        };
+      }
+    }
+
+    // Piggy-back an SSH status check on the polling we are doing
+    // anyway. Toggle the global banner so the user sees it on every
+    // tab rather than only after entering the Settings tab.
+    checkSshBanner();
+    const ps = (xml.match(/<playStatus>([^<]+)<\/playStatus>/) || [])[1] || '';
+
+    // Native Bose Spotify receiver detection: source=SPOTIFY means a phone
+    // connected to the speaker's built-in Spotify Connect, not STM's
+    // go-librespot (STM's own playback is always source=UPNP via the stream
+    // proxy). STM cannot recall a preset on the native receiver, so say so
+    // once per episode and reset when the speaker leaves SPOTIFY again.
+    //
+    // Two conditions, both from the same report. The notice opens with
+    // "Playing on the speaker's built-in Spotify" and used to fire on a PAUSED
+    // session, because the play state was read further down than the notice.
+    // And it tells the user to press a saved Spotify key, which a free account
+    // cannot create at all, so it sent a free-account user looking for a button
+    // that does not exist. It now needs a speaker that is really playing and a
+    // key that really exists, and it is remembered per speaker, not globally.
+    // Two conditions were not enough. The reporter HAS a saved Spotify key
+    // and his speaker WAS playing, so both gates passed and he still got a
+    // notice telling him to press a key he cannot use (on v0.9.83 which
+    // already had the first fix). The key existing was never the question;
+    // being able to use it is.
+    //
+    // The third attempt has to ask the SPEAKER, and it has to ask here.
+    // state.spotifyPremiumRequired looked like the answer, but it is only ever
+    // written while STM's own stream is the thing playing (isSpotifyNow, below),
+    // and that is false exactly when this notice fires, because what is playing
+    // is the box's OWN receiver. The flag was therefore always undefined at this
+    // point. A free account is also only half of it: a speaker that was never
+    // picked in Spotify at all cannot use the key either, and reports
+    // premiumRequired=false because it has no account to judge.
+    const spotifyKeySaved = (state.presets || []).some(p => p && p.type === 'spotify');
+    const spotifyWarnKey = (state.currentBox && state.currentBox.host) || '';
+    if (src === 'SPOTIFY' && ps === 'PLAY_STATE' && spotifyKeySaved) {
+      // Silent until the speaker has answered. One poll's delay on a hint is
+      // cheaper than a third wrong instruction to the same person.
+      if (state.nativeSpotifyWarned !== spotifyWarnKey && spotifyKeyUsableFor(state.currentBox) === true) {
+        state.nativeSpotifyWarned = spotifyWarnKey;
+        showToast(t('play.nativeSpotifyHint'));
+      }
+    } else if (src !== 'SPOTIFY') {
+      state.nativeSpotifyWarned = '';
+      // Forget the verdict too: the user may go and tap the speaker in Spotify
+      // precisely because the key did not work, and the app must notice.
+      state.spotifyKeyUsable = {};
+    }
+    const loc = decodeXmlEntities((xml.match(/location="([^"]+)"/) || [])[1] || '');
+    // Extract the art URL from the <art ...>URL</art> tag. Bose
+    // emits it for stations with an image (for example after a
+    // radio-search play). Without this refresh, state.nowIcon would
+    // stay stuck from the previous soft click ("logo of the
+    // previous station" bug).
+    const artRaw = decodeXmlEntities((xml.match(/<art[^>]*>([^<]+)<\/art>/) || [])[1] || '');
+
+    // Optimistic guard: after a user preset click we set nowLocation
+    // straight to the desired stream. Until optimisticUntil expires,
+    // refreshStatus must NOT overwrite location/name. Otherwise the
+    // button flickers grey between click and the actual stream
+    // start. Once the speaker confirms our location, release the
+    // optimistic guard.
+    const optimistic = Date.now() < (state.optimisticUntil || 0);
+    if (optimistic && loc && loc === state.nowLocation) {
+      state.optimisticUntil = 0;
+    }
+    const newLoc = optimistic ? state.nowLocation : loc;
+    const newName = optimistic ? state.nowName : name;
+    const stateChanged = state.nowPlayState !== ps || state.nowLocation !== newLoc || state.nowName !== newName;
+    // A different track means the progress must start over; anything else keeps
+    // its reading so the bar does not stutter on an unrelated status change.
+    const trackKey = newLoc + '|' + newName;
+    if (trackKey !== trackPos.key) resetTrackProgress(trackKey);
+    // the Recently-played view now refreshes now-playing itself (recent.js
+    // syncCurrentNowPlaying), because refreshStatus returns early on any non-box
+    // view, so an "if (state.view === 'recent')" branch here was unreachable.
+    state.nowPlayState = ps;
+    state.nowLocation = newLoc;
+    state.nowName = newName;
+    // Live Spotify track metadata for the now-playing line: poll the agent's
+    // /spotify/info (throttled) while a Spotify stream is active so the desktop
+    // shows the current song + artist, not just the playlist/preset name.
+    // A container location is also what the speaker's own receiver reports, and
+    // for that one the song came out of the status XML above. Asking STM's
+    // engine then answers about a session it is not serving and blanks the line.
+    const isSpotifyNow = /\/spotify\/stream|\/playback\/container/.test(newLoc) && !state.nowBoxSpotify;
+    if (isSpotifyNow) {
+      const npBox = state.currentBox;
+      if (npBox && Date.now() - (state.lastSpotifyNowFetch || 0) > 3000) {
+        state.lastSpotifyNowFetch = Date.now();
+        SpotifyNowPlaying(npBox.host, npBox.port).then(np => {
+          if (!np) return;
+          const coverChanged = state.nowSpotifyCover !== (np.cover || '');
+          state.nowSpotifyTrack = np.track || '';
+          state.nowSpotifyArtist = np.artist || '';
+          state.nowSpotifyCover = np.cover || '';
+          state.nowSpotifyContext = np.context || '';
+          state.nowSpotifyAccount = np.account || '';
+          // A free account cannot start a playlist from a preset key, so any
+          // message that tells the user to press one is wrong for them.
+          state.spotifyPremiumRequired = !!np.premiumRequired;
+          // Spotify refused the audio key for track after track. Without this
+          // the playlist just races past in silence and the speaker looks
+          // broken, when in fact Spotify is refusing this engine for this
+          // account. Said once per episode: the condition clears itself on the
+          // speaker after ten quiet minutes, and repeating it every three
+          // seconds would be worse than the silence.
+          if (np.audioKeyRefused) {
+            if (!state.spotifyKeyRefusalShown) {
+              state.spotifyKeyRefusalShown = true;
+              showError(t('spotify.audioKeyRefused'));
+            }
+          } else {
+            state.spotifyKeyRefusalShown = false;
+          }
+          // The now-playing line redraws every status poll, but the tile cover
+          // only redraws on renderPresets. Re-render when the cover changes so
+          // the preset logo tracks the song in step with the title instead of
+          // lagging a track behind.
+          if (coverChanged) renderPresets();
+        }).catch(() => {});
+      }
+    } else {
+      state.nowSpotifyTrack = '';
+      state.nowSpotifyArtist = '';
+      state.nowSpotifyCover = '';
+    }
+    // The tile adopts state.nowIcon (and persists it) only while the active
+    // preset still has no stored art. That render used to come for free from
+    // the 12 s live-title rebuild; since the key stopped showing the running
+    // title (2026-08-23) nothing repaints the grid between two status changes,
+    // so a speaker that reports an empty <art> on the poll which first shows
+    // the new location and fills it in a poll later would leave the key on its
+    // fallback favicon for the rest of the song, with the real logo never
+    // saved. False again the moment the art is stored, so this renders once
+    // per station, not once per poll.
+    let iconAdoptable = false;
+    // Update state.nowIcon. Prefer the art tag from now_playing.
+    // If that is empty AND we are playing through the stream proxy,
+    // adopt the logo of the source preset. Bose UPnP items emitted
+    // by hardware key presses carry no art tag, so we need this
+    // fallback.
+    if (!optimistic) {
+      const slotFromProxy = activeSlotFromLocation(newLoc);
+      const ap = slotFromProxy !== null ? state.presets.find(p => p.slot === slotFromProxy) : null;
+      if (artRaw) {
+        state.nowIcon = artRaw;
+      } else if (ap) {
+        state.nowIcon = ap.art || '';
+      } else if (!newLoc) {
+        state.nowIcon = '';
+      }
+      // Mirror of the grid's adopt gate in renderPresets: judge the UNWRAPPED
+      // icon, because for a native play the box's <art> is the agent's own
+      // loopback art-proxy URL and can leave nothing adoptable once unwrapped
+      // Judging the raw value here while the grid persists the
+      // unwrapped one would re-render for an adopt that never happens.
+      iconAdoptable = shouldAdoptPresetArt(appArtFromBoxArt(state.nowIcon), ap);
+      // Keep the now-playing bitrate in sync with the active preset
+      // (hardware key press or app restart did not go through the play
+      // path that sets it). Cleared when nothing is playing.
+      if (/\/spotify\/stream/.test(newLoc)) {
+        // Spotify stream: never inherit the previous radio station's bitrate.
+        // Use the matching Spotify preset's stored (measured) rate, or 0 so the
+        // live fetch below recomputes it from the actual stream.
+        const sp = state.presets.find(p => p.type === 'spotify' && p.name === newName);
+        state.nowBitrate = (sp && sp.bitrate) ? sp.bitrate : 0;
+      } else if (ap && ap.bitrate) {
+        state.nowBitrate = ap.bitrate;
+      } else if (!newLoc ||
+                 (!/\/stream\//.test(newLoc) && !/\/spotify\/stream/.test(newLoc))) {
+        // Nothing playing, or a direct library file: a library track is played
+        // straight to the box (not through the stream proxy), so there is no
+        // measured live bitrate. Clear it instead of leaving a previous radio
+        // station's value behind.
+        state.nowBitrate = 0;
+      }
+      // Still playing through the stream proxy but with no bitrate yet
+      // (app restart, hardware key press, or a preset whose stored bitrate
+      // is 0): kick the live fetch. It writes state.nowBitrate once the
+      // agent has measured and then self-stops, so this does not re-trigger
+      // on every poll once a value is in.
+      if (!state.nowBitrate &&
+          (ps === 'PLAY_STATE' || ps === 'BUFFERING_STATE') &&
+          (activeSlotFromLocation(newLoc) !== null || /\/spotify\/stream/.test(newLoc))) {
+        scheduleLiveBitrate();
+      }
+      // Keep the live radio track flowing into the now-playing bar for playback
+      // STM did not itself start (hardware key, app restart). Self-guarded, so
+      // calling it on every poll is safe; it no-ops while already polling.
+      if ((ps === 'PLAY_STATE' || ps === 'BUFFERING_STATE') &&
+          activeSlotFromLocation(newLoc) !== null) {
+        scheduleLiveTitle();
+      }
+    }
+
+    // If the speaker is now playing successfully, clear the preset
+    // error. The speaker's ContentItems run through the stream
+    // proxy, so accept the slot match from /stream/<slot> too.
+    if (ps === 'PLAY_STATE') {
+      // Any successful playback is a valid "your box is alive again" moment, not
+      // just internet radio. The old filter (proxy /stream/ and not /spotify/)
+      // missed every Spotify, media-library, AUX/Bluetooth and hardware-button
+      // user, which is why so many never saw the pin invite. maybeInviteWorldMap
+      // is once-ever-guarded (synchronous flag + durable Go-side flag), so
+      // broadening the trigger only widens reach, it cannot double-invite.
+      maybeInviteWorldMap();
+      const slotFromProxy = activeSlotFromLocation(loc);
+      const ap = state.presets.find(p =>
+        p.stream_url === loc || (slotFromProxy !== null && p.slot === slotFromProxy)
+      );
+      if (ap && state.presetErrors[ap.slot]) {
+        delete state.presetErrors[ap.slot];
+      }
+      // Spotify presets carry no stream_url and the location (/spotify/stream)
+      // has no slot, so the match above never fires. When a Spotify stream is
+      // confirmed playing, clear ALL Spotify preset errors so a stale
+      // "speaker still starting" no longer sticks on the tile.
+      if (/\/spotify\/stream/.test(loc)) {
+        for (const p of state.presets) {
+          if (p.type === 'spotify') delete state.presetErrors[p.slot];
+        }
+      }
+    }
+
+    if ((stateChanged || iconAdoptable) && state.presets.length > 0) {
+      renderPresets();
+    }
+
+    // Now-playing status line. Rendered from cached state so the live-title
+    // poller can refresh it the instant a track arrives, not only on the next
+    // status poll. It is the only place the running title is shown.
+    renderNowPlayingBar();
+
+    highlightActiveSource();
+  } catch {
+    // Transient status-fetch failure (a single poll timing out while the
+    // box is briefly busy, e.g. BoseApp's :8090 under load). Keep the last
+    // known now-playing on screen instead of blanking it to a dash, which
+    // looked like the display flickering to "---" and back even though
+    // nothing actually changed. The next successful poll refreshes it.
+    _statusFailCount++;
+    // Several consecutive failures mean the active box is genuinely unreachable,
+    // most likely because its IP changed under us (a router restart re-leased the
+    // whole LAN, or a LAN<->Wi-Fi / band switch). Kick a full rediscovery so the
+    // /24 sweep finds it at its new address and applyBoxList re-binds it by
+    // deviceID. Debounced so a box that is simply switched off does not sweep the
+    // LAN every few seconds.
+    if (_statusFailCount >= 4 && Date.now() - _lastUnreachableRediscover > 20000) {
+      _lastUnreachableRediscover = Date.now();
+      _statusFailCount = 0;
+      discoverBoxes();
+    }
+  }
+}
+
+// ---------- Community world map invite ----------
+//
+// After the first successful radio playback, invite the user once to drop a pin
+// on the community world map (COMMUNITY_MAP_URL) ("your box is alive again"), the moment
+// success feels real. Non-blocking: a dismissible banner with a button that opens
+// the localized map URL in the EXTERNAL browser (not a webview, so the site's
+// coarse-location + anti-spam work in a normal session). Fires once ever
+// (localStorage flag). The app sends NO data and NO location: the website handles
+// the pin (the user taps a coarse region) and its own anti-spam token.
+const WORLD_MAP_FLAG = 'str.worldMapInvited';        // after the first radio play
+const WORLD_MAP_ALL_FLAG = 'str.worldMapInvitedAll'; // when the whole set runs STM
+const WORLD_MAP_PROVISIONED_PREFIX = 'str.worldMapProvisioned.'; // per box, right after a successful install
+// Session re-entry guard: the status poll fires every few seconds, so the async
+// flag check below must not let a second poll open a second invite before the
+// first has persisted the flag. Set synchronously on the first call.
+let worldMapInviteHandled = false;
+let worldMapAllHandled = false;
+
+// worldMapURL builds the localized community-map deep link. English is the site
+// root; the other locales live under /<locale>/. ?share opens the "set pin" form
+// and scrolls to the map; src=app lets the site optionally attribute app pins
+// (harmless if unused). Unknown params are ignored by the site.
+function worldMapURL() {
+  let loc = 'en';
+  try { loc = getLocale() || 'en'; } catch { /* default en */ }
+  const prefix = loc === 'en' ? '' : '/' + loc;
+  return COMMUNITY_MAP_URL + prefix + '/?share&src=app#community';
+}
+
+// inviteWorldMapOnce shows the world-map invite at most once ever for the given
+// flag. The durable Go-side flag survives app updates and reinstalls (unlike
+// webview localStorage), so a one-time invite never reappears; localStorage is a
+// fast secondary check. variant 'all' uses the "whole setup rescued" wording.
+async function inviteWorldMapOnce(flag, variant) {
+  let already = false;
+  try { already = await GetAppFlag(flag); } catch { /* fall back to localStorage */ }
+  if (!already) {
+    try { already = localStorage.getItem(flag) === '1'; } catch {}
+  }
+  if (already) return;
+  // Show FIRST, then persist, and only if it really appeared. The old order
+  // burned the flag before showing, so an invite that returned early (another
+  // one still on screen, which is what a second speaker finishing its install 20
+  // seconds later runs into) was recorded as seen and never came back for that
+  // speaker. The re-entry the old order guarded against is already covered by
+  // the synchronous worldMapInviteHandled latch and by the DOM check inside
+  // showWorldMapInvite.
+  if (!showWorldMapInvite(variant)) return;
+  try { localStorage.setItem(flag, '1'); } catch {}
+  try { await SetAppFlag(flag); } catch {}
+}
+
+async function maybeInviteWorldMap() {
+  if (worldMapInviteHandled) return; // synchronous guard against status-poll re-entry
+  worldMapInviteHandled = true;
+  await inviteWorldMapOnce(WORLD_MAP_FLAG, 'first');
+}
+
+// inviteWorldMapAfterProvision celebrates a freshly provisioned box right after a
+// successful install. This is the strongest and most reliable "your SoundTouch is
+// alive again" moment, and the one nearly every user actually reaches: the old
+// triggers only fired on the first internet-radio play through the proxy, or once
+// the whole multi-box set ran STM, so users who play Spotify, AUX/Bluetooth, the
+// media library, or just press the hardware buttons never saw the pin invite,
+// which is exactly why so many ask how to drop a pin. Keyed per box (deviceID,
+// else host), so converting another speaker celebrates and invites again, while
+// re-running the installer on the same box does not nag. Called from the setup
+// view via the injected celebrateProvision dep.
+async function inviteWorldMapAfterProvision(box) {
+  const id = (box && (box.deviceID || box.deviceId || box.id || box.mac || box.host)) || '';
+  const flag = id ? (WORLD_MAP_PROVISIONED_PREFIX + id) : WORLD_MAP_FLAG;
+  // The provision moment supersedes the first-playback invite, for this session
+  // and forever, so the same box's "alive again" milestone is never doubled up.
+  worldMapInviteHandled = true;
+  try { localStorage.setItem(WORLD_MAP_FLAG, '1'); } catch {}
+  try { await SetAppFlag(WORLD_MAP_FLAG); } catch {}
+  await inviteWorldMapOnce(flag, 'first');
+}
+
+// maybeInviteStickProvisioned fires the per-speaker pin invite for speakers
+// provisioned via the USB stick, where the app has no install-completion hook:
+// the stick installs autonomously on power-cycle and the box simply reappears
+// in discovery as STM. A stock -> str transition observed within this session
+// is that completion signal. Two guards keep it honest: a box ever seen as STM
+// earlier in the session never fires (an OTA/reboot briefly misclassifies a
+// live STM box as stock when its Bose port answers before the agent is up, see
+// updateStockReprobe), and the durable per-box flag inside
+// inviteWorldMapAfterProvision suppresses repeats across sessions. Keyed by
+// host: the deviceID only becomes visible once STM runs, so the host is the
+// only identity stable across the transition.
+const worldMapKindSeen = new Map(); // host -> last seen kind, this session
+const worldMapEverStr = new Set();  // hosts ever seen as str, this session
+function maybeInviteStickProvisioned() {
+  for (const b of (state.boxes || [])) {
+    if (!b || !b.host || !b.kind) continue;
+    const prev = worldMapKindSeen.get(b.host);
+    worldMapKindSeen.set(b.host, b.kind);
+    const isStr = b.kind !== 'stock';
+    if (prev === 'stock' && isStr && !worldMapEverStr.has(b.host)) {
+      worldMapEverStr.add(b.host);
+      // Freshly rescued via stick: celebrate like the in-app install paths do.
+      inviteWorldMapAfterProvision(b);
+      continue;
+    }
+    if (isStr) worldMapEverStr.add(b.host);
+  }
+}
+
+// maybeInviteWorldMapAllDone fires the SECOND invite once every supported
+// SoundTouch the app has discovered is running STM (no stock box left to
+// convert) and there are at least two of them, i.e. the user has rescued their
+// whole multi-speaker setup. Once ever. Single-box users already got the
+// first-radio-play invite, so the >=2 guard keeps this as the distinct
+// whole-setup milestone instead of a duplicate.
+async function maybeInviteWorldMapAllDone() {
+  if (worldMapAllHandled) return;
+  const boxes = state.boxes || [];
+  const stmBoxes = boxes.filter(b => b && b.kind !== 'stock');
+  const stockBoxes = boxes.filter(b => b && b.kind === 'stock');
+  if (stmBoxes.length < 2 || stockBoxes.length > 0) return;
+  worldMapAllHandled = true; // latch only once the milestone is actually reached
+  await inviteWorldMapOnce(WORLD_MAP_ALL_FLAG, 'all');
+}
+
+// worldMapPreviewSVG returns a small, stylized world-map thumbnail for the invite
+// so the user instantly sees this is "the community pin map" before clicking
+// through to the website. It is a self-contained inline SVG: NO network tile
+// request and NO real pin data (which keeps the invite's "the app sends nothing"
+// guarantee intact). Continents are simplified silhouettes; the pins are
+// decorative, with one pulsing to suggest "add yours here".
+function worldMapPreviewSVG() {
+  const pin = (x, y) => `<circle cx="${x}" cy="${y}" r="2.4"/><circle cx="${x}" cy="${y}" r="0.9" fill="#fff"/>`;
+  return `<svg viewBox="0 0 220 110" class="wmi-map-svg" role="img" aria-hidden="true" preserveAspectRatio="xMidYMid slice">`
+    + `<defs><clipPath id="wmiClip"><rect x="0" y="0" width="220" height="110" rx="8"/></clipPath></defs>`
+    + `<g clip-path="url(#wmiClip)">`
+    + `<rect x="0" y="0" width="220" height="110" fill="#11202b"/>`
+    + `<g stroke="#1f3a49" stroke-width="0.6">`
+    + `<line x1="0" y1="27.5" x2="220" y2="27.5"/><line x1="0" y1="55" x2="220" y2="55"/><line x1="0" y1="82.5" x2="220" y2="82.5"/>`
+    + `<line x1="55" y1="0" x2="55" y2="110"/><line x1="110" y1="0" x2="110" y2="110"/><line x1="165" y1="0" x2="165" y2="110"/></g>`
+    + `<g fill="#2f6b4f">`
+    + `<path d="M28,22 70,18 78,38 58,52 42,46 30,34 Z"/>`     // North America
+    + `<path d="M62,58 78,60 82,78 70,98 60,84 Z"/>`           // South America
+    + `<circle cx="88" cy="13" r="6"/>`                        // Greenland
+    + `<path d="M104,27 126,25 124,41 108,43 Z"/>`             // Europe
+    + `<path d="M110,46 134,46 136,72 122,92 112,68 Z"/>`      // Africa
+    + `<path d="M128,22 192,20 196,44 158,52 132,44 Z"/>`      // Asia
+    + `<path d="M150,52 162,52 156,66 Z"/>`                    // India
+    + `<path d="M172,82 198,80 200,96 178,98 Z"/></g>`         // Australia
+    + `<g fill="var(--brand,#e0531f)">`
+    + pin(52, 34) + pin(72, 72) + pin(170, 36) + pin(186, 88) + pin(196, 30)
+    + `<circle cx="112" cy="34" r="3" opacity="0.5">`          // "your pin", pulsing
+    + `<animate attributeName="r" values="3;10;3" dur="2.2s" repeatCount="indefinite"/>`
+    + `<animate attributeName="opacity" values="0.55;0;0.55" dur="2.2s" repeatCount="indefinite"/></circle>`
+    + pin(112, 34)
+    + `</g></g></svg>`;
+}
+
+// Returns true when the invite was actually put on screen. The caller burns the
+// once-ever flag only on a true, because an invite that silently did not appear
+// must not count as one the user has seen.
+function showWorldMapInvite(variant) {
+  if (!COMMUNITY_MAP_URL) return false;
+  if (document.getElementById('worldMapInvite')) return false;
+  const headline = variant === 'all' ? t('worldMap.inviteTextAll') : t('worldMap.inviteText');
+  const el = document.createElement('div');
+  el.id = 'worldMapInvite';
+  el.className = 'worldmap-invite';
+  el.innerHTML =
+    `<button class="wmi-close" id="wmiClose" aria-label="close">&times;</button>` +
+    `<button class="wmi-map" id="wmiMap" title="${escapeAttr(t('worldMap.inviteBtn'))}" aria-label="${escapeAttr(t('worldMap.inviteBtn'))}">` +
+      worldMapPreviewSVG() +
+      `<span class="wmi-map-badge" aria-hidden="true">🎉</span>` +
+    `</button>` +
+    `<div class="wmi-body">` +
+      `<div class="wmi-text">${escapeHtml(headline)}</div>` +
+      `<div class="wmi-count" id="wmiCount">${escapeHtml(t('worldMap.pinPrompt'))}</div>` +
+      `<button class="btn btn-mini btn-primary wmi-share" id="wmiShare">${escapeHtml(t('worldMap.inviteBtn'))}</button>` +
+    `</div>`;
+  document.body.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  // A short confetti burst for the celebration moment, removed after it plays.
+  spawnConfetti(el);
+  // Live "rescued worldwide" count, fetched server-side from the website's pin
+  // API (graceful: the line stays hidden on 0 or any error). Motivates the user
+  // to add their pin and push the counter higher.
+  // The count is an upgrade to the prompt, never its precondition: the line is
+  // already on screen asking for a pin, and a number simply makes it warmer.
+  // Every failure here leaves the plain ask standing.
+  (async () => {
+    let n = 0;
+    try { n = await RescuedSpeakerCount(); } catch { /* keep the plain ask */ }
+    const line = pinPromptKey(n);
+    const c = el.querySelector('#wmiCount');
+    if (c) c.textContent = t(line.key, line.params);
+  })();
+  const close = () => { el.classList.remove('show'); setTimeout(() => el.remove(), 300); };
+  const openMap = () => { try { BrowserOpenURL(worldMapURL()); } catch {} close(); };
+  const shareBtn = el.querySelector('#wmiShare');
+  if (shareBtn) shareBtn.onclick = openMap;
+  // The thumbnail is the second, more obvious way in: clicking the map preview
+  // opens the same community map on the website.
+  const mapBtn = el.querySelector('#wmiMap');
+  if (mapBtn) mapBtn.onclick = openMap;
+  const closeBtn = el.querySelector('#wmiClose');
+  if (closeBtn) closeBtn.onclick = close;
+  // Auto-dismiss so it never lingers. It will not return (once-ever flag), but the
+  // persistent World map footer link is always there if the user wants back in, so
+  // missing this window is no longer a dead end. A calmer 45 s gives time to react.
+  setTimeout(close, 45000);
+  return true;
+}
+
+// spawnConfetti drops a brief, CSS-animated emoji confetti burst above the invite
+// for the celebration moment, then cleans itself up. Pure decoration, best-effort.
+function spawnConfetti(anchor) {
+  try {
+    const burst = document.createElement('div');
+    burst.className = 'wmi-confetti';
+    const bits = ['🎉', '🎊', '✨', '🌍', '🔊', '🥳'];
+    for (let i = 0; i < 14; i++) {
+      const s = document.createElement('span');
+      s.textContent = bits[i % bits.length];
+      s.style.left = Math.round((i / 13) * 100) + '%';
+      s.style.animationDelay = (i % 5) * 90 + 'ms';
+      burst.appendChild(s);
+    }
+    anchor.appendChild(burst);
+    setTimeout(() => burst.remove(), 2600);
+  } catch { /* decoration only */ }
+}
+
+// Preview hook: force-show the world-map invite (bypassing the once-ever flag) so
+// the celebration can be checked without re-triggering it. Ctrl+Shift+M = the
+// first-radio-play invite; Ctrl+Shift+Alt+M = the "whole setup rescued" variant.
+// Harmless if a user finds it; it only previews the invite.
+try {
+  document.addEventListener('keydown', (e) => {
+    if (e.ctrlKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) {
+      e.preventDefault();
+      showWorldMapInvite(e.altKey ? 'all' : 'first');
+    }
+  });
+} catch { /* no preview hook */ }
+
+// ---------- Search ----------
+
+const PAGE_SIZE = 30;
+
+// Radio favorites: a per-machine list of starred stations kept in
+// localStorage (no agent change, no preset-schema change). It stores only
+// the minimal Station fields renderSearchResults needs, so a favorite renders
+// through the exact same row path as a search result and inherits play, the
+// pick -> assign-to-key modal, and the long-press-to-tile fast path for free.
+const FAV_KEY = 'str.favStations';
+
+function loadFavStore() {
+  try { return JSON.parse(localStorage.getItem(FAV_KEY)) || []; } catch { return []; }
+}
+function saveFavStore(arr) {
+  try { localStorage.setItem(FAV_KEY, JSON.stringify(arr)); } catch {}
+  // And onto the speakers, so the phone page shows the same list. Until this
+  // the stars lived only here, on one PC, and a user asking where to find them
+  // on his phone got the honest answer: nowhere (2026-09-26).
+  pushFavoritesToBoxes(arr);
+}
+
+// pushFavoritesToBoxes stores the list on every speaker that runs STM.
+//
+// Every speaker, not one: whichever speaker's page the phone opens has to show
+// the same stars, and there is no central place to put them. The agent ignores
+// an unchanged list instead of writing it again, so this is cheap to repeat
+// and costs nothing on the speakers' flash.
+//
+// Best effort by design. A speaker that is asleep or off simply misses this
+// round and gets the list on the next save or the next app start; a failure
+// here must never make starring a station look broken.
+function pushFavoritesToBoxes(arr) {
+  const json = JSON.stringify(arr || []);
+  (state.boxes || []).forEach((b) => {
+    if (!b || b.offline || b.kind === 'stock') return;
+    PushFavorites(b.host, b.port, json).catch(() => {});
+  });
+}
+function favMinimal(s) {
+  return {
+    stationuuid: s.stationuuid, name: s.name, url: s.url, url_resolved: s.url_resolved,
+    bitrate: s.bitrate || 0, country: s.country, countrycode: s.countrycode,
+    codec: s.codec, hls: s.hls || 0, tags: s.tags, votes: s.votes || 0, homepage: s.homepage,
+    favicon: s.favicon, lastcheckok: s.lastcheckok,
+  };
+}
+function favId(s) { return s && (s.stationuuid || (s.name + '|' + (s.url || ''))); }
+// favStationsJSON / mergeFavStations are the backup hooks: export hands
+// the raw store to the backup file, import merges the file's list back in.
+// Merging (not replacing) is deliberate: restoring onto a damaged install adds
+// everything back, and restoring an old file onto a healthy one cannot delete
+// the stars added since.
+function favStationsJSON() {
+  try { return localStorage.getItem(FAV_KEY) || '[]'; } catch { return '[]'; }
+}
+function mergeFavStations(json) {
+  let incoming = [];
+  try { incoming = JSON.parse(json) || []; } catch { /* not a list: nothing to merge */ }
+  if (!Array.isArray(incoming)) incoming = [];
+  const arr = loadFavStore();
+  const have = new Set(arr.map(favId));
+  let added = 0;
+  for (const s of incoming) {
+    const id = favId(s);
+    if (!id || have.has(id)) continue;
+    arr.push(favMinimal(s));
+    have.add(id);
+    added++;
+  }
+  if (added) saveFavStore(arr);
+  updateFavModeBtn();
+  return { added, total: arr.length };
+}
+function isFav(s) {
+  const id = favId(s);
+  return !!id && loadFavStore().some(x => favId(x) === id);
+}
+function toggleFav(s) {
+  const id = favId(s);
+  if (!id) return false;
+  const arr = loadFavStore();
+  const idx = arr.findIndex(x => favId(x) === id);
+  let nowFav;
+  if (idx >= 0) { arr.splice(idx, 1); nowFav = false; }
+  else { arr.push(favMinimal(s)); nowFav = true; }
+  saveFavStore(arr);
+  updateFavModeBtn();
+  return nowFav;
+}
+// updateFavModeBtn shows the "Favorites" mode entry next to Top/Search only
+// once at least one station is starred, so a user who never uses favorites
+// sees the unchanged toggle (the "appears only after the first star" design).
+function updateFavModeBtn() {
+  const b = $('favModeBtn');
+  if (!b) return;
+  b.classList.toggle('hidden', loadFavStore().length === 0);
+}
+// loadFavorites renders the saved stations through the normal search-result
+// path. No server fetch and no load-more: the list is exactly the store.
+function loadFavorites() {
+  if (!state.currentBox) { showError(t('search.errSelectSpeaker')); return; }
+  state.searchLastMode = 'favorites';
+  state.searchResults = loadFavStore();
+  const lm = $('loadMoreRow');
+  if (lm) lm.classList.add('hidden');
+  renderSearchResults();
+}
+
+async function doSearch() {
+  if (!state.currentBox) { showError(t('search.errSelectSpeaker')); return; }
+  const q = $('searchQ').value.trim();
+  state.searchLastQuery = q;
+  state.searchLastMode = q ? 'search' : 'top';
+  state.searchOffset = 0;
+  if (!q) { return doTop(); }
+  // A pasted stream URL is not a name query: look it up in the directory
+  // by URL (a known station renders as a normal result, logo and all), or
+  // fall back to a single synthetic play-this-URL card.
+  if (isStreamURL(q)) { return searchByStreamURL(q); }
+  await fetchSearchPage(false);
+}
+
+// searchByStreamURL resolves a pasted stream URL. Directory hits render
+// through the normal result path; no hits (or an app built against the older
+// binding set, or a directory outage) render the synthetic card instead, so
+// a pasted URL always ends in something playable and long-press-savable.
+async function searchByStreamURL(url) {
+  $('searchResults').innerHTML = `<div class="muted">${escapeHtml(t('search.loadingStations'))}</div>`;
+  $('loadMoreRow').classList.add('hidden');
+  state.searchRelaxed = false;
+  let list = [];
+  try {
+    list = await RadioStationsByURL(url) || [];
+  } catch {
+    list = [];
+  }
+  if (list.length === 0) {
+    // Nothing in the directory: before offering the play-this-URL card, ask
+    // the backend what the URL actually serves. A station HOMEPAGE answers
+    // 200 and looks fine, but saving it to a preset produces a key that can
+    // never play - a field case cost a user three dead hardware keys and two
+    // support rounds (2026-08-02). Only an explicit "website" verdict blocks;
+    // unknown/unreachable still renders the card, so an offline station or an
+    // odd server never stops a URL that actually works.
+    let kind = null;
+    try { kind = await ClassifyStreamURL(url); } catch { kind = null; }
+    if (kind && kind.kind === 'website') {
+      $('searchResults').innerHTML =
+        `<div class="muted">${escapeHtml(t('search.urlIsWebsite'))}</div>`
+        + `<div class="muted" style="margin-top:.5rem">${escapeHtml(t('search.urlIsWebsiteHint'))}</div>`;
+      state.searchResults = [];
+      return;
+    }
+    list = [syntheticStationForURL(url)];
+  }
+  state.searchResults = list;
+  renderSearchResults();
+}
+
+async function doTop() {
+  if (!state.currentBox) { showError(t('search.errSelectSpeaker')); return; }
+  state.searchLastMode = 'top';
+  state.searchOffset = 0;
+  await fetchSearchPage(false);
+}
+
+async function loadMore() {
+  state.searchOffset += PAGE_SIZE;
+  await fetchSearchPage(true);
+}
+
+function buildSearchOpts() {
+  const isSearch = state.searchLastMode === 'search' && state.searchLastQuery;
+  // For order=name we still fetch 4x the page size so the "Bose-compatible
+  // only" filter still has enough left after the strip of HTTPS-only stations
+  // like laut.fm. Sorting itself is done client-side in fetchSearchPage.
+  const ord = state.searchOrder || 'votes';
+  const limit = ord === 'name' ? PAGE_SIZE * 4 : PAGE_SIZE;
+  // cc empty = all countries. top:true selects the vote-ordered top list (no
+  // free-text query). On a free-text NAME search the language filter is dropped:
+  // it defaults to the app language, and many stations (small/US ones especially)
+  // have no language tag in radio-browser, so a default language filter silently
+  // hid a station the user searched for by name (e.g. "Real Talk 93.3", whose
+  // radio-browser entry has an empty language field). Language still scopes the
+  // browse/top list, where it aids discovery; a name lookup should find the
+  // station regardless of how radio-browser tagged its language. Country is
+  // already opt-in (never auto-defaulted), so it stays applied.
+  return {
+    q: isSearch ? state.searchLastQuery : '',
+    cc: state.searchCountry || '',
+    lang: isSearch ? '' : (state.searchLang || ''),
+    tag: state.searchTag || '',
+    order: ord,
+    limit: limit,
+    offset: state.searchOffset,
+    onlyok: !!state.searchOnlyOK,
+    top: !isSearch,
+  };
+}
+
+async function fetchSearchPage(append) {
+  if (!append) {
+    $('searchResults').innerHTML = `<div class="muted">${escapeHtml(t('search.loadingStations'))}</div>`;
+    $('loadMoreRow').classList.add('hidden');
+  }
+  try {
+    // Query radio-browser DIRECTLY from the app (reliable internet, real CPU)
+    // instead of routing through the box agent — the box only ever needs the
+    // final stream URL. This is the app-first direction and it removes the box
+    // as a point of failure for search (the HTTP 502s). The
+    // radiobrowser client does its own multi-mirror failover, so no per-call
+    // retry is needed here.
+    //
+    // Prefer the detailed search: it also says whether the backend had to
+    // relax the quality filters to find anything, which drives the
+    // "showing unverified results too" hint. An app built against the older
+    // binding set falls back to the plain search (no hint, same results);
+    // a real search failure is NOT swallowed by the fallback and surfaces
+    // through the catch below like before.
+    let page;
+    let relaxed = false;
+    try {
+      const detailed = normalizeDetailedSearch(await RadioSearchDetailed(buildSearchOpts()));
+      page = detailed.stations;
+      relaxed = detailed.relaxed;
+    } catch (err) {
+      if (!isMissingBinding(err)) throw err;
+      page = await RadioSearch(buildSearchOpts()) || [];
+    }
+    // Relaxed is per result set: a fresh search resets it (and the dismiss),
+    // a "load more" keeps the hint once any page needed relaxing.
+    state.searchRelaxed = append ? (state.searchRelaxed || relaxed) : relaxed;
+    if (!append) state.searchRelaxedDismissed = false;
+    if (append) {
+      state.searchResults = state.searchResults.concat(page);
+    } else {
+      state.searchResults = page;
+    }
+    // Dedup by UUID (paginate + local sort can produce duplicates).
+    const seen = new Set();
+    state.searchResults = state.searchResults.filter(s => {
+      const id = s.stationuuid || (s.name + '|' + s.url);
+      if (seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    });
+    // Local sort. The server always returns order=votes so that the
+    // set of stations stays consistent across all sort options.
+    const ord = state.searchOrder || 'votes';
+    state.searchResults.sort((a, b) => {
+      switch (ord) {
+        case 'name': {
+          const ca = cleanForSort(a.name);
+          const cb = cleanForSort(b.name);
+          return ca.localeCompare(cb, 'de', { sensitivity: 'base' });
+        }
+        case 'clickcount':
+          return (b.clickcount || 0) - (a.clickcount || 0);
+        case 'clicktrend':
+          return (b.clicktrend || 0) - (a.clicktrend || 0);
+        case 'bitrate':
+          return (b.bitrate || 0) - (a.bitrate || 0);
+        case 'votes':
+        default:
+          return (b.votes || 0) - (a.votes || 0);
+      }
+    });
+    renderSearchResults();
+    $('loadMoreRow').classList.toggle('hidden', page.length < PAGE_SIZE);
+  } catch (e) {
+    $('searchResults').innerHTML = `<div class="muted">${escapeHtml(t('common.error'))}: ${escapeHtml(e.message)}</div>`;
+    $('loadMoreRow').classList.add('hidden');
+  }
+}
+
+// cleanForSort strips leading non-alphanumeric characters (tab,
+// space, dash, dot, asterisk, ...) so that "  ABC" and "ABC" sort
+// alike. Robust against webview versions without Unicode property
+// escapes: matches the classic ASCII range plus selected extended
+// blocks (Latin diacritics, Cyrillic, etc.).
+function cleanForSort(name) {
+  const raw = (name || '').toString();
+  // Strip leading non-alphanumeric characters. Accept A-Z, 0-9 and
+  // selected Unicode ranges (German diacritics, Cyrillic, etc.).
+  const stripped = raw.replace(/^[^A-Za-z0-9À-ɏͰ-ӿ]+/, '');
+  // If nothing remains after the strip (the name was symbols only),
+  // fall back to the raw name. Otherwise empty-string stations would
+  // all clump together at the top.
+  return (stripped || raw).toLowerCase().trim();
+}
+
+// isBoseCompatible estimates whether the speaker can reliably play the stream.
+// Since stick-agent build 0132 every stream goes through /stream/raw (TLS is no
+// longer a concern), and since v0.7.21 STM converts HLS playlists on the fly, so
+// HLS stations play too. So:
+//   - HLS streams (radio-browser hls=1, or an .m3u8 URL) play via STM's HLS
+//     conversion, regardless of the segment codec
+//   - MP3 / AAC / AAC+ / AACP / MPEG the box decodes directly
+//   - Ogg / Opus / FLAC neither the box nor the proxy can decode
+//   - an unknown codec ("UNKNOWN" or empty) is let through, the box tries it
+// radio-browser reports the BBC HLS stations (Radio 2/4, which play since
+// v0.7.21) as codec "UNKNOWN" with hls=1, and the old check dropped both: it
+// only let an EMPTY codec through and knew nothing of HLS, so it treated the
+// literal "UNKNOWN" string as incompatible and hid every now-playable HLS
+// station when the filter was on.
+function isBoseCompatible(s) {
+  const url = String(s.url_resolved || s.url || '');
+  if (s.hls === 1 || s.hls === '1' || /\.m3u8(\?|#|$)/i.test(url)) return true;
+  const codec = String(s.codec || '').toUpperCase();
+  if (!codec || codec === 'UNKNOWN') return true; // let the speaker try
+  return codec === 'MP3' || codec === 'AAC' || codec === 'AAC+' ||
+    codec === 'AACP' || codec === 'MPEG';
+}
+
+// streamErrorMessage maps a stream-status reason to a clear, human, localized
+// message. The raw HTTP code (403/503) means nothing to a user; the reason
+// class does. Falls back to a generic "unreachable" line for unknown reasons.
+function streamErrorMessage(reason) {
+  switch (reason) {
+    case 'blocked':     return t('search.streamBlocked');
+    case 'gone':        return t('search.streamGone');
+    case 'unavailable': return t('search.streamUnavailable');
+    case 'hls':         return t('search.streamHls');
+    case 'offline':     return t('search.streamOffline');
+    default:            return t('search.streamUnreachable');
+  }
+}
+
+// openBoxWifiSetup takes the user to a speaker's Wi-Fi setup: it makes the box
+// the settings target (keeping the tabs in sync), switches to the settings view,
+// and expands + scrolls to the WLAN switch section. Used from the "speaker has
+// no internet" prompt so a box that landed on a dead Wi-Fi can be re-provisioned
+// in one tap instead of a manual factory reset.
+function openBoxWifiSetup(box) {
+  if (!box) return;
+  speakerPickedInTab(box);
+  switchView('settings');
+  setTimeout(() => {
+    const toggle = $('wlanSwitchToggle');
+    if (!toggle) return;
+    const form = $('wlanSwitchForm');
+    if (form && form.classList.contains('hidden')) toggle.click();
+    toggle.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, 250);
+}
+
+// pollStreamFailure asks the agent whether the stream the box just started has
+// failed upstream. Radio failures are asynchronous: the box accepts the UPnP
+// URL instantly, then the 403/503 only surfaces when it pulls the bytes. We poll
+// /api/stream-status for a few seconds; the moment a fresh failure for OUR url
+// appears we return it, otherwise we assume the station is playing and return
+// null. Best-effort: any fetch error just ends the poll (assume playing).
+async function pollStreamFailure(box, url, windowMs = 6000) {
+  const deadline = Date.now() + windowMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 800));
+    if (state.nowLocation !== url) return null; // user moved on; stop watching
+    let data;
+    try {
+      const r = await boxFetch(box, '/api/stream-status', {}, 4000);
+      if (!r.ok) continue;
+      data = await r.json();
+    } catch { return null; }
+    if (data && data.error && data.url === url) return data;
+  }
+  return null;
+}
+
+// findAlternativeStation looks for ANOTHER radio-browser entry of the same
+// station than the ones already tried. Stations are frequently listed several
+// times (different mirrors/CDNs); when one URL is geo-blocked or down, a sibling
+// entry usually plays. We match by name (exact, then loose) and skip any URL on
+// a host we already failed on, preferring entries radio-browser last checked OK.
+async function findAlternativeStation(orig, triedHosts) {
+  const wanted = (orig.name || '').toLowerCase().trim();
+  if (!wanted) return null;
+  let list;
+  try {
+    list = await RadioSearch({ q: orig.name, limit: 20, order: 'votes', top: false }) || [];
+  } catch { return null; }
+  const candidates = list.filter(s => {
+    const u = s.url_resolved || s.url;
+    if (!u) return false;
+    const h = extractHost(u);
+    if (!h || triedHosts.has(h)) return false;
+    const n = (s.name || '').toLowerCase().trim();
+    return n === wanted || n.includes(wanted) || wanted.includes(n);
+  });
+  if (candidates.length === 0) return null;
+  // Prefer a station radio-browser last checked OK, then by votes (the search
+  // already ordered by votes, so a stable partition keeps that secondary order).
+  candidates.sort((a, b) => (b.lastcheckok ? 1 : 0) - (a.lastcheckok ? 1 : 0));
+  return candidates[0];
+}
+
+// preferMp3SiblingForBox returns an MP3-coded sibling entry (same station
+// name) when the chosen entry is AAC-coded and the given, already-loaded list
+// offers one. The speaker's AAC decoding is the fragile path (HE-AAC
+// stations played silence for years under the fixed audio/mpeg label), while
+// the same station's MP3 mirror plays rock solid, so for BOX playback the MP3
+// sibling wins. No extra network round trip on purpose: with no list or no
+// sibling the chosen entry is returned unchanged and now plays with the
+// correct audio/aac label instead.
+function preferMp3SiblingForBox(s, list) {
+  if (!s || !/aac/i.test(s.codec || '') || !Array.isArray(list)) return s;
+  const wanted = (s.name || '').toLowerCase().trim();
+  if (!wanted) return s;
+  const siblings = list.filter(o => o && o !== s
+    && (o.name || '').toLowerCase().trim() === wanted
+    && /^mp3$/i.test(o.codec || '')
+    && (o.url_resolved || o.url));
+  if (siblings.length === 0) return s;
+  // Prefer a mirror radio-browser reached on its last check, then the best bitrate.
+  siblings.sort((a, b) => ((b.lastcheckok ? 1 : 0) - (a.lastcheckok ? 1 : 0)) || ((b.bitrate || 0) - (a.bitrate || 0)));
+  return siblings[0];
+}
+
+// playStation plays a radio station and, when its stream fails upstream
+// (403 geo-block, 503 down, dead URL), shows a clear reason and automatically
+// retries with another radio-browser entry of the SAME station before giving
+// up. This turns the most common "every station errors" frustration into a
+// usually-silent recovery. Used by every radio play-now button.
+async function playStation(s) {
+  // A play aimed at a zone follower must go to its master instead.
+  let box = effectivePlayTarget();
+  if (!box) return;
+  // The user-facing selection when this play started. Every await below
+  // re-checks it: without the guard, a speaker switch during the retry loop
+  // kept starting playback on the PREVIOUS speaker and painted its buffering
+  // state onto the newly selected one. Identity, not object equality — a
+  // background discovery replaces the box object for the same device.
+  const startBox = state.currentBox;
+  const switched = () => !sameBoxIdentity(state.currentBox, startBox);
+  // The row the user tapped, before any sibling/alternative swap below, so
+  // its play button can turn into pause while this play is on the speaker.
+  state.searchPlaying = { uuid: s.stationuuid || '', url: s.url_resolved || s.url || '', name: s.name || '' };
+  // Box playback prefers an MP3 sibling over an AAC entry of the same station
+  // when the already-loaded result list offers one: the speaker's AAC
+  // path is the fragile one, the MP3 mirror of the same station is rock solid.
+  // No sibling (or no list) plays the chosen entry unchanged; its AAC codec is
+  // now labelled correctly, so it works too.
+  s = preferMp3SiblingForBox(s, state.searchResults);
+  const tried = new Set();
+  let cur = s;
+  let retargeted = false;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    if (switched()) return;
+    const url = cur.url_resolved || cur.url;
+    const host = extractHost(url);
+    if (host) tried.add(host);
+    const chain = stationLogoChain(cur);
+    state.nowPlayState = 'BUFFERING_STATE';
+    state.nowLocation = url;
+    state.nowName = s.name; // keep the user's chosen station name across retries
+    state.nowIcon = chain;
+    state.nowBitrate = cur.bitrate || 0;
+    scheduleLiveBitrate();
+    state.nowUUID = cur.stationuuid || '';
+    renderPresets();
+    syncPlayNowButtons();
+
+    let fail = null;
+    try {
+      // 0: a radio station has no length, which is exactly what the field is
+      // for. The box then answers total=0 and no bar is drawn, correctly.
+      await PlayURL(box.host, box.port, url, s.name, chain, cur.stationuuid || '', '', s.homepage || '', cur.codec || '', 0);
+      // Remember the station the APP itself just started. A long-press save
+      // must prefer this over the box-reported now-playing: on a speaker that
+      // was asleep, the agent's wake resume can race the play and briefly put
+      // the PREVIOUS preset back on, and saving from the box report then
+      // copied the OLD station onto the key. Cleared by any other play
+      // the app issues (preset recall etc.), so a true hardware-key press
+      // still saves via the box report.
+      state.lastAppPlay = {
+        url, name: s.name || '', icon: chain, bitrate: cur.bitrate || 0,
+        uuid: cur.stationuuid || '', homepage: s.homepage || '',
+        codec: cur.codec || '', at: Date.now(),
+      };
+      // Register the play with radio-browser, but ONLY for a real station UUID.
+      // Recently-played cards reuse the stream URL as their identity (no UUID), so
+      // a plain `if (stationuuid)` fired RadioClick with a URL, which 404s. Guard
+      // on the UUID shape, and use .catch() (not try/catch) since the rejection is
+      // async: an unhandled 404 promise surfaced as an error toast when playing a
+      // recent radio card even though playback itself was fine.
+      if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(cur.stationuuid || '')) {
+        RadioClick(cur.stationuuid).catch(() => {});
+      }
+      // Refresh the now-playing bar promptly on the happy path; the upstream
+      // verdict (success vs 403/503) arrives asynchronously, so poll for it.
+      setTimeout(refreshStatus, 1200);
+      fail = await pollStreamFailure(box, url);
+    } catch (err) {
+      // Newer agents reject a play sent to a grouped follower with a
+      // structured 409 ({"error":"box-grouped","master":...}): retarget the
+      // play ONCE to the group master instead of cycling through alternative
+      // sources. Older agents send a raw SOAP string, which falls through to
+      // the unreachable path below exactly as before.
+      const rej = parsePlayRejection(err);
+      if (rej.grouped && !retargeted) {
+        const mb = resolveBoxByRef(rej.master, state.boxes)
+          || resolvePlayTarget(box, state.zoneLive, state.boxes);
+        if (mb && mb.host !== box.host) {
+          retargeted = true;
+          box = mb;
+          attempt--; // the retarget must not burn an alternative-source attempt
+          continue;
+        }
+      }
+      // A synchronous failure (box refused the URI) reads as unreachable.
+      fail = { reason: 'unreachable', status: 0 };
+    }
+    // The user may have switched speakers during the play/verdict round trip:
+    // stop here so the failure handling below cannot repaint the new
+    // speaker's UI or start an alternative stream on the old one.
+    if (switched()) return;
+    if (!fail) return; // playing fine
+
+    if (fail.reason === 'offline') {
+      // The speaker itself has no internet: every station will fail the same
+      // way, so do not cycle through alternatives. Say so plainly and offer to
+      // re-run its Wi-Fi setup.
+      state.nowPlayState = '';
+      state.nowLocation = '';
+      state.lastAppPlay = null;
+      state.searchPlaying = null;
+      renderPresets();
+      syncPlayNowButtons();
+      const fix = await confirmWarn(
+        t('search.streamOfflineTitle'),
+        t('search.streamOfflineBody', { name: getBoxLabel(box) }),
+        { icon: null, confirmLabel: t('search.streamOfflineFix'), confirmClass: 'btn btn-primary' }
+      );
+      if (fix) openBoxWifiSetup(box);
+      return;
+    }
+
+    // A TuneIn station has no radio-browser siblings to fall back to.
+    const alt = String(s.url || '').startsWith('tunein:') ? null : await findAlternativeStation(s, tried);
+    if (switched()) return; // speaker switched during the search: stop quietly
+    if (!alt) {
+      state.nowPlayState = '';
+      state.nowLocation = '';
+      state.lastAppPlay = null; // never long-press-save a station that failed to play
+      state.searchPlaying = null;
+      renderPresets();
+      syncPlayNowButtons();
+      showToast(streamErrorMessage(fail.reason) + ' ' + t('search.allSourcesFailed'));
+      return;
+    }
+    showToast(t('search.tryingAlternative', { name: s.name || '' }));
+    cur = alt;
+  }
+  // Exhausted the retry budget without a working source.
+  state.nowPlayState = '';
+  state.nowLocation = '';
+  state.lastAppPlay = null; // never long-press-save a station that failed to play
+  state.searchPlaying = null;
+  renderPresets();
+  syncPlayNowButtons();
+  showToast(t('search.allSourcesFailed'));
+}
+
+// searchRowIsPlaying reports whether result s is the station the app started
+// from the search list and the speaker is still playing (or buffering) it.
+// The box-reported name is the one PlayURL sent, so a preset key or another
+// app taking over the speaker turns the row back to play.
+function searchRowIsPlaying(s) {
+  const p = state.searchPlaying;
+  if (!s || !p) return false;
+  const ps = state.nowPlayState;
+  if (ps !== 'PLAY_STATE' && ps !== 'BUFFERING_STATE') return false;
+  if ((state.nowName || '') !== p.name) return false;
+  if (p.uuid && s.stationuuid) return p.uuid === s.stationuuid;
+  return !!p.url && p.url === (s.url_resolved || s.url || '');
+}
+
+// syncPlayNowButtons flips each search row's play button between play and
+// pause in place, so the status poll does not re-render the list (and reload
+// every logo) just to move one glyph.
+function syncPlayNowButtons() {
+  syncTuneInPlayButtons();
+  const res = $('searchResults');
+  const list = state.searchRenderedList;
+  if (!res || !list) return;
+  res.querySelectorAll('.play-now').forEach(btn => {
+    const playing = searchRowIsPlaying(list[parseInt(btn.dataset.i, 10)]);
+    if (btn.classList.contains('is-playing') === playing) return;
+    btn.classList.toggle('is-playing', playing);
+    btn.innerHTML = playing ? '&#9208;&#xFE0E;' : '&#9654;&#xFE0E;';
+    btn.title = playing ? t('controls.pause') : t('search.playNow');
+  });
+}
+
+function renderSearchResults() {
+  const res = $('searchResults');
+  // Optional client-side Bose compatibility filter: drop HTTPS
+  // streams and exotic codecs so the user does not hit 502 errors
+  // on play.
+  const totalRaw = (state.searchResults || []).length;
+  let list = state.searchResults || [];
+  if (state.searchOnlyBose) {
+    list = list.filter(isBoseCompatible);
+  }
+  // Minimum-bitrate filter. Stations with no reported bitrate (very
+  // common on radio-browser) are kept, not hidden, so a quality filter
+  // does not wipe out most results; only stations with a known bitrate
+  // below the threshold are dropped.
+  const minBr = state.searchMinBitrate || 0;
+  if (minBr) {
+    list = list.filter(s => !s.bitrate || s.bitrate >= minBr);
+  }
+  // Update the counter row. radio-browser does not return a grand
+  // total on a filtered search, so we show "X shown" plus a hint
+  // that more can arrive via "load more".
+  const cnt = $('searchCount');
+  if (cnt) {
+    if (list.length === 0) {
+      cnt.classList.add('hidden');
+    } else {
+      const moreHint = totalRaw >= PAGE_SIZE ? ' ' + t('search.moreHint') : '';
+      const filterHint = state.searchOnlyBose && list.length < totalRaw
+        ? ' ' + t('search.filterHiddenCount', { n: totalRaw - list.length })
+        : '';
+      cnt.innerHTML = t('search.shownCount', { n: `<b>${list.length}</b>` }) + filterHint + moreHint;
+      cnt.classList.remove('hidden');
+    }
+  }
+  // The "add a missing station" guide above the list: unfolded by the renderer
+  // when the directory answered a name search with nothing, folded back when a
+  // later search does return stations. A guide the user unfolded themselves is
+  // left alone, so the flag records who opened it.
+  const guide = $('addStationBox');
+  const fold = addStationGuideFold(state.addStationGuideAuto, state.searchLastMode, totalRaw);
+  if (guide && fold.open !== null) guide.open = fold.open;
+  state.addStationGuideAuto = fold.auto;
+  // Small dismissible hint above the results when the backend had to relax
+  // the quality filters: entries may be unverified, and the user should know
+  // why. Rendered inside #searchResults so no markup outside src/ changes.
+  let hintHtml = '';
+  if (relaxedHintVisible(state.searchRelaxed, state.searchRelaxedDismissed, state.searchLastMode)) {
+    hintHtml = '<div class="search-relaxed-hint" id="relaxedHint">'
+      + '<span>' + escapeHtml(t('search.relaxedHint')) + '</span>'
+      + `<button class="search-relaxed-dismiss" id="relaxedHintDismiss" title="${escapeAttr(t('search.relaxedHintDismiss'))}">&times;</button>`
+      + '</div>';
+  }
+  const wireRelaxedDismiss = () => {
+    const d = $('relaxedHintDismiss');
+    if (!d) return;
+    d.onclick = () => {
+      state.searchRelaxedDismissed = true;
+      const h = $('relaxedHint');
+      if (h) h.remove();
+    };
+  };
+  if (list.length === 0) {
+    const msg = state.searchLastMode === 'favorites'
+      ? t('search.favEmpty')
+      : state.searchOnlyBose && (state.searchResults || []).length > 0
+        ? t('search.noBoseStations')
+        : t('search.noStationsFound');
+    const html = '<div class="muted">' + escapeHtml(msg) + '</div>';
+    res.innerHTML = hintHtml + html;
+    wireRelaxedDismiss();
+    return;
+  }
+  res.innerHTML = hintHtml + list.map((s, i) => {
+    const flag = flagFromCC(s.countrycode);
+    const okClass = s.lastcheckok ? 'ok' : 'bad';
+    const webUrl = (typeof s.homepage === 'string' && /^https?:\/\//i.test(s.homepage)) ? s.homepage : '';
+    const okTitle = s.lastcheckok ? t('search.checkOk') : t('search.checkBad');
+    let trend = '';
+    if (s.clicktrend > 0) trend = `<span class="result-trend" title="${escapeAttr(t('search.trendUp', { n: s.clicktrend }))}">&#9650;</span>`;
+    else if (s.clicktrend < 0) trend = `<span class="result-trend up-down" title="${escapeAttr(t('search.trendDown', { n: s.clicktrend }))}">&#9660;</span>`;
+
+    const countryDe = translateCountry(s.country);
+    const tagChips = translateTags(s.tags).slice(0, 4).map(tag => `<span class="tag-pill">${escapeHtml(tag)}</span>`).join('');
+
+    const metaBits = [];
+    if (s.synthetic) {
+      // The synthetic play-this-URL card: no directory metadata exists, so
+      // the meta line carries the localized card label instead.
+      metaBits.push(escapeHtml(t('search.playUrlCard')));
+    } else {
+      if (countryDe) metaBits.push(escapeHtml(countryDe));
+      // Always show a bitrate cell. Many radio-browser stations report no
+      // bitrate (e.g. "Sunshine Live - Die 90er"); show "- kbit/s" rather
+      // than hiding the field so the column stays consistent.
+      metaBits.push(s.bitrate ? `${s.bitrate} kbit/s` : '- kbit/s');
+      if (s.votes)   metaBits.push(t('search.votes', { n: formatNumber(s.votes) }));
+    }
+
+    // The online dot reflects radio-browser's last check; a synthetic card
+    // was never checked, so it gets no dot rather than a false "broken" red.
+    const okDot = s.synthetic ? '' : `<span class="result-online-dot ${okClass}" title="${escapeAttr(okTitle)}"></span>`;
+
+    const logo = `
+      <div class="result-logo">
+        ${logoImgTag(s, 'fav')}
+        ${flag ? `<span class="fav-flag" title="${escapeAttr(s.country || '')}">${flag}</span>` : ''}
+      </div>`;
+    return `
+      <div class="result-row" data-i="${i}">
+        ${logo}
+        <div class="result-text">
+          <div class="result-name">
+            ${okDot}
+            <span class="result-name-text">${escapeHtml(s.name || t('search.unnamed'))}</span>
+            ${trend}
+          </div>
+          <div class="result-meta">${metaBits.join(' &middot; ')}${webUrl ? ` &middot; <a href="#" class="result-site" data-i="${i}" title="${escapeAttr(t('search.openWebsite'))}">${escapeHtml(t('footer.website'))}</a>` : ''}</div>
+          ${tagChips ? `<div class="result-tag-chips">${tagChips}</div>` : ''}
+        </div>
+        <div class="result-actions">
+          ${searchRowIsPlaying(s)
+    ? `<button class="btn btn-mini play-now is-playing" data-i="${i}" title="${escapeAttr(t('controls.pause'))}">&#9208;&#xFE0E;</button>`
+    : `<button class="btn btn-mini play-now" data-i="${i}" title="${escapeAttr(t('search.playNow'))}">&#9654;&#xFE0E;</button>`}
+          <button class="btn btn-mini pick" data-i="${i}" title="${escapeAttr(t('search.assignToKey'))}">&#10133;</button>
+          <button class="btn btn-mini fav-toggle${isFav(s) ? ' is-fav' : ''}" data-i="${i}" title="${escapeAttr(isFav(s) ? t('search.removeFav') : t('search.addFav'))}">${isFav(s) ? '&#9733;' : '&#9734;'}</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+  state.searchRenderedList = list;
+  wireRelaxedDismiss();
+  res.querySelectorAll('.play-now').forEach(btn => {
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const s = list[parseInt(btn.dataset.i, 10)];
+      if (searchRowIsPlaying(s)) {
+        // Show play again right away; the status poll confirms the pause.
+        state.nowPlayState = 'PAUSE_STATE';
+        syncPlayNowButtons();
+        renderNowPlayingBar();
+        await action('pause');
+        return;
+      }
+      // playStation handles the upstream-failure case (403/503/dead URL): it
+      // shows a clear reason and auto-retries another radio-browser entry of the
+      // same station before giving up, so a single blocked mirror no longer
+      // looks like "every station errors".
+      await playStation(s);
+    };
+  });
+  res.querySelectorAll('.pick').forEach(btn => {
+    btn.onclick = (e) => { e.stopPropagation(); openPick(list[parseInt(btn.dataset.i, 10)]); };
+  });
+  res.querySelectorAll('.fav-toggle').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const s = list[parseInt(btn.dataset.i, 10)];
+      const nowFav = toggleFav(s);
+      if (state.searchLastMode === 'favorites' && !nowFav) {
+        // Unstarred while viewing the favorites list: drop it from the view.
+        state.searchResults = loadFavStore();
+        renderSearchResults();
+        return;
+      }
+      btn.classList.toggle('is-fav', nowFav);
+      btn.innerHTML = nowFav ? '&#9733;' : '&#9734;';
+      btn.title = nowFav ? t('search.removeFav') : t('search.addFav');
+    };
+  });
+  res.querySelectorAll('.result-site').forEach(link => {
+    link.onclick = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const s = list[parseInt(link.dataset.i, 10)];
+      if (s && typeof s.homepage === 'string' && /^https?:\/\//i.test(s.homepage)) BrowserOpenURL(s.homepage);
+    };
+  });
+}
+
+// showSlotPicker renders the shared 1-6 preset slot-picker modal. Callers pass
+// the title, subtitle and an onPick(slot) that does the actual save; closing the
+// modal, reloading the presets and surfacing errors are common to every use.
+// box is the speaker the pick writes to. It defaults to the selected one, and a
+// caller that can assign onto ANOTHER speaker (a Recently-played card from a
+// different box) has to pass it, so a move offered after a refusal happens on
+// the speaker the station is actually on.
+function showSlotPicker({ title, subtitle, onPick, box }) {
+  $('pickTitle').textContent = title;
+  $('pickSub').textContent = subtitle || '';
+  const grid = $('pickGrid');
+  grid.innerHTML = '';
+  for (let i = 1; i <= 6; i++) {
+    const p = state.presets.find(x => x.slot === i);
+    // A key the speaker owns (e.g. Deezer) is shown as taken, and replacing it
+    // takes a second tap: window.confirm is a silent "no" in the Android WebView.
+    const bp = !p ? (state.boxPresets || []).find(x => x.slot === i && !lostStrKey(x)) : null;
+    const bpSource = bp ? boxSourceLabel(bp.source) : '';
+    const label = p ? p.name : bp ? (bp.name || bpSource || t('preset.onSpeaker')) : t('preset.pickEmpty');
+    const b = document.createElement('button');
+    b.className = 'pick-slot' + (p || bp ? ' has' : '') + (bp ? ' box-native' : '');
+    b.innerHTML = '<div class="ps-num">' + escapeHtml(t('preset.key', { n: i })) + '</div><div class="ps-name">' + escapeHtml(label) + '</div>' +
+      (bpSource ? '<div class="ps-source">' + escapeHtml(t('preset.sourceBadge', { source: bpSource })) + '</div>' : '');
+    let armed = false;
+    b.onclick = async () => {
+      if (bp && !armed) {
+        armed = true;
+        b.classList.add('armed');
+        b.querySelector('.ps-name').textContent = t('preset.pickReplaceBoxNative', { source: bpSource || t('preset.onSpeaker') });
+        return;
+      }
+      try {
+        await onPick(i);
+        closePick();
+        await loadPresets();
+      } catch (err) {
+        // Assigning a station from a list meets the same already-on-another-key
+        // refusal as the hold-to-save, and it is the path the two reporters were
+        // on, so it gets the same offer to move.
+        const conflict = parsePresetConflict(err);
+        const target = box || state.currentBox;
+        if (conflict && target) {
+          closePick();
+          presetMoveOffer(conflict, i, target);
+          return;
+        }
+        showError(err);
+      }
+    };
+    grid.appendChild(b);
+  }
+  $('pickModal').classList.remove('hidden');
+}
+
+function openPick(station) {
+  // Presets play on the box only, so the same MP3-over-AAC sibling preference
+  // as playStation applies to an assignment from the search list.
+  station = preferMp3SiblingForBox(station, state.searchResults);
+  showSlotPicker({
+    title: t('preset.assignStationTitle'),
+    subtitle: station.name + (station.bitrate ? ' (' + station.bitrate + ' kbit/s)' : ''),
+    onPick: async (i) => {
+      const logo = stationLogoChain(station);
+      await SetPreset(state.currentBox.host, state.currentBox.port, i, station.name, station.url_resolved || station.url, logo, station.bitrate || 0, station.homepage || '', station.codec || '');
+      if (station.stationuuid) {
+        if (!String(station.stationuuid).startsWith('tunein:')) RadioVote(station.stationuuid).catch(() => {});
+      }
+      showToast(t('preset.savedToKey', { n: i, name: station.name }));
+    },
+  });
+}
+function closePick() { $('pickModal').classList.add('hidden'); }
+
+// ---------- Box Einstellungen View ----------
+
+// ROOM_NAMES_BY_LOCALE contains the common room suggestions for the
+// friendly-name combobox. Recomputed via getRoomNames() so a locale
+// switch reflects on the next render. Falls back to English for any
+// locale we have not localised.
+const ROOM_NAMES_BY_LOCALE = {
+  de: [
+    'Wohnzimmer', 'Schlafzimmer', 'Küche', 'Esszimmer',
+    'Bad', 'Arbeitszimmer', 'Büro', 'Kinderzimmer',
+    'Gästezimmer', 'Flur', 'Diele', 'Eingang',
+    'Garten', 'Terrasse', 'Balkon', 'Werkstatt',
+    'Hobbyraum', 'Keller', 'Dachboden', 'Garage',
+  ],
+  fr: [
+    'Salon', 'Chambre', 'Cuisine', 'Salle à manger',
+    'Salle de bain', 'Bureau', 'Espace de travail', 'Chambre d\'enfant',
+    'Chambre d\'amis', 'Couloir', 'Entrée',
+    'Jardin', 'Terrasse', 'Balcon', 'Atelier',
+    'Salle de loisirs', 'Sous-sol', 'Grenier', 'Garage',
+  ],
+  es: [
+    'Salón', 'Dormitorio', 'Cocina', 'Comedor',
+    'Baño', 'Estudio', 'Oficina', 'Habitación infantil',
+    'Habitación de invitados', 'Pasillo', 'Entrada',
+    'Jardín', 'Patio', 'Balcón', 'Taller',
+    'Sala de ocio', 'Sótano', 'Ático', 'Garaje',
+  ],
+  ja: [
+    'リビング', '寝室', 'キッチン', 'ダイニング',
+    'バスルーム', '書斎', 'オフィス', '子供部屋',
+    'ゲストルーム', '廊下', '玄関',
+    '庭', 'テラス', 'バルコニー', '作業部屋',
+    '趣味の部屋', '地下室', '屋根裏', 'ガレージ',
+  ],
+  uk: [
+    'Вітальня', 'Спальня', 'Кухня', 'Їдальня',
+    'Ванна', 'Кабінет', 'Офіс', 'Дитяча',
+    'Кімната для гостей', 'Коридор', 'Передпокій',
+    'Сад', 'Тераса', 'Балкон', 'Майстерня',
+    'Кімната для хобі', 'Підвал', 'Горище', 'Гараж',
+  ],
+  nl: [
+    'Woonkamer', 'Slaapkamer', 'Keuken', 'Eetkamer',
+    'Badkamer', 'Studeerkamer', 'Kantoor', 'Kinderkamer',
+    'Logeerkamer', 'Gang', 'Hal',
+    'Tuin', 'Terras', 'Balkon', 'Werkplaats',
+    'Hobbykamer', 'Kelder', 'Zolder', 'Garage',
+  ],
+  pl: [
+    'Salon', 'Sypialnia', 'Kuchnia', 'Jadalnia',
+    'Łazienka', 'Gabinet', 'Biuro', 'Pokój dziecięcy',
+    'Pokój gościnny', 'Korytarz', 'Przedpokój',
+    'Ogród', 'Taras', 'Balkon', 'Warsztat',
+    'Pokój hobby', 'Piwnica', 'Strych', 'Garaż',
+  ],
+  lt: [
+    'Svetainė', 'Miegamasis', 'Virtuvė', 'Valgomasis',
+    'Vonia', 'Darbo kambarys', 'Biuras', 'Vaikų kambarys',
+    'Svečių kambarys', 'Koridorius', 'Prieškambaris',
+    'Sodas', 'Terasa', 'Balkonas', 'Dirbtuvė',
+    'Pomėgių kambarys', 'Rūsys', 'Palėpė', 'Garažas',
+  ],
+  lv: [
+    'Viesistaba', 'Guļamistaba', 'Virtuve', 'Ēdamistaba',
+    'Vannasistaba', 'Kabinets', 'Birojs', 'Bērnu istaba',
+    'Viesu istaba', 'Gaitenis', 'Priekštelpa',
+    'Dārzs', 'Terase', 'Balkons', 'Darbnīca',
+    'Hobiju istaba', 'Pagrabs', 'Bēniņi', 'Garāža',
+  ],
+  tr: [
+    'Oturma Odası', 'Yatak Odası', 'Mutfak', 'Yemek Odası',
+    'Banyo', 'Çalışma Odası', 'Ofis', 'Çocuk Odası',
+    'Misafir Odası', 'Koridor', 'Giriş',
+    'Bahçe', 'Teras', 'Balkon', 'Atölye',
+    'Hobi Odası', 'Bodrum', 'Çatı Katı', 'Garaj',
+  ],
+  en: [
+    'Living Room', 'Bedroom', 'Kitchen', 'Dining Room',
+    'Bathroom', 'Study', 'Office', 'Kid\'s Room',
+    'Guest Room', 'Hallway', 'Entrance',
+    'Garden', 'Patio', 'Balcony', 'Workshop',
+    'Hobby Room', 'Basement', 'Attic', 'Garage',
+  ],
+};
+function getRoomNames() {
+  return ROOM_NAMES_BY_LOCALE[getLocale()] || ROOM_NAMES_BY_LOCALE.en;
+}
+
+function formatDuration(sec) {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
+
+renderFooter();
+wireShareModal();
+
+// Prefill from the cache first so the UI shows the last selected
+// speaker immediately. discoverBoxes refreshes the real list in the
+// background within a few seconds.
+(function bootFromCache() {
+ // Wrapped end to end: this runs synchronously at module load and only
+ // when a cached speaker exists in localStorage. A throw here would abort
+ // the rest of the bootstrap (discoverBoxes + the refreshStatus timer
+ // below never run) and leave the window blank, which presents to the
+ // user as the app flashing up and quitting. Never let prefill-render do
+ // that: on any failure, log and fall through to live discovery.
+ try {
+  const cached = loadCachedBoxes();
+  if (cached.length === 0) return;
+  state.boxes = cached;
+  const lastID = loadLastBox();
+  const target = lastID ? cached.find(b => b.deviceID === lastID) : null;
+  if (target) {
+    state.currentBox = target;
+    renderBoxSelect();
+    loadPresets();
+    refreshStatus();
+    loadTaxonomy();
+    loadStickRegion();
+    // Also fire the OTA check on boot. Without this, an app that
+    // boots while speaker version === app version skips
+    // checkBoxUpdate (it only fires from discoverBoxes on
+    // `changed=true`), and the music-tab banner would never reflect
+    // a build-stamp mismatch even though the speaker-settings tab
+    // surfaces it independently.
+    checkBoxUpdate();
+  } else {
+    renderBoxSelect();
+  }
+ } catch (e) {
+  try { console.warn('bootFromCache failed, falling back to live discovery', e); } catch {}
+ }
+})();
+
+try { discoverBoxes(); } catch (e) { try { console.warn('discoverBoxes failed', e); } catch {} }
+// loadWifiProfiles() no longer fires at app start. Defers the OS
+// WiFi profile lookup to Setup-tab activation (see switchView).
+// Was the cause of the macOS keychain prompt on every launch
+// even after the v0.5.16 isMacOS gate, and is also redundant on
+// Windows / Linux for users who never visit the Setup tab.
+// Adaptive status poll. A fixed 2 s interval meant ~30 now_playing
+// requests/min at the speaker. On BCO speakers (Portable, ST20-spotty) the
+// Bose firmware app cannot sustain that: its memory and the system load
+// climb steadily until a firmware watchdog reboots the box about every
+// 25 minutes (confirmed live 2026-06-02 on a Portable: with the desktop app
+// killed the memAvailable freefall stopped cold and load fell from 5 to 1.5,
+// while gabbo + autopair kept running). So poll moderately while audio is
+// actually playing (metadata/volume move) and slowly when idle or in
+// standby (nothing changes). Every user action still fires its own
+// immediate refreshStatus, so feedback stays snappy regardless of cadence.
+function nextStatusDelayMs() {
+  if (state.view !== 'box' || !state.currentBox) return 15000;
+  const ps = state.nowPlayState;
+  if (ps === 'PLAY_STATE' || ps === 'BUFFERING_STATE') return 5000;
+  return 15000;
+}
+(function statusPollLoop() {
+  setTimeout(async () => {
+    try { await refreshStatus(); } catch {}
+    statusPollLoop();
+  }, nextStatusDelayMs());
+})();

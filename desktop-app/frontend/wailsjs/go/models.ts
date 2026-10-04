@@ -1,0 +1,1363 @@
+export namespace main {
+	
+	export class AppInfo {
+	    version: string;
+	    build: string;
+	    author: string;
+	    githubUrl: string;
+	    websiteUrl: string;
+	    donateUrl: string;
+	    donateSlogan: string;
+	    updateManifestUrl: string;
+	    agentSha256: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new AppInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.version = source["version"];
+	        this.build = source["build"];
+	        this.author = source["author"];
+	        this.githubUrl = source["githubUrl"];
+	        this.websiteUrl = source["websiteUrl"];
+	        this.donateUrl = source["donateUrl"];
+	        this.donateSlogan = source["donateSlogan"];
+	        this.updateManifestUrl = source["updateManifestUrl"];
+	        this.agentSha256 = source["agentSha256"];
+	    }
+	}
+	export class BoxInfo {
+	    name: string;
+	    host: string;
+	    port: number;
+	    deviceID: string;
+	    boxDeviceID?: string;
+	    friendlyName: string;
+	    model: string;
+	    version: string;
+	    build: string;
+	    agentBinarySha256?: string;
+	    agentRunningSha256?: string;
+	    offline?: boolean;
+	    offlineSinceSec?: number;
+	    stmNotRunning?: boolean;
+	    stmSilent?: boolean;
+	    otaPending?: boolean;
+	    boxHealth?: string;
+	    conflictingMod?: string;
+	    foreignCloudURL?: string;
+	    groupKeyError?: string;
+	    holdRefusedSource?: string;
+	    holdRefusedSlot?: string;
+	    storm1036?: boolean;
+	    storm1036SinceSec?: number;
+	    recallRefusal?: boolean;
+	    recallRefusalSinceSec?: number;
+	    wlanCredsMissing?: boolean;
+	    serialNumber: string;
+	    kind: string;
+	    portVerified: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new BoxInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.host = source["host"];
+	        this.port = source["port"];
+	        this.deviceID = source["deviceID"];
+	        this.boxDeviceID = source["boxDeviceID"];
+	        this.friendlyName = source["friendlyName"];
+	        this.model = source["model"];
+	        this.version = source["version"];
+	        this.build = source["build"];
+	        this.agentBinarySha256 = source["agentBinarySha256"];
+	        this.agentRunningSha256 = source["agentRunningSha256"];
+	        this.offline = source["offline"];
+	        this.offlineSinceSec = source["offlineSinceSec"];
+	        this.stmNotRunning = source["stmNotRunning"];
+	        this.stmSilent = source["stmSilent"];
+	        this.otaPending = source["otaPending"];
+	        this.boxHealth = source["boxHealth"];
+	        this.conflictingMod = source["conflictingMod"];
+	        this.foreignCloudURL = source["foreignCloudURL"];
+	        this.groupKeyError = source["groupKeyError"];
+	        this.holdRefusedSource = source["holdRefusedSource"];
+	        this.holdRefusedSlot = source["holdRefusedSlot"];
+	        this.storm1036 = source["storm1036"];
+	        this.storm1036SinceSec = source["storm1036SinceSec"];
+	        this.recallRefusal = source["recallRefusal"];
+	        this.recallRefusalSinceSec = source["recallRefusalSinceSec"];
+	        this.wlanCredsMissing = source["wlanCredsMissing"];
+	        this.serialNumber = source["serialNumber"];
+	        this.kind = source["kind"];
+	        this.portVerified = source["portVerified"];
+	    }
+	}
+	export class BoxMediaServer {
+	    id: string;
+	    ip: string;
+	    manufacturer: string;
+	    modelName: string;
+	    friendlyName: string;
+	    registered: boolean;
+	    enabled: boolean;
+	    status: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new BoxMediaServer(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.ip = source["ip"];
+	        this.manufacturer = source["manufacturer"];
+	        this.modelName = source["modelName"];
+	        this.friendlyName = source["friendlyName"];
+	        this.registered = source["registered"];
+	        this.enabled = source["enabled"];
+	        this.status = source["status"];
+	    }
+	}
+	export class BoxPresetInfo {
+	    slot: number;
+	    source: string;
+	    type: string;
+	    location: string;
+	    sourceAccount: string;
+	    name: string;
+	    stmOrigin: boolean;
+	    lost: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new BoxPresetInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.slot = source["slot"];
+	        this.source = source["source"];
+	        this.type = source["type"];
+	        this.location = source["location"];
+	        this.sourceAccount = source["sourceAccount"];
+	        this.name = source["name"];
+	        this.stmOrigin = source["stmOrigin"];
+	        this.lost = source["lost"];
+	    }
+	}
+	export class BoxSSHState {
+	    running: boolean;
+	    persistent: boolean;
+	    boseMarker: boolean;
+	    supported: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new BoxSSHState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.running = source["running"];
+	        this.persistent = source["persistent"];
+	        this.boseMarker = source["boseMarker"];
+	        this.supported = source["supported"];
+	    }
+	}
+	export class CloudRestoreResult {
+	    host: string;
+	    name: string;
+	    rebooted: boolean;
+	    cameBack: boolean;
+	    restored: boolean;
+	    stillForeign?: string;
+	    error?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new CloudRestoreResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.host = source["host"];
+	        this.name = source["name"];
+	        this.rebooted = source["rebooted"];
+	        this.cameBack = source["cameBack"];
+	        this.restored = source["restored"];
+	        this.stillForeign = source["stillForeign"];
+	        this.error = source["error"];
+	    }
+	}
+	export class CloudRestoreTarget {
+	    host: string;
+	    port: number;
+	    name: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new CloudRestoreTarget(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.host = source["host"];
+	        this.port = source["port"];
+	        this.name = source["name"];
+	    }
+	}
+	export class FirmwareInfo {
+	    reachable: boolean;
+	    model: string;
+	    firmware: string;
+	    short: string;
+	    moduleType: string;
+	    variant: string;
+	    latest: string;
+	    outdated: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new FirmwareInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.reachable = source["reachable"];
+	        this.model = source["model"];
+	        this.firmware = source["firmware"];
+	        this.short = source["short"];
+	        this.moduleType = source["moduleType"];
+	        this.variant = source["variant"];
+	        this.latest = source["latest"];
+	        this.outdated = source["outdated"];
+	    }
+	}
+	export class InstallResult {
+	    step: string;
+	    code: string;
+	    ok: boolean;
+	    message: string;
+	    log: string;
+	    firmware: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new InstallResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.step = source["step"];
+	        this.code = source["code"];
+	        this.ok = source["ok"];
+	        this.message = source["message"];
+	        this.log = source["log"];
+	        this.firmware = source["firmware"];
+	    }
+	}
+	export class LibraryContainer {
+	    id: string;
+	    parentID: string;
+	    title: string;
+	    childCount: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LibraryContainer(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.parentID = source["parentID"];
+	        this.title = source["title"];
+	        this.childCount = source["childCount"];
+	    }
+	}
+	export class LibraryItem {
+	    id: string;
+	    parentID: string;
+	    title: string;
+	    artist: string;
+	    album: string;
+	    mimeType: string;
+	    streamURL: string;
+	    albumArtURL: string;
+	    durationSec: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LibraryItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.parentID = source["parentID"];
+	        this.title = source["title"];
+	        this.artist = source["artist"];
+	        this.album = source["album"];
+	        this.mimeType = source["mimeType"];
+	        this.streamURL = source["streamURL"];
+	        this.albumArtURL = source["albumArtURL"];
+	        this.durationSec = source["durationSec"];
+	    }
+	}
+	export class LibraryPage {
+	    containers: LibraryContainer[];
+	    items: LibraryItem[];
+	    totalMatches: number;
+	    returned: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LibraryPage(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.containers = this.convertValues(source["containers"], LibraryContainer);
+	        this.items = this.convertValues(source["items"], LibraryItem);
+	        this.totalMatches = source["totalMatches"];
+	        this.returned = source["returned"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class LibraryServer {
+	    udn: string;
+	    friendlyName: string;
+	    manufacturer: string;
+	    modelName: string;
+	    iconURL: string;
+	    address: string;
+	    manual: boolean;
+	    notAnswering: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new LibraryServer(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.udn = source["udn"];
+	        this.friendlyName = source["friendlyName"];
+	        this.manufacturer = source["manufacturer"];
+	        this.modelName = source["modelName"];
+	        this.iconURL = source["iconURL"];
+	        this.address = source["address"];
+	        this.manual = source["manual"];
+	        this.notAnswering = source["notAnswering"];
+	    }
+	}
+	export class LogExportRequest {
+	    savePath: string;
+	    boxHosts: string[];
+	    anonymize: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new LogExportRequest(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.savePath = source["savePath"];
+	        this.boxHosts = source["boxHosts"];
+	        this.anonymize = source["anonymize"];
+	    }
+	}
+	export class LogExportResult {
+	    savePath: string;
+	    bytes: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new LogExportResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.savePath = source["savePath"];
+	        this.bytes = source["bytes"];
+	    }
+	}
+	export class PhoneAddress {
+	    url: string;
+	    name?: string;
+	    addressUrl: string;
+	    source: string;
+	    note?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new PhoneAddress(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.url = source["url"];
+	        this.name = source["name"];
+	        this.addressUrl = source["addressUrl"];
+	        this.source = source["source"];
+	        this.note = source["note"];
+	    }
+	}
+	export class Preset {
+	    slot: number;
+	    name: string;
+	    stream_url: string;
+	    type: string;
+	    art?: string;
+	    bitrate?: number;
+	    codec?: string;
+	    uri?: string;
+	    account?: string;
+	    source?: string;
+	    homepage?: string;
+	    shuffle?: boolean;
+	    items?: number[];
+	    repeat?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new Preset(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.slot = source["slot"];
+	        this.name = source["name"];
+	        this.stream_url = source["stream_url"];
+	        this.type = source["type"];
+	        this.art = source["art"];
+	        this.bitrate = source["bitrate"];
+	        this.codec = source["codec"];
+	        this.uri = source["uri"];
+	        this.account = source["account"];
+	        this.source = source["source"];
+	        this.homepage = source["homepage"];
+	        this.shuffle = source["shuffle"];
+	        this.items = source["items"];
+	        this.repeat = source["repeat"];
+	    }
+	}
+	export class RadioSearchOpts {
+	    q: string;
+	    cc: string;
+	    lang: string;
+	    tag: string;
+	    order: string;
+	    limit: number;
+	    offset: number;
+	    onlyok: boolean;
+	    top: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioSearchOpts(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.q = source["q"];
+	        this.cc = source["cc"];
+	        this.lang = source["lang"];
+	        this.tag = source["tag"];
+	        this.order = source["order"];
+	        this.limit = source["limit"];
+	        this.offset = source["offset"];
+	        this.onlyok = source["onlyok"];
+	        this.top = source["top"];
+	    }
+	}
+	export class RadioSearchResult {
+	    stations: radiobrowser.Station[];
+	    relaxed: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioSearchResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.stations = this.convertValues(source["stations"], radiobrowser.Station);
+	        this.relaxed = source["relaxed"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class RadioStationStatus {
+	    stationuuid: string;
+	    name: string;
+	    url: string;
+	    url_resolved: string;
+	    favicon: string;
+	    homepage: string;
+	    tags: string;
+	    country: string;
+	    countrycode: string;
+	    language: string;
+	    state: string;
+	    codec: string;
+	    bitrate: number;
+	    hls: number;
+	    votes: number;
+	    clickcount: number;
+	    clicktrend: number;
+	    lastcheckok: number;
+	    lastchecktime: string;
+	    status: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioStationStatus(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.stationuuid = source["stationuuid"];
+	        this.name = source["name"];
+	        this.url = source["url"];
+	        this.url_resolved = source["url_resolved"];
+	        this.favicon = source["favicon"];
+	        this.homepage = source["homepage"];
+	        this.tags = source["tags"];
+	        this.country = source["country"];
+	        this.countrycode = source["countrycode"];
+	        this.language = source["language"];
+	        this.state = source["state"];
+	        this.codec = source["codec"];
+	        this.bitrate = source["bitrate"];
+	        this.hls = source["hls"];
+	        this.votes = source["votes"];
+	        this.clickcount = source["clickcount"];
+	        this.clicktrend = source["clicktrend"];
+	        this.lastcheckok = source["lastcheckok"];
+	        this.lastchecktime = source["lastchecktime"];
+	        this.status = source["status"];
+	    }
+	}
+	export class RadioStationLookup {
+	    found: boolean;
+	    station: RadioStationStatus;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioStationLookup(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.found = source["found"];
+	        this.station = this.convertValues(source["station"], RadioStationStatus);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	
+	export class RadioSubmitDraft {
+	    name: string;
+	    url: string;
+	    homepage: string;
+	    favicon: string;
+	    countrycode: string;
+	    iso_3166_2: string;
+	    state: string;
+	    languagecodes: string;
+	    language: string;
+	    tags: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioSubmitDraft(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.url = source["url"];
+	        this.homepage = source["homepage"];
+	        this.favicon = source["favicon"];
+	        this.countrycode = source["countrycode"];
+	        this.iso_3166_2 = source["iso_3166_2"];
+	        this.state = source["state"];
+	        this.languagecodes = source["languagecodes"];
+	        this.language = source["language"];
+	        this.tags = source["tags"];
+	    }
+	}
+	export class RadioSubmitPrecheck {
+	    fields: Record<string, string>;
+	    stream: streamcheck.Result;
+	    sameUrl: RadioStationStatus[];
+	    similarName: RadioStationStatus[];
+	    problems: string[];
+	    warnings: string[];
+	    canSubmit: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioSubmitPrecheck(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.fields = source["fields"];
+	        this.stream = this.convertValues(source["stream"], streamcheck.Result);
+	        this.sameUrl = this.convertValues(source["sameUrl"], RadioStationStatus);
+	        this.similarName = this.convertValues(source["similarName"], RadioStationStatus);
+	        this.problems = source["problems"];
+	        this.warnings = source["warnings"];
+	        this.canSubmit = source["canSubmit"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class RadioSubmitResult {
+	    uuid: string;
+	    message: string;
+	    precheck: RadioSubmitPrecheck;
+	
+	    static createFrom(source: any = {}) {
+	        return new RadioSubmitResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.uuid = source["uuid"];
+	        this.message = source["message"];
+	        this.precheck = this.convertValues(source["precheck"], RadioSubmitPrecheck);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class RecentItem {
+	    ts: string;
+	    source: string;
+	    cardKey: string;
+	    cardName: string;
+	    cardArt: string;
+	    cardURL: string;
+	    track: string;
+	    account: string;
+	    homepage: string;
+	    mime?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new RecentItem(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ts = source["ts"];
+	        this.source = source["source"];
+	        this.cardKey = source["cardKey"];
+	        this.cardName = source["cardName"];
+	        this.cardArt = source["cardArt"];
+	        this.cardURL = source["cardURL"];
+	        this.track = source["track"];
+	        this.account = source["account"];
+	        this.homepage = source["homepage"];
+	        this.mime = source["mime"];
+	    }
+	}
+	export class SetupAPPushResult {
+	    step: string;
+	    message: string;
+	    ok: boolean;
+	    logTail: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new SetupAPPushResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.step = source["step"];
+	        this.message = source["message"];
+	        this.ok = source["ok"];
+	        this.logTail = source["logTail"];
+	    }
+	}
+	export class SpotifyNow {
+	    bitrate: number;
+	    track: string;
+	    artist: string;
+	    cover: string;
+	    context: string;
+	    account: string;
+	    premiumRequired: boolean;
+	    audioKeyRefused: boolean;
+	    canRecall?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new SpotifyNow(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.bitrate = source["bitrate"];
+	        this.track = source["track"];
+	        this.artist = source["artist"];
+	        this.cover = source["cover"];
+	        this.context = source["context"];
+	        this.account = source["account"];
+	        this.premiumRequired = source["premiumRequired"];
+	        this.audioKeyRefused = source["audioKeyRefused"];
+	        this.canRecall = source["canRecall"];
+	    }
+	}
+	export class SpotifyQualityState {
+	    ok: boolean;
+	    bitrate: number;
+	    pending: boolean;
+	    applied: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new SpotifyQualityState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.bitrate = source["bitrate"];
+	        this.pending = source["pending"];
+	        this.applied = source["applied"];
+	    }
+	}
+	export class SpotifySyncTarget {
+	    host: string;
+	    port: number;
+	    name: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SpotifySyncTarget(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.host = source["host"];
+	        this.port = source["port"];
+	        this.name = source["name"];
+	    }
+	}
+	export class StoragePreflight {
+	    tight: boolean;
+	    freeBytes: number;
+	    needBytes: number;
+	    reclaimableBytes: number;
+	    conflictingMod?: string;
+	    foreignCloudURL?: string;
+	    foreignDirs?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new StoragePreflight(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.tight = source["tight"];
+	        this.freeBytes = source["freeBytes"];
+	        this.needBytes = source["needBytes"];
+	        this.reclaimableBytes = source["reclaimableBytes"];
+	        this.conflictingMod = source["conflictingMod"];
+	        this.foreignCloudURL = source["foreignCloudURL"];
+	        this.foreignDirs = source["foreignDirs"];
+	    }
+	}
+	export class StreamURLKind {
+	    kind: string;
+	    contentType: string;
+	    status: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new StreamURLKind(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.contentType = source["contentType"];
+	        this.status = source["status"];
+	    }
+	}
+	export class TrackDelivery {
+	    delivered: boolean;
+	    known: boolean;
+	    status: number;
+	    detail?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TrackDelivery(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.delivered = source["delivered"];
+	        this.known = source["known"];
+	        this.status = source["status"];
+	        this.detail = source["detail"];
+	    }
+	}
+	export class TrueFactoryResetResult {
+	    step: string;
+	    ok: boolean;
+	    message: string;
+	    log: string;
+	    wipedFiles: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new TrueFactoryResetResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.step = source["step"];
+	        this.ok = source["ok"];
+	        this.message = source["message"];
+	        this.log = source["log"];
+	        this.wipedFiles = source["wipedFiles"];
+	    }
+	}
+	export class TuneInListen {
+	    url: string;
+	    hls: boolean;
+	    finite?: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new TuneInListen(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.url = source["url"];
+	        this.hls = source["hls"];
+	        this.finite = source["finite"];
+	    }
+	}
+	export class TuneInStation {
+	    id: string;
+	    kind: string;
+	    name: string;
+	    slogan?: string;
+	    image?: string;
+	    location?: string;
+	    genre?: string;
+	    language?: string;
+	    description?: string;
+	    hosts?: string;
+	    ref?: string;
+	    codec?: string;
+	    bitrate?: number;
+	    finite?: boolean;
+	    playable: boolean;
+	    reason?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new TuneInStation(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.kind = source["kind"];
+	        this.name = source["name"];
+	        this.slogan = source["slogan"];
+	        this.image = source["image"];
+	        this.location = source["location"];
+	        this.genre = source["genre"];
+	        this.language = source["language"];
+	        this.description = source["description"];
+	        this.hosts = source["hosts"];
+	        this.ref = source["ref"];
+	        this.codec = source["codec"];
+	        this.bitrate = source["bitrate"];
+	        this.finite = source["finite"];
+	        this.playable = source["playable"];
+	        this.reason = source["reason"];
+	    }
+	}
+	export class UninstallSTMResult {
+	    step: string;
+	    ok: boolean;
+	    stickPresent: boolean;
+	    message: string;
+	    log: string;
+	    removedFiles: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new UninstallSTMResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.step = source["step"];
+	        this.ok = source["ok"];
+	        this.stickPresent = source["stickPresent"];
+	        this.message = source["message"];
+	        this.log = source["log"];
+	        this.removedFiles = source["removedFiles"];
+	    }
+	}
+	export class UpdateAsset {
+	    version: string;
+	    sha256: string;
+	    url: string;
+	    filename: string;
+	    autoInstall: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateAsset(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.version = source["version"];
+	        this.sha256 = source["sha256"];
+	        this.url = source["url"];
+	        this.filename = source["filename"];
+	        this.autoInstall = source["autoInstall"];
+	    }
+	}
+	export class ZoneMember {
+	    deviceID: string;
+	    ip: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ZoneMember(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.deviceID = source["deviceID"];
+	        this.ip = source["ip"];
+	    }
+	}
+	export class ZoneSpec {
+	    master: ZoneMember;
+	    slaves: ZoneMember[];
+	    name: string;
+	    stereo: boolean;
+	    mode: string;
+	    permanent: boolean;
+	    defineOnly: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ZoneSpec(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.master = this.convertValues(source["master"], ZoneMember);
+	        this.slaves = this.convertValues(source["slaves"], ZoneMember);
+	        this.name = source["name"];
+	        this.stereo = source["stereo"];
+	        this.mode = source["mode"];
+	        this.permanent = source["permanent"];
+	        this.defineOnly = source["defineOnly"];
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
+export namespace radiobrowser {
+	
+	export class Language {
+	    name: string;
+	    iso_639: string;
+	    stationcount: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Language(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.iso_639 = source["iso_639"];
+	        this.stationcount = source["stationcount"];
+	    }
+	}
+	export class Station {
+	    stationuuid: string;
+	    name: string;
+	    url: string;
+	    url_resolved: string;
+	    favicon: string;
+	    homepage: string;
+	    tags: string;
+	    country: string;
+	    countrycode: string;
+	    language: string;
+	    state: string;
+	    codec: string;
+	    bitrate: number;
+	    hls: number;
+	    votes: number;
+	    clickcount: number;
+	    clicktrend: number;
+	    lastcheckok: number;
+	    lastchecktime: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Station(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.stationuuid = source["stationuuid"];
+	        this.name = source["name"];
+	        this.url = source["url"];
+	        this.url_resolved = source["url_resolved"];
+	        this.favicon = source["favicon"];
+	        this.homepage = source["homepage"];
+	        this.tags = source["tags"];
+	        this.country = source["country"];
+	        this.countrycode = source["countrycode"];
+	        this.language = source["language"];
+	        this.state = source["state"];
+	        this.codec = source["codec"];
+	        this.bitrate = source["bitrate"];
+	        this.hls = source["hls"];
+	        this.votes = source["votes"];
+	        this.clickcount = source["clickcount"];
+	        this.clicktrend = source["clicktrend"];
+	        this.lastcheckok = source["lastcheckok"];
+	        this.lastchecktime = source["lastchecktime"];
+	    }
+	}
+	export class Tag {
+	    name: string;
+	    stationcount: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new Tag(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.name = source["name"];
+	        this.stationcount = source["stationcount"];
+	    }
+	}
+
+}
+
+export namespace sticksetup {
+	
+	export class Drive {
+	    path: string;
+	    label: string;
+	    totalBytes: number;
+	    freeBytes: number;
+	    filesystem: string;
+	    removable: boolean;
+	    hasStick: boolean;
+	    description: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Drive(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.path = source["path"];
+	        this.label = source["label"];
+	        this.totalBytes = source["totalBytes"];
+	        this.freeBytes = source["freeBytes"];
+	        this.filesystem = source["filesystem"];
+	        this.removable = source["removable"];
+	        this.hasStick = source["hasStick"];
+	        this.description = source["description"];
+	    }
+	}
+	export class StickCheck {
+	    ok: boolean;
+	    path: string;
+	    filesystem: string;
+	    totalBytes: number;
+	    isFat32: boolean;
+	    bigEnough: boolean;
+	    writable: boolean;
+	    reason: string;
+	    detail?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new StickCheck(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.path = source["path"];
+	        this.filesystem = source["filesystem"];
+	        this.totalBytes = source["totalBytes"];
+	        this.isFat32 = source["isFat32"];
+	        this.bigEnough = source["bigEnough"];
+	        this.writable = source["writable"];
+	        this.reason = source["reason"];
+	        this.detail = source["detail"];
+	    }
+	}
+	export class StickConfigs {
+	    wlanSSID: string;
+	    wlanPass: string;
+	    region: string;
+	    name: string;
+	    locale: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new StickConfigs(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.wlanSSID = source["wlanSSID"];
+	        this.wlanPass = source["wlanPass"];
+	        this.region = source["region"];
+	        this.name = source["name"];
+	        this.locale = source["locale"];
+	    }
+	}
+
+}
+
+export namespace streamcheck {
+	
+	export class Result {
+	    ok: boolean;
+	    url: string;
+	    resolvedUrl: string;
+	    codec: string;
+	    bitrate: number;
+	    contentType: string;
+	    hls: boolean;
+	    icyName: string;
+	    icyGenre: string;
+	    icyUrl: string;
+	    error: string;
+	    detail: string;
+	    tokenParams: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Result(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.url = source["url"];
+	        this.resolvedUrl = source["resolvedUrl"];
+	        this.codec = source["codec"];
+	        this.bitrate = source["bitrate"];
+	        this.contentType = source["contentType"];
+	        this.hls = source["hls"];
+	        this.icyName = source["icyName"];
+	        this.icyGenre = source["icyGenre"];
+	        this.icyUrl = source["icyUrl"];
+	        this.error = source["error"];
+	        this.detail = source["detail"];
+	        this.tokenParams = source["tokenParams"];
+	    }
+	}
+
+}
+
+export namespace tunein {
+	
+	export class Item {
+	    kind: string;
+	    text: string;
+	    subtext?: string;
+	    guideId?: string;
+	    ref?: string;
+	    image?: string;
+	    bitrate?: number;
+	    reliability?: number;
+	    formats?: string;
+	    genreId?: string;
+	    durationSec?: number;
+	    children?: Item[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Item(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.kind = source["kind"];
+	        this.text = source["text"];
+	        this.subtext = source["subtext"];
+	        this.guideId = source["guideId"];
+	        this.ref = source["ref"];
+	        this.image = source["image"];
+	        this.bitrate = source["bitrate"];
+	        this.reliability = source["reliability"];
+	        this.formats = source["formats"];
+	        this.genreId = source["genreId"];
+	        this.durationSec = source["durationSec"];
+	        this.children = this.convertValues(source["children"], Item);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class Page {
+	    title: string;
+	    items: Item[];
+	
+	    static createFrom(source: any = {}) {
+	        return new Page(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.title = source["title"];
+	        this.items = this.convertValues(source["items"], Item);
+	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+
+}
+
+export namespace wifiprofiles {
+	
+	export class Profile {
+	    ssid: string;
+	    hasPass: boolean;
+	    source: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Profile(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ssid = source["ssid"];
+	        this.hasPass = source["hasPass"];
+	        this.source = source["source"];
+	    }
+	}
+
+}
+

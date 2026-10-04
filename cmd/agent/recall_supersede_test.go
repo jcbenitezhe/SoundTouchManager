@@ -1,0 +1,409 @@
+package main
+
+import (
+	"context"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jcbenitezhe/SoundTouchManager/internal/presets"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/upnp"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/webui"
+)
+
+// TestSuperseded covers the hardware verify's stand-down on a newer play: a
+// newer hardware press (press sequence) or a newer play of any kind (the
+// webui recall generation) must stop an older verify loop from re-pushing its
+// stale URL over the user's newest choice ("pressed 2, got 1").
+func TestSuperseded(t *testing.T) {
+	h := &presetWsHandler{}
+	seq := h.pressSeq.Add(1)
+	if h.superseded(seq, 0) {
+		t.Fatal("the newest press must not read as superseded")
+	}
+	h.pressSeq.Add(1)
+	if !h.superseded(seq, 0) {
+		t.Fatal("a newer press must supersede the older verify")
+	}
+
+	cur := uint64(7)
+	h2 := &presetWsHandler{recallGenFn: func() uint64 { return cur }}
+	s2 := h2.pressSeq.Add(1)
+	if h2.superseded(s2, 7) {
+		t.Fatal("matching generation must not read as superseded")
+	}
+	cur = 8 // an app recall (or any newer play) bumped the shared generation
+	if !h2.superseded(s2, 7) {
+		t.Fatal("a newer recall generation must supersede the older verify")
+	}
+	if h2.superseded(s2, 0) {
+		t.Fatal("gen 0 means the generation was never captured; only the press sequence decides")
+	}
+}
+
+// TestSlotPulledSince covers the handler's slot-scoped success pass-through:
+// the decision itself (liveness, sustained-fetch) lives in
+// streamproxy.SlotPulledSince and is tested there; here the wiring must be
+// nil-safe and forward slot + anchor untouched.
+func TestSlotPulledSince(t *testing.T) {
+	h := &presetWsHandler{}
+	if h.slotPulledSince(3, time.Now().Add(-time.Minute)) {
+		t.Fatal("nil slotPulled must read as not pulled")
+	}
+
+	var gotSlot int
+	var gotSince time.Time
+	h.slotPulled = func(slot int, since time.Time) bool {
+		gotSlot, gotSince = slot, since
+		return slot == 3
+	}
+	anchor := time.Now()
+	if !h.slotPulledSince(3, anchor) {
+		t.Fatal("wired signal must decide")
+	}
+	if gotSlot != 3 || !gotSince.Equal(anchor) {
+		t.Fatalf("slot/anchor must pass through untouched, got slot=%d since=%v", gotSlot, gotSince)
+	}
+	if h.slotPulledSince(2, anchor) {
+		t.Fatal("another slot must not certify this recall")
+	}
+}
+
+// TestIsOwnBoxPresetLocation pins the prune's deletion guard to exactly the
+// locations STM itself writes into box preset slots (boxurl shapes). The old
+// loose "/stream/" substring match could misread a foreign station URL as
+// STM-owned and delete a working box preset.
+func TestIsOwnBoxPresetLocation(t *testing.T) {
+	// The native form the speaker reports STM's own keys in: the
+	// RELATIVE "/station?data=" location OrionStationLocation writes, and the
+	// same behind the orion adapter prefix. Neither matched, so
+	// on an all-native box the prune and the recovery both did nothing.
+	native3 := webui.OrionStationLocation("http://127.0.0.1:8888/stream/3", "WDCB Jazz", "")
+	own := []string{
+		"http://127.0.0.1:8888/stream/1",
+		"http://127.0.0.1:8888/stream/6",
+		"http://127.0.0.1:8888/spotify/stream-4.ogg",
+		"http://127.0.0.1:8888/spotify/stream.ogg",
+		native3,
+		"/core02/svc-bmx-adapter-orion/prod/orion" + native3,
+	}
+	for _, u := range own {
+		if !isOwnBoxPresetLocation(u) {
+			t.Errorf("STM-written location not recognised: %s", u)
+		}
+	}
+	foreign := []string{
+		"http://icecast.example.com/stream/1",
+		"http://example.com/radio/stream/128.mp3",
+		"http://127.0.0.1:8888/stream/7",
+		"http://127.0.0.1:8888/stream/raw?u=abc",
+		"/v1/playback/station/s12345",
+		"123456789",
+		"",
+		// A native descriptor that is NOT ours: an external stream (an
+		// old-cloud orion station, or a foreign adapter), a slot number STM
+		// never writes, the ad-hoc raw proxy of an app play, and garbage.
+		webui.OrionStationLocation("https://stream.example.com/live.mp3", "Foreign", ""),
+		webui.OrionStationLocation("http://127.0.0.1:8888/stream/7", "Seven", ""),
+		webui.OrionStationLocation("http://127.0.0.1:8888/stream/raw?u=abc", "Ad hoc", ""),
+		"/station?data=!!!not-base64!!!",
+		"/station?data=",
+	}
+	for _, u := range foreign {
+		if isOwnBoxPresetLocation(u) {
+			t.Errorf("foreign location must never be prunable: %s", u)
+		}
+	}
+}
+
+// TestUrgentResyncHasOwnBudget: the urgent re-sync (a 1036/re-login wipe is
+// imminent) must not be starved by a routine ask that consumed the normal
+// budget minutes earlier - the field bundles showed five dead-key presses
+// producing no heal because the boot-time ask had eaten the shared budget.
+func TestUrgentResyncHasOwnBudget(t *testing.T) {
+	presetResyncAsk.Store(false)
+	presetResyncLast.Store(time.Now().Unix()) // routine budget just consumed
+	presetResyncUrgentLast.Store(0)
+	t.Cleanup(func() {
+		presetResyncAsk.Store(false)
+		presetResyncLast.Store(0)
+		presetResyncUrgentLast.Store(0)
+	})
+
+	requestPresetKeyResync(nil, "test")
+	if presetResyncAsk.Load() {
+		t.Fatal("routine ask inside its gap must be rate-limited")
+	}
+
+	requestPresetKeyResyncUrgent(nil, "test")
+	if !presetResyncAsk.Load() {
+		t.Fatal("urgent ask must not be starved by the routine budget")
+	}
+
+	// The urgent budget itself still bounds a 1036 storm.
+	presetResyncAsk.Store(false)
+	requestPresetKeyResyncUrgent(nil, "test")
+	if presetResyncAsk.Load() {
+		t.Fatal("urgent asks inside the urgent gap must coalesce")
+	}
+}
+
+// A standby deferral drops the ask AND resets the routine budget: the wake
+// re-asks via OnStandbyExit within seconds-to-hours, and a deferral moments
+// before a wake must not swallow the wake's own re-ask under the 2-minute
+// rate limit (the deferred heal would then wait for the 20-minute insurance).
+func TestStandbyDeferralResetsRoutineBudget(t *testing.T) {
+	presetResyncAsk.Store(false)
+	presetResyncLast.Store(0)
+	presetResyncUrgentLast.Store(0)
+	t.Cleanup(func() {
+		presetResyncAsk.Store(false)
+		presetResyncLast.Store(0)
+		presetResyncUrgentLast.Store(0)
+	})
+
+	requestPresetKeyResync(nil, "thumb")
+	if !presetResyncAsk.Load() {
+		t.Fatal("fresh routine ask must be accepted")
+	}
+	presetResyncAsk.Store(false) // the reconcile consumed the ask...
+	deferPresetResyncForStandby(slog.New(slog.NewTextHandler(io.Discard, nil)), "STANDBY")
+
+	requestPresetKeyResync(nil, "standby-exit") // ...and the wake re-asks
+	if !presetResyncAsk.Load() {
+		t.Fatal("wake re-ask was swallowed by the routine budget after a deferral")
+	}
+}
+
+// A deferred URGENT ask must reset the urgent budget too: the 1036 asker
+// fires on a box that is already awake (no wake hook is coming for it), so
+// after a deferral on a transient probe error the next 1036 is the only
+// natural retrigger, and the burned 60s budget would silence it.
+func TestStandbyDeferralResetsUrgentBudget(t *testing.T) {
+	presetResyncAsk.Store(false)
+	presetResyncLast.Store(0)
+	presetResyncUrgentLast.Store(0)
+	t.Cleanup(func() {
+		presetResyncAsk.Store(false)
+		presetResyncLast.Store(0)
+		presetResyncUrgentLast.Store(0)
+	})
+
+	requestPresetKeyResyncUrgent(nil, "1036")
+	if !presetResyncAsk.Load() {
+		t.Fatal("fresh urgent ask must be accepted")
+	}
+	presetResyncAsk.Store(false) // consumed by the reconcile...
+	deferPresetResyncForStandby(slog.New(slog.NewTextHandler(io.Discard, nil)), "")
+
+	requestPresetKeyResyncUrgent(nil, "1036") // ...and the next 1036 re-asks
+	if !presetResyncAsk.Load() {
+		t.Fatal("follow-up 1036 was swallowed by the urgent budget after a deferral")
+	}
+}
+
+// TestNudgeStuckSource pins the sys-power-nudge decision: exactly one nudge
+// per recall, only at the third attempt, only while the box reports
+// INVALID_SOURCE (the mojo/ST30 wedge where the box inertly ACKs every push
+// and only a real sys-power toggle ever activated the source).
+func TestNudgeStuckSource(t *testing.T) {
+	cases := []struct {
+		attempt int
+		nudged  bool
+		source  string
+		want    bool
+	}{
+		{1, false, "INVALID_SOURCE", false}, // give the normal wake+re-push a chance first
+		{2, false, "INVALID_SOURCE", false},
+		{3, false, "INVALID_SOURCE", true},
+		{3, true, "INVALID_SOURCE", false}, // one nudge per recall
+		{3, false, "STANDBY", false},       // the wake path owns standby
+		{3, false, "UPNP", false},
+		{3, false, "", false}, // probe failed: do not toggle blind
+		{4, false, "INVALID_SOURCE", false},
+	}
+	for _, c := range cases {
+		if got := nudgeStuckSource(c.attempt, c.nudged, c.source); got != c.want {
+			t.Errorf("nudgeStuckSource(%d,%v,%q) = %v, want %v", c.attempt, c.nudged, c.source, got, c.want)
+		}
+	}
+}
+
+// TestRePushAfterSourceRejectWakesBeforePush asserts the wake ordering of the
+// wrong-state repair (bundle signature: box drops INVALID_SOURCE->STANDBY
+// within ~1s of the press; pushing without a wake did nothing): the repair
+// must wake the box BEFORE re-issuing SetURI+Play.
+func TestRePushAfterSourceRejectWakesBeforePush(t *testing.T) {
+	var mu sync.Mutex
+	var order []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		order = append(order, "soap")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	h := &presetWsHandler{
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		boxHost:  "192.0.2.9",
+		renderer: &upnp.Renderer{ControlURL: srv.URL, Client: srv.Client()},
+		wakeBox: func(ctx context.Context, host string) error {
+			mu.Lock()
+			order = append(order, "wake")
+			mu.Unlock()
+			return nil
+		},
+		boxPlayingFn: func(url string) bool { return false },
+	}
+	seq := h.pressSeq.Add(1)
+	pressAt := time.Now().Add(-2 * time.Second)
+	h.OnSourceRejected(context.Background()) // 1036 stamped after pressAt
+
+	h.rePushAfterSourceReject(seq, 0, pressAt, 1, "http://127.0.0.1:8888/stream/1", "S", "", "")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(order) < 2 || order[0] != "wake" {
+		t.Fatalf("the repair must wake the box before pushing, got order %v", order)
+	}
+	if order[len(order)-1] != "soap" {
+		t.Fatalf("the repair must push after waking, got order %v", order)
+	}
+}
+
+// TestOnPresetSelectedReturnsBeforeSlowRecall pins the F1 contract directly:
+// the gabbo dispatch must not block behind slow box I/O (pre-fix, a press on a
+// cold box held the single read loop for up to ~18s and every queued frame -
+// including the teardown STOP_STATE the classification windows were tuned for -
+// was stamped late).
+func TestOnPresetSelectedReturnsBeforeSlowRecall(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	store, err := presets.Load(filepath.Join(t.TempDir(), "presets.json"))
+	if err != nil {
+		t.Fatalf("presets.Load: %v", err)
+	}
+	if err := store.SetSlot(presets.Preset{Slot: 1, Name: "S", StreamURL: "http://example.com/s.mp3", Type: "radio"}); err != nil {
+		t.Fatal(err)
+	}
+	h := &presetWsHandler{
+		logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+		store:        store,
+		renderer:     &upnp.Renderer{ControlURL: slow.URL, Client: slow.Client()},
+		wakeBox:      func(ctx context.Context, host string) error { return nil },
+		boxPlayingFn: func(url string) bool { return false },
+	}
+
+	start := time.Now()
+	h.OnPresetSelected(context.Background(), 1, "http://127.0.0.1:8888/stream/1", "S")
+	elapsed := time.Since(start)
+	// Supersede immediately so the background recall/verify goroutines stand
+	// down at their next check instead of retrying for ~30s.
+	h.pressSeq.Add(1)
+
+	if elapsed > time.Second {
+		t.Fatalf("OnPresetSelected blocked the gabbo dispatch for %v; the slow recall must run in the background", elapsed)
+	}
+}
+
+// TestRecallStandDown pins the shared stand-down decision the verify paths
+// re-check before every escalation (wake, sys-power nudge, re-push): those run
+// seconds after the loop-top check, and a power press inside that gap used to
+// be reversed by the very wake meant to recover the box's own give-up.
+func TestRecallStandDown(t *testing.T) {
+	h := &presetWsHandler{}
+	seq := h.pressSeq.Add(1)
+	pressAt := time.Now()
+	if h.recallStandDown(seq, 0, pressAt) {
+		t.Fatal("a fresh recall with no events must not stand down")
+	}
+
+	h.standbyStopAfter = func(since time.Time) bool { return true }
+	if !h.recallStandDown(seq, 0, pressAt) {
+		t.Fatal("a power-off after the press must stand the recall down")
+	}
+	h.standbyStopAfter = nil
+
+	h.pressSeq.Add(1)
+	if !h.recallStandDown(seq, 0, pressAt) {
+		t.Fatal("a newer press must stand the older recall down")
+	}
+}
+
+// TestWakeSkipsWhenAbortSignalled: the wake helper consults the caller's abort
+// predicate so a stand-down that arrives after the caller decided to wake
+// still keeps the box off (check-then-act).
+func TestWakeSkipsWhenAbortSignalled(t *testing.T) {
+	called := 0
+	h := &presetWsHandler{
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		boxHost: "192.0.2.9",
+		wakeBox: func(ctx context.Context, host string) error { called++; return nil },
+	}
+	if err := h.wake(context.Background(), func() bool { return true }); err != nil {
+		t.Fatalf("an aborted wake must be a quiet no-op, got %v", err)
+	}
+	if called != 0 {
+		t.Fatal("an abort that already holds must skip the wake entirely")
+	}
+	if err := h.wake(context.Background(), nil); err != nil {
+		t.Fatalf("wake: %v", err)
+	}
+	if called != 1 {
+		t.Fatal("nil abort must wake as before")
+	}
+}
+
+// TestVerifyPowerOffDuringWakeIsNotOverridden reproduces the
+// check-then-act window: the verify iteration passes its loop-top stand-downs,
+// then the user presses power while the wake helper is already running. The
+// re-check after the wake must catch the fresh stamp and no SOAP push may
+// follow - pre-fix the box was actively powered back on and the stale URL
+// re-armed.
+func TestVerifyPowerOffDuringWakeIsNotOverridden(t *testing.T) {
+	var mu sync.Mutex
+	pushes := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		pushes++
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	var poweredOff atomic.Bool
+	h := &presetWsHandler{
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		boxHost:  "192.0.2.9",
+		renderer: &upnp.Renderer{ControlURL: srv.URL, Client: srv.Client()},
+		wakeBox: func(ctx context.Context, host string) error {
+			// The user presses power while the wake helper runs; the standby
+			// classifier stamps the latch within milliseconds.
+			poweredOff.Store(true)
+			return nil
+		},
+		standbyStopAfter: func(since time.Time) bool { return poweredOff.Load() },
+		boxPlayingFn:     func(url string) bool { return false },
+		boxSourceFn:      func() string { return "STANDBY" },
+	}
+	seq := h.pressSeq.Add(1)
+
+	h.verifyPlayURL(seq, 0, time.Now(), 2, "http://127.0.0.1:8888/stream/2", "S", "", "")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if pushes != 0 {
+		t.Fatalf("a power press during the wake must hold: no SOAP push may follow, got %d", pushes)
+	}
+}

@@ -1,0 +1,141 @@
+# Security Policy
+
+## Supported Versions
+
+| Version | Supported |
+|---------|-----------|
+| latest release | yes |
+| prior releases | no |
+
+Use the most recent release. Older builds may contain known vulnerabilities or compatibility issues.
+
+## Reporting a Vulnerability
+
+If you discover a security issue please do **not** open a public GitHub issue. Send an email to:
+
+**jcbenitezhe@gmail.com**
+
+Subject line: `[security] STM (SoundTouch Manager)`
+
+Include:
+
+- a clear description of the issue
+- steps to reproduce
+- affected version(s)
+- your assessment of impact
+- whether you wish to be credited
+
+STM is maintained in spare time, so there is no formal SLA.
+Reports get attention as quickly as the maintainer can manage,
+typically within a few days.
+
+Critical findings will be patched and a short advisory published in
+GitHub Releases. Reporters who follow responsible disclosure are
+credited unless they prefer to stay anonymous.
+
+## Threat Model
+
+STM (SoundTouch Manager) installs a small agent onto a Bose SoundTouch speaker, normally over the network from the desktop app; a USB stick serves as the fallback and recovery install path. After the install, the agent runs from the speaker's own persistent storage. It also ships a desktop application and a website.
+
+Critical trust boundaries:
+
+1. **Binary release** users download to their machine
+2. **Code that runs on the speaker** with root privileges
+3. **TLS certificate authority** that the agent installs in the speaker's trust store
+4. **GitHub repository** and its build artifacts
+5. **Website** that hosts download links and donation channels
+
+## Build Provenance
+
+All binaries published on GitHub Releases are produced exclusively by the official GitHub Actions workflow in this repository. Manual uploads to releases are not part of the trusted build process.
+
+Each release attaches:
+
+- the binary itself
+- a `SHA256SUMS` file
+- a build attestation produced by GitHub's OIDC infrastructure (sigstore based)
+
+Users can verify a download with either:
+
+```bash
+# Method 1: SHA256 checksum
+sha256sum -c SHA256SUMS
+
+# Method 2: GitHub CLI attestation verification
+gh attestation verify STM-Windows-vX.Y.Z.exe \
+    --owner jcbenitezhe
+```
+
+The attestation proves:
+
+- the binary was built by the official workflow
+- in the official repository
+- from a specific commit
+- by GitHub's runners (not a developer machine)
+
+## Supply Chain Security Practices
+
+### Repository
+
+- Branch protection on `main`: pull request required, status checks must pass, signed commits required, force push forbidden, admin enforcement enabled.
+- Two factor authentication required for all maintainers, hardware key preferred.
+- Personal access tokens minimized; OIDC used for CI auth where possible.
+- Dependabot enabled for Go modules, npm packages, and GitHub Actions.
+- All third party GitHub Actions pinned to a full commit SHA (not a tag).
+- Secret Scanning with Push Protection enabled: commits containing a leaked credential are blocked before they land.
+- CodeQL static analysis runs on every push and pull request, plus weekly.
+- OpenSSF Scorecard runs weekly and on push; it scores the repo's security posture, uploads the result to the Security tab, and feeds the Scorecard badge in the README, so the practices on this page are visible and verifiable, not just claimed.
+
+### Build
+
+- Builds run in clean GitHub hosted runners.
+- Every push runs `golangci-lint`, `govulncheck` (Go vulnerability scan), and the test suite; a pull request cannot merge if any of them fail.
+- `go mod verify` runs before build, and lockfile consistency (`go mod tidy`) is checked.
+- `npm ci` is used (never `npm install`) to ensure the lockfile is honored.
+- Build artifacts are attested using `actions/attest-build-provenance`.
+- SHA256 sums are generated and uploaded alongside artifacts.
+- All shipped binaries are compiled from source by the workflow, including the small speaker shim (built from `usb-stick/shim/shim.c`); the repo ships no opaque prebuilt binaries.
+
+### Release
+
+- Releases are created from signed Git tags only.
+- Release notes contain the commit hash and link to the workflow run.
+- No manual binary uploads to releases.
+
+### Website
+
+- Static HTML from `site/`, hosted on GitHub Pages; no server-side code.
+- Download links point exclusively to GitHub Releases.
+- No cookies and no analytics.
+
+## What Users Can Do
+
+- Always download from the official sources: `https://github.com/jcbenitezhe/SoundTouchManager/releases` or `https://jcbenitezhe.github.io/SoundTouchManager/`.
+- Verify the SHA256 checksum before running an installer.
+- Inspect the source code on GitHub if you are technical.
+- Run the desktop app on a network where the SoundTouch lives only.
+- Keep the app updated.
+
+## Privacy and Data Collection
+
+STM has no user accounts, no advertising, and no third-party trackers in the app.
+
+- **The speaker never contacts the Bose cloud.** STM redirects the Bose cloud hostnames to localhost and answers them itself. The speaker reaches your LAN, the radio station's own stream, and, only if you enable Spotify Connect, Spotify's servers (the bundled go-librespot client). Station search moved to the desktop app; the speaker no longer contacts radio-browser.info.
+- **The desktop app talks to:** radio-browser.info (station search) and public favicon endpoints (station logos). Its automatic update check is off (no update server is configured). No account, no device identifier, no personal data.
+- **The website** sets no cookies and uses no analytics. It is hosted on GitHub Pages, which may log visitor IP addresses.
+
+The full breakdown is in [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md#telemetry-analytics-and-privacy).
+
+## Known Limitations
+
+- **SSH follows the USB stick:** the firmware root account uses a well-known default with no password, so STM keeps SSH opt-in. SSH is only started while the STM stick is inserted (Bose's `remote_services` marker) and closes again on the next stickless reboot; the agent no longer keeps it open on every boot. A persistent opt-in marker (`/mnt/nv/stmanager/enable-ssh`) exists for maintainers and is flagged in the desktop app. While SSH is open, run the speaker on a trusted network or its own VLAN.
+- Windows releases are **code signed** with a Certum Open Source code signing certificate (since v0.9.20), so SmartScreen shows a verified publisher. SHA256 sums and Sigstore attestations additionally cover every release artifact.
+- macOS releases are **signed with a Developer ID certificate and notarized by Apple** (since v0.9.33). The app and the disk image each carry a stapled ticket, so Gatekeeper opens them without a warning, offline included. If Apple's notary service does not return a verdict in time for a given build, that release ships signed but without a ticket, and its release notes say so.
+- The desktop app does not implement application sandboxing. Future versions may use OS provided sandboxing.
+
+## Changelog
+
+- 2026 May 15: initial security policy.
+- 2026 Jun 03: documented the privacy/telemetry posture, added OpenSSF Scorecard, and listed the per-push checks (golangci-lint, govulncheck, CodeQL, Secret Scanning + Push Protection).
+- 2026 Jun 12: corrected the privacy section (app-side radio search, Spotify sidecar), documented the pre-1.0 SSH posture, noted the update-check endpoint, fixed the attestation example to the versioned asset name.
+- 2026 Aug 11: recorded macOS Developer ID signing and Apple notarization, shipping since v0.9.33. The previous "not notarized yet" line had outlived the fact.

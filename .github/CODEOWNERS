@@ -1,0 +1,19 @@
+# Code Owners. Bei PRs werden diese automatisch als Reviewer hinzugefuegt.
+# Eintraege gewinnen nach Spezifitaet, die letzte Regel hat Vorrang.
+
+# Default: everything goes to the maintainer
+*       @jcbenitezhe
+
+# Sensible Bereiche extra absichern. Auch wenn aktuell nur ein Owner: bei
+# spaeterem Team Wachstum wichtig.
+/.github/                @jcbenitezhe
+/SECURITY.md             @jcbenitezhe
+/LICENSE                 @jcbenitezhe
+/cmd/agent/              @jcbenitezhe
+/internal/tlsgen/        @jcbenitezhe
+/internal/marge/         @jcbenitezhe
+# Security-critical per docs/THREAT-MODEL.md: pairing/TLS trust and the
+# on-box firewall + TLS setup scripts.
+/internal/autopair/           @jcbenitezhe
+/usb-stick/setup-tls.sh       @jcbenitezhe
+/usb-stick/iptables-setup.sh  @jcbenitezhe

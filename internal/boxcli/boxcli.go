@@ -1,0 +1,542 @@
+// Package boxcli sends commands to Bose's local CLI server on port
+// 17000. We use it to wake the box from standby before we send a UPnP
+// play.
+package boxcli
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Send sends a single command to port 17000 and collects up to 200 ms
+// of output. The box typically answers immediately.
+func Send(ctx context.Context, host, cmd string) (string, error) {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	dialer := net.Dialer{Timeout: 3 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", host+":17000")
+	if err != nil {
+		return "", fmt.Errorf("dial cli: %w", err)
+	}
+	defer conn.Close()
+
+	_ = conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte(cmd + "\n")); err != nil {
+		return "", fmt.Errorf("write: %w", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(700 * time.Millisecond))
+	var sb strings.Builder
+	r := bufio.NewReader(conn)
+	for {
+		line, err := r.ReadString('\n')
+		sb.WriteString(line)
+		if err != nil {
+			break
+		}
+	}
+	return sb.String(), nil
+}
+
+// PowerOn toggles the box's power. NOTE: `sys power` is a TOGGLE, not an
+// idempotent power-on — the same command also returns the box to standby (see
+// the announce standby-restore in internal/webui/announce.go). Callers must
+// therefore confirm the box is actually in standby before calling this, or they
+// risk turning a running box off. WakeAndWait does that gating; prefer it over
+// calling PowerOn directly.
+func PowerOn(ctx context.Context, host string) error {
+	if fn := powerToggleHook(); fn != nil {
+		fn()
+	}
+	_, err := Send(ctx, host, "sys power")
+	return err
+}
+
+// beforePowerToggle runs immediately before every `sys power` toggle. It exists
+// for ONE caller: the box answers the firmware's own power-on self-resume with
+// errorUpdate 1036 (it tries to restart a source it does not consider itself
+// logged into), and the 1036 storm counter in internal/boxws counted those as
+// evidence that the box refuses everything - so forming and dissolving a group
+// a few times, which wakes speakers, was enough to raise a red banner about a
+// perfectly healthy speaker (field, 2026-09-07).
+//
+// A callback rather than a direct call so this package keeps no dependency on
+// boxws: boxcli is the low-level CLI transport and is imported by nearly
+// everything, boxws is a WebSocket client with its own lifecycle.
+var (
+	powerHookMu       sync.Mutex
+	beforePowerToggle func()
+)
+
+// SetBeforePowerToggle wires the callback run immediately before each `sys
+// power` toggle. nil clears it. Wired once at agent start.
+func SetBeforePowerToggle(fn func()) {
+	powerHookMu.Lock()
+	defer powerHookMu.Unlock()
+	beforePowerToggle = fn
+}
+
+func powerToggleHook() func() {
+	powerHookMu.Lock()
+	defer powerHookMu.Unlock()
+	return beforePowerToggle
+}
+
+// selfWakeGrace is how long WakeAndWait first watches for the box to leave
+// standby on its OWN before it sends a `sys power` toggle. Because `sys power`
+// is a power TOGGLE (see PowerOn), toggling a box that is already coming out of
+// standby — for example because the user just pressed the physical power button
+// or a hardware preset, which is exactly the press that produced the gabbo wake
+// frame STM is reacting to — would CANCEL that wake, and the box looks dead to
+// the button. That is the overnight-standby "won't switch on / needs several
+// presses" report (ST30 Klaus, ST20, preset first-press), made easy to
+// hit once the keepalive started delivering the wake frame instantly,
+// mid-transition. Watching for a self-wake first means STM only toggles a box
+// that stays firmly, stably asleep — a genuine STM-initiated wake such as an app
+// play on an idle box with no user press.
+const selfWakeGrace = 2500 * time.Millisecond
+
+// toggleEvery is how long a toggled box is left alone before a second
+// toggle is considered. `sys power` is a TOGGLE, so re-sending it at a box
+// that is slowly waking switches it back off.
+const toggleEvery = 4 * time.Second
+
+// minWakeBudget is the shortest deadline under which this function can do
+// what it is written to do. Below selfWakeGrace + toggleEvery the second
+// toggle is unreachable: the deadline fires first, every time, and a speaker
+// that ignored the first toggle is reported as still asleep after exactly one
+// attempt.
+//
+// Five of the nine callers passed 6 s, which is under that sum, so for them
+// the retry was dead code. What made it worse is that the user retries by
+// hand: each press sends another toggle at a box that may be mid-wake, which
+// is precisely what the single-toggle design avoids internally. One speaker
+// took over eighty presses in a session that way, its agent logging "box
+// stays in STANDBY after 1 attempts" each time (2026-09-29).
+//
+// A caller asking for less is raised to this rather than refused: every one
+// of them wants the box awake, and none of them chose 6 s for a reason that
+// survives knowing the arithmetic. Waking early still returns early, so this
+// costs nothing on a speaker that wakes on the first toggle, which is most
+// of them.
+const minWakeBudget = selfWakeGrace + toggleEvery + 2*time.Second
+
+// WakeAndWait makes sure the box is out of standby. It first watches briefly for
+// the box to wake on its own (a user button press already waking it); only if it
+// stays in standby does it send the `sys power` toggle, polling `/now_playing`
+// until source != STANDBY or timeout. The box sometimes reacts with a delay or
+// ignores sys power entirely when it is in deep standby; in that case it is sent
+// multiple times.
+//
+// logger may be nil; when present, per-iteration phase markers are emitted
+// so a diagnostic bundle shows the standby-exit timeline.
+func WakeAndWait(ctx context.Context, host string, maxWait time.Duration, logger *slog.Logger) error {
+	return WakeAndWaitAbort(ctx, host, maxWait, logger, nil)
+}
+
+// WakeAndWaitAbort is WakeAndWait with an abort predicate, consulted
+// immediately before EACH `sys power` toggle would be sent. Callers whose
+// wake decision can be invalidated while the wake is already running - the
+// recall verify, whose "the box's own give-up put it in standby" conclusion a
+// user power press can overtake at any moment - pass their stand-down check
+// here, so the toggle never re-powers a box the user just switched off
+// nil = never abort. Aborting returns nil: the box deliberately stays
+// as it is.
+func WakeAndWaitAbort(ctx context.Context, host string, maxWait time.Duration, logger *slog.Logger, abort func() bool) error {
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if maxWait <= 0 {
+		maxWait = minWakeBudget
+	}
+	if maxWait < minWakeBudget {
+		// Not an error: the caller wants the box awake, and this is what that
+		// costs when the first toggle is ignored.
+		maxWait = minWakeBudget
+	}
+	deadline := time.Now().Add(maxWait)
+	client := &http.Client{Timeout: 2 * time.Second}
+	infoURL := fmt.Sprintf("http://%s:8090/now_playing", host)
+	start := time.Now()
+	logPhase := func(msg string, kv ...any) {
+		if logger == nil {
+			return
+		}
+		kv = append(kv, "elapsed_ms", time.Since(start).Milliseconds())
+		logger.Warn(msg, kv...)
+	}
+
+	logPhase("wake phase: start", "host", host, "max_wait", maxWait.String())
+
+	// Phase 1: self-wake grace. The wake STM is reacting to was almost always
+	// caused by the user pressing a button, which is itself bringing the box out
+	// of standby. Give it that moment to surface so we do NOT toggle it back off.
+	graceDeadline := time.Now().Add(selfWakeGrace)
+	if graceDeadline.After(deadline) {
+		graceDeadline = deadline
+	}
+	for {
+		state, err := readSource(ctx, client, infoURL)
+		if err == nil && state != "STANDBY" {
+			logPhase("wake phase: box left standby on its own, not toggling (user wake)", "source", state)
+			return nil
+		}
+		if !time.Now().Before(graceDeadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			logPhase("wake phase: ctx cancelled (grace)", "err", ctx.Err().Error())
+			return ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+
+	// Phase 2: still firmly asleep after the grace -> no user wake in progress,
+	// so this is a genuine STM-initiated wake. Send ONE `sys power` toggle, then
+	// poll patiently for the box to wake; only re-toggle if it is STILL firmly
+	// asleep after a long beat.
+	//
+	// `sys power` is a TOGGLE (see PowerOn). Re-sending it while a SLOW box is
+	// still coming out of standby flips it back off. A soundbar (SoundTouch 300)
+	// wakes slowly enough that the old "re-send every 800ms" toggled it
+	// on/off/on/off five or six times and drove it into its alternating-LED
+	// recovery-blink state, which only a manual power-cycle clears (Jens' ST300,
+	// 2026-07-15). The fast SoundTouch 10/20/30 wake within the first poll, so
+	// they still take a single toggle and this changes nothing for them.
+	for i := 0; ; i++ {
+		state, err := readSource(ctx, client, infoURL)
+		if err == nil && state != "STANDBY" {
+			logPhase("wake phase: already awake", "attempt", i, "source", state)
+			return nil
+		}
+		if err != nil {
+			// The box's power state is UNKNOWN, and `sys power` is a TOGGLE:
+			// sent blind it switches a PLAYING box off. Measured live 2026-08-18
+			// (ST20 leading a playing 2-box zone whose BoseApp :8090 froze): the
+			// pre-check read timed out, the blind toggle went out anyway, and 66ms
+			// later the master dropped UPNP -> STANDBY and the zone dissolved. So
+			// a failed read never earns a toggle; keep asking until the deadline
+			// and report the unreadable state instead.
+			logPhase("wake phase: state read failed, withholding the power toggle (unknown state)", "attempt", i, "err", err.Error())
+			if time.Now().After(deadline) {
+				return fmt.Errorf("box power state unreadable, power toggle withheld: %w", err)
+			}
+			select {
+			case <-ctx.Done():
+				logPhase("wake phase: ctx cancelled (state unknown)", "attempt", i, "err", ctx.Err().Error())
+				return ctx.Err()
+			case <-time.After(700 * time.Millisecond):
+			}
+			continue
+		}
+		logPhase("wake phase: STANDBY, sending sys power", "attempt", i, "source", state)
+		if abort != nil && abort() {
+			logPhase("wake phase: abort signalled (caller stood down), not toggling", "attempt", i)
+			return nil
+		}
+		if pwrErr := PowerOn(ctx, host); pwrErr != nil {
+			logPhase("wake phase: sys power write failed", "attempt", i, "err", pwrErr.Error())
+		}
+		toggledAt := time.Now()
+		// Poll for the wake WITHOUT re-toggling, giving a slow box time to come up
+		// rather than toggling it back off. Re-toggle only after toggleEvery of
+		// continued standby (a toggle the box genuinely ignored), never mid-wake.
+		for {
+			select {
+			case <-ctx.Done():
+				logPhase("wake phase: ctx cancelled", "attempt", i, "err", ctx.Err().Error())
+				return ctx.Err()
+			case <-time.After(400 * time.Millisecond):
+			}
+			state, err = readSource(ctx, client, infoURL)
+			if err == nil && state != "STANDBY" {
+				logPhase("wake phase: woke", "attempt", i, "source", state)
+				return nil
+			}
+			if time.Now().After(deadline) {
+				logPhase("wake phase: timeout", "attempts", i+1, "last_source", state)
+				return fmt.Errorf("box stays in STANDBY after %d attempts", i+1)
+			}
+			if time.Since(toggledAt) >= toggleEvery {
+				break // still firmly asleep after a long beat -> re-toggle
+			}
+		}
+	}
+}
+
+// readSource extracts the source attribute from /now_playing.
+func readSource(ctx context.Context, c *http.Client, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body := make([]byte, 1024)
+	n, _ := resp.Body.Read(body)
+	s := string(body[:n])
+	// First source="X" attribute
+	if i := strings.Index(s, `source="`); i >= 0 {
+		rest := s[i+8:]
+		if j := strings.IndexByte(rest, '"'); j >= 0 {
+			return rest[:j], nil
+		}
+	}
+	return "", fmt.Errorf("source attribute not found")
+}
+
+// PresetKey simulates a physical preset key press.
+//
+//	slot 1..6
+//	mode "p" = press&release, "ph" = press&hold
+func PresetKey(ctx context.Context, host string, slot int, mode string) error {
+	if mode == "" {
+		mode = "p"
+	}
+	_, err := Send(ctx, host, fmt.Sprintf("sys presetkey %d %s", slot, mode))
+	return err
+}
+
+// tapLabel makes a preset name safe as a quoted TAP CLI argument. The
+// tokeniser splits on the label's OWN quotes, so a station name like
+// `CFSM 107.5 "2Day FM"` turns the command into too many arguments and the
+// box stores nothing while the socket reports success. Newlines end
+// the command line early, same effect. A label that cleans down to nothing
+// gets the fallback, because an empty `""` is collapsed by the tokeniser
+// and shifts every following argument.
+func tapLabel(name, fallback string) string {
+	name = strings.NewReplacer("\"", "", "\n", " ", "\r", " ").Replace(name)
+	if name = strings.TrimSpace(name); name == "" {
+		return fallback
+	}
+	return name
+}
+
+// AddPreset stores a preset on the box so the hardware keys can trigger
+// a `nowSelectionUpdated` event with the ContentItem. We set all presets
+// as a UPNP source because that is what the box is most likely to accept
+// without a running STS worker.
+//
+// CLI syntax (from BoseApp strings):
+//
+//	ws AddPreset <SOURCE> <TYPE> <LOCATION> <LABEL> <SOURCEACCOUNT> <PRESETID>
+func AddPreset(ctx context.Context, host string, slot int, name, streamURL string) error {
+	// LABEL must be in quotes, otherwise the box splits it at the space.
+	// LOCATION should have no quotes.
+	cmd := fmt.Sprintf(`ws AddPreset UPNP audio %s "%s" UPnPUserName %d`,
+		streamURL, tapLabel(name, fmt.Sprintf("Preset %d", slot)), slot)
+	out, err := Send(ctx, host, cmd)
+	if err != nil {
+		return err
+	}
+	// The TAP CLI answers a REJECTED AddPreset with an error line and a clean
+	// socket, so "no transport error" does not mean the slot was written. The
+	// native path below learned this in 2026-08 and checks its reply; this one
+	// never did, and threw the answer away entirely.
+	//
+	// What that cost: the firmware refuses this write while the box sits on a
+	// source it will not take a UPnP preset for, answering "AddPreset - failed
+	// due to invalid SourceID". STM counted it as done, so the forced pass
+	// that had just waited five minutes for the music to stop believed the
+	// hardware keys were registered when nothing had been stored, and nothing
+	// retried. The owner sees six keys that do nothing and a preset that keeps
+	// coming back as it was (reported 2026-09-25).
+	if reply := strings.TrimSpace(out); nativeAddRejected(reply) {
+		return fmt.Errorf("box refused the preset for slot %d: %s", slot, firstLine(reply))
+	}
+	return nil
+}
+
+// AddPresetRaw writes a preset for an arbitrary source/type/location/account,
+// not just STM's UPnP streams. Used to restore an account-linked preset the box
+// dropped (e.g. a Deezer playlist) back onto its original slot, so the box plays
+// it again via its own cached account token. Inputs are sanitised for the TAP
+// CLI (no quotes/newlines that would break tokenisation).
+func AddPresetRaw(ctx context.Context, host string, slot int, source, typ, location, name, account string) error {
+	clean := func(s string) string {
+		return strings.NewReplacer("\"", "", "\n", " ", "\r", " ").Replace(strings.TrimSpace(s))
+	}
+	source = clean(source)
+	typ = clean(typ)
+	location = clean(location)
+	account = clean(account)
+	name = tapLabel(name, fmt.Sprintf("Preset %d", slot))
+	if source == "" || location == "" || slot < 1 || slot > 6 {
+		return fmt.Errorf("AddPresetRaw: source, location and slot 1..6 required")
+	}
+	if typ == "" {
+		typ = "audio"
+	}
+	if account == "" {
+		account = source + "UserName"
+	}
+	cmd := fmt.Sprintf(`ws AddPreset %s %s %s "%s" %s %d`, source, typ, location, name, account, slot)
+	_, err := Send(ctx, host, cmd)
+	return err
+}
+
+// RemovePreset deletes the box preset slot.
+func RemovePreset(ctx context.Context, host string, slot int) error {
+	_, err := Send(ctx, host, fmt.Sprintf("ws RemovePreset %d", slot))
+	return err
+}
+
+// diagLogger receives the diagnostics this package cannot return through its
+// existing signatures (the per-slot native-preset fallback). nil until wired,
+// which keeps every existing caller and the tests unchanged.
+var diagLogger *slog.Logger
+
+// SetDiagLogger wires the logger used for per-slot preset diagnostics.
+func SetDiagLogger(l *slog.Logger) { diagLogger = l }
+
+// AddPresetNative stores a preset as a native LOCAL_INTERNET_RADIO station
+// instead of a UPnP stream. This is the difference between a hardware key the
+// box can press itself and one it refuses.
+//
+// A UPNP preset makes the box answer its own key press with 1036
+// UNABLE_TO_PROCESS_NOT_LOGGED_IN / UpnpRcvdContentItemInWrongState, because
+// UPNP is the box's local MediaRenderer and never reports itself available (it
+// stays status="UNAVAILABLE" in GET /sources even while it is the playing
+// source). Everything STM does to recover from that - clearing the transport,
+// re-pushing, verifying - exists only because of it, and it costs ~8 s per
+// press. A LOCAL_INTERNET_RADIO station registered through the emulated
+// account is READY, so the box activates it itself in about 2 s and STM does
+// not have to intervene at all.
+//
+// location must be the orion station location built by
+// webui.OrionStationLocation, RELATIVE to the BMX service baseUrl. The source
+// account is deliberately EMPTY: that is what the firmware itself reports for
+// this source, and any other value puts it back in the refusing state.
+func AddPresetNative(ctx context.Context, host string, slot int, name, location string) error {
+	if location == "" || slot < 1 || slot > 6 {
+		return fmt.Errorf("AddPresetNative: location and slot 1..6 required")
+	}
+	// The account argument is the literal "none", and that detail is the whole
+	// difference between a working migration and six dead hardware keys.
+	//
+	// This source needs an EMPTY sourceAccount, but the TAP CLI cannot be given
+	// one: `""` is collapsed by its tokeniser, so the box answers "Incorrect
+	// number of arguments. 6 required, 5 supplied." and stores nothing - while
+	// the socket still reports success, which is what made an earlier attempt
+	// log six healed slots over an empty preset list. Measured on an ST10
+	// (2026-08-02): "none" occupies the argument and the firmware stores
+	// sourceAccount="" from it, which is exactly the shape that plays.
+	cmd := fmt.Sprintf(`ws AddPreset LOCAL_INTERNET_RADIO stationurl %s "%s" none %d`,
+		location, tapLabel(name, fmt.Sprintf("Preset %d", slot)), slot)
+	out, err := Send(ctx, host, cmd)
+	if err != nil {
+		return err
+	}
+	// The TAP CLI answers a rejected AddPreset with a usage/error line and a
+	// zero exit at the socket level, so "no transport error" does NOT mean the
+	// slot was written: an early attempt reported six successful syncs while
+	// the box stored nothing at all. Surface the reply so the caller can fall
+	// back, and so a diagnostic bundle shows what the box said.
+	if reply := strings.TrimSpace(out); nativeAddRejected(reply) {
+		return fmt.Errorf("box refused the native preset for slot %d: %s", slot, firstLine(reply))
+	}
+	return nil
+}
+
+// nativeAddRejected reports whether a TAP reply to AddPreset indicates the
+// command was not accepted. Matching is deliberately loose and case-insensitive:
+// the firmware's wording differs per chassis, and treating an unrecognised
+// complaint as success is the failure mode that hides a dead hardware key.
+func nativeAddRejected(reply string) bool {
+	l := strings.ToLower(reply)
+	// "Incorrect number of arguments" is the observed rejection wording and the
+	// one that previously passed as success.
+	for _, bad := range []string{"incorrect number", "usage", "error", "invalid", "unknown", "fail", "not supported", "wrong state"} {
+		if strings.Contains(l, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexAny(s, "\r\n"); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
+// PresetSpec is a box preset specification for SyncAllPresets.
+type PresetSpec struct {
+	Slot      int    // 1..6
+	Name      string // displayed name (quoted if it contains a space)
+	StreamURL string // direct stream URL for UPnP
+	// NativeLocation, when set, stores the slot as a native
+	// LOCAL_INTERNET_RADIO station instead of a UPnP stream. Empty means the
+	// caller could not confirm the box has that source registered, and the
+	// UPnP form is used.
+	NativeLocation string
+}
+
+// SyncAllPresets sends all presets to the box, natively where the box has the
+// radio source registered and as UPnP ContentItems everywhere else. Should run
+// after a box boot (the box needs ~10s until the CLI server has come up) and
+// whenever the stick preset store is updated.
+//
+// errs is a map of slot -> error for individual slots; continued after
+// errors.
+// WriteGap is the pause between two preset writes.
+//
+// Every AddPreset is its own TAP connection, and six of them back to back is
+// exactly what the losing sweeps looked like on an ST10: the first writes of
+// the first sweep after a boot were accepted and then not stored, while the
+// same commands succeeded moments later. Spacing them costs about a second
+// across a full sweep and removes a whole class of silent loss. It is a
+// variable so a test can drop it to zero.
+var WriteGap = 250 * time.Millisecond
+
+func SyncAllPresets(ctx context.Context, host string, presets []PresetSpec) map[int]error {
+	errs := map[int]error{}
+	for i, p := range presets {
+		if p.StreamURL == "" || p.Slot < 1 || p.Slot > 6 {
+			continue
+		}
+		if i > 0 && WriteGap > 0 {
+			select {
+			case <-ctx.Done():
+				return errs
+			case <-time.After(WriteGap):
+			}
+		}
+		c, cancel := context.WithTimeout(ctx, 4*time.Second)
+		var err error
+		if p.NativeLocation != "" {
+			err = AddPresetNative(c, host, p.Slot, p.Name, p.NativeLocation)
+			if err != nil {
+				// Never leave a slot empty because the native form was
+				// refused: a working key that costs a recovery round beats a
+				// dead one. Say so, though - a silent fallback would look
+				// exactly like a successful migration in a bundle.
+				if diagLogger != nil {
+					diagLogger.Warn("native preset refused by the box, storing the UPnP form for this slot instead",
+						"slot", p.Slot, "err", err)
+				}
+				err = AddPreset(c, host, p.Slot, p.Name, p.StreamURL)
+			}
+		} else {
+			err = AddPreset(c, host, p.Slot, p.Name, p.StreamURL)
+		}
+		if err != nil {
+			errs[p.Slot] = err
+		}
+		cancel()
+	}
+	return errs
+}

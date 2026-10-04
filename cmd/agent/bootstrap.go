@@ -1,0 +1,666 @@
+// Boot-time self-heal: stick and NAND bootstrap sync, reboot policy,
+// version stamping, region and box-name plumbing, and sshd.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io/fs"
+	"log/slog"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxapi"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/tlsgen"
+	usbstick "github.com/jcbenitezhe/SoundTouchManager/usb-stick"
+)
+
+// loadRegion reads the country code from region.txt on the stick. Empty
+// if the file does not exist or is empty; in that case the app later falls
+// back to the browser/user default.
+func loadRegion(path string, logger *slog.Logger) string {
+	if path == "" {
+		return ""
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		logger.Debug("region file not readable", "path", path, "err", err)
+		return ""
+	}
+	cc := ""
+	for _, r := range string(b) {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			cc += string(r)
+		}
+	}
+	if len(cc) < 2 {
+		return ""
+	}
+	cc = cc[:2]
+	// Uppercase
+	out := ""
+	for _, r := range cc {
+		if r >= 'a' && r <= 'z' {
+			r = r - 32
+		}
+		out += string(r)
+	}
+	logger.Info("region loaded", "country", out)
+	return out
+}
+
+// trustRepairAttempts are the delays after agent start at which the trust
+// store is checked. The boot script mounts its own overlay AFTER starting the
+// agent: it waits for the root CA (up to 20s) and then mounts, so checking
+// before that would inspect a store the script is about to replace. The first
+// delay clears that window with room to spare; the second covers a boot slow
+// enough to miss it. Two bounded attempts, not a poll: this corruption is
+// created at boot and never mid-run.
+var trustRepairAttempts = []time.Duration{60 * time.Second, 5 * time.Minute}
+
+// repairTrustStoreWhenBootstrapIsDone checks the box's trust stores once the
+// boot script has finished with them and rebuilds any that lost the vendor's
+// public roots. Stops as soon as every store is healthy, which on a healthy
+// box is the first look.
+func repairTrustStoreWhenBootstrapIsDone(ctx context.Context, caDir string, logger *slog.Logger) {
+	for _, delay := range trustRepairAttempts {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		results := tlsgen.RepairTrustStore(tlsgen.ReadRootCAPEM(caDir), logger)
+		if !trustStoresHealthy(results) {
+			continue // still broken and unrepairable; the next attempt may find it settled
+		}
+		// The store on disk is healthy. That is NOT the same as this process
+		// trusting those roots: Go caches the system store once per process,
+		// and the boot script mounts the overlay after the agent has already
+		// started and reached for TLS. A speaker in exactly that state reports
+		// both stores healthy and still fails every https station (ST20 field
+		// bundle, 2026-08-14, which is what "restart only when I changed
+		// something" missed: nothing needed changing, the cache was simply
+		// older than the store).
+		if effective, ok := tlsgen.RootsEffectiveInProcess(tlsgen.DefaultTrustStorePaths); ok && !effective {
+			restartForStaleTrustCache(logger)
+		}
+		return
+	}
+}
+
+// trustRestartStamp marks that this boot has already restarted for a repair.
+// On tmpfs: it must not survive a reboot, because a fresh boot rebuilds the
+// broken overlay and legitimately earns another restart.
+const trustRestartStamp = "/tmp/stmanager-trust-restarted"
+
+// restartForStaleTrustCache exits so the boot script's watchdog respawns the
+// agent, and with it the Spotify engine, on a trust store both can actually
+// read.
+//
+// This is the only lever there is. Go caches the system trust store once per
+// process, nothing re-reads it, and the Spotify engine is a separate process
+// STM does not control from the inside. Repairing the file changes what is on
+// disk and nothing about what either process trusts until both are new.
+//
+// Restarting is safe here in a way it would not be normally: a speaker that
+// reaches this path cannot reach anything over https, so there is no stream to
+// interrupt. Guarded to once per boot, because a restart that keeps repeating
+// is worse than a speaker that trusts nothing.
+func restartForStaleTrustCache(logger *slog.Logger) {
+	if _, err := os.Stat(trustRestartStamp); err == nil {
+		logger.Warn("the trust store still is not effective after a restart this boot, not restarting again (something is rebuilding it)")
+		return
+	}
+	if err := os.WriteFile(trustRestartStamp, []byte(time.Now().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+		logger.Warn("trust store repair: cannot write the restart guard, staying up rather than risking a restart loop", "err", err)
+		return
+	}
+	logger.Warn("the trust store on disk is healthy but this process does not trust those roots, restarting so it and the Spotify engine read the current store (Go caches it once per process)")
+	// Flush before pulling the rug out, the same way every other exit path
+	// here does.
+	_ = exec.Command("sync").Run()
+	time.Sleep(500 * time.Millisecond)
+	os.Exit(0)
+}
+
+// trustStoresHealthy reports whether every store either carries public roots
+// or does not exist on this chassis. A store we could not fix keeps the
+// retry alive; one we did fix ends it.
+func trustStoresHealthy(results []tlsgen.TrustRepairResult) bool {
+	for _, r := range results {
+		switch r.Outcome {
+		case tlsgen.TrustRepairHealthy, tlsgen.TrustRepairAbsent, tlsgen.TrustRepairRepaired:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// syncRunOverrideFromStick keeps the NAND run-override.sh in sync with
+// the run.sh on the stick. Important: rc.local prioritises NAND over the
+// stick, so a stale NAND script would ignore the new setup wizard features
+// (name.conf, region.conf, etc.).
+//
+// If the files are identical: no-op (no flash writes).
+func syncRunOverrideFromStick(logger *slog.Logger) {
+	const stickPath = "/media/sda1/run.sh"
+	const nandPath = "/mnt/nv/stmanager/run-override.sh"
+
+	time.Sleep(5 * time.Second) // give the stick time to mount
+
+	stickData, err := os.ReadFile(stickPath)
+	if err != nil {
+		logger.Debug("run.sh on stick not readable, skipping sync", "err", err)
+		return
+	}
+	nandData, _ := os.ReadFile(nandPath)
+	if len(nandData) > 0 && bytesEqual(stickData, nandData) {
+		return // already identical
+	}
+	tmp := nandPath + ".new"
+	if err := os.WriteFile(tmp, stickData, 0o755); err != nil {
+		logger.Warn("run-override.sh sync write failed", "err", err)
+		return
+	}
+	if err := os.Rename(tmp, nandPath); err != nil {
+		logger.Warn("run-override.sh sync rename failed", "err", err)
+		os.Remove(tmp)
+		return
+	}
+	logger.Info("run-override.sh updated on NAND from stick", "bytes", len(stickData))
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// applyPendingBoxName applies a box name left by the setup wizard once to the
+// Bose box, verbatim. The name is one the user deliberately typed for this
+// speaker during setup, so it is used exactly as chosen: appending the DeviceID
+// as a UID suffix here made the user's own name look untidy on every install and
+// update. Duplicate-name disambiguation is the caller's concern (the
+// user simply gives two speakers two different names); STM does not second-guess
+// a name the user picked. On success the file is deleted.
+func applyPendingBoxName(ctx context.Context, boxHost, path string, logger *slog.Logger) {
+	if boxHost == "" || path == "" {
+		return
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		// no file, nothing to apply
+		return
+	}
+	raw := strings.TrimSpace(string(b))
+	if raw == "" {
+		_ = os.Remove(path)
+		return
+	}
+	wanted := raw
+	// The box must be reachable. Wait until the BoseApp web server is up.
+	time.Sleep(10 * time.Second)
+	c := boxapi.New(boxHost)
+	for attempt := 0; attempt < 12; attempt++ {
+		callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := c.SetName(callCtx, wanted)
+		cancel()
+		if err == nil {
+			logger.Info("setup wizard box name applied", "name", wanted)
+			_ = os.Remove(path)
+			return
+		}
+		logger.Debug("box name set failed, will retry", "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+	logger.Warn("could not set box name from setup, giving up", "path", path)
+}
+
+// ensureSshdRunning starts sshd when, and only when, this speaker has been
+// opted in to it.
+//
+// It used to try unconditionally, on the stated pre-1.0 preference for
+// diagnostic access over the residual risk of the known-default Bose root
+// password. In practice that preference was not being honoured: Bose's
+// /etc/init.d/sshd gates on a remote_services marker and exits 0 while
+// declining to start, the loop read the exit status as success and returned,
+// and sshd stayed down. The log said "sshd started" the whole time.
+//
+// Fixing that log line turned the silent no-op into a real start, because the
+// loop then fell through to /usr/sbin/sshd, which has no gate. Five speakers
+// in the reference household came up with port 22 open, and the app told their
+// owner to reboot to close it, which the next boot would have undone
+// (2026-09-28). A logging fix is not the place to change what a speaker
+// exposes to its network.
+//
+// So it is an opt-in now, keyed on the same two markers the app already reads
+// to decide whether SSH is deliberately open: /mnt/nv/stmanager/enable-ssh and
+// /mnt/nv/remote_services. A speaker nobody asked keeps its port closed, and
+// the diagnostic channel is one deliberate action away rather than always on.
+//
+// bootstrapTargets lists the on-NAND files the agent will replace
+// when their disk content differs from what is embedded in the
+// agent binary. /mnt/nv/rc.local is read once by /etc/init.d/
+// shelby_local at boot; /mnt/nv/stmanager/run-override.sh is what
+// that rc.local exec's. Both must stay in sync with the agent
+// version so the boot path uses the same shim / WLAN / gate logic
+// the running agent expects.
+var bootstrapTargets = []struct {
+	embedded string
+	target   string
+	desc     string
+}{
+	{"run.sh", "/mnt/nv/stmanager/run-override.sh", "boot bootstrap script"},
+	{"rc.local", "/mnt/nv/rc.local", "shelby_local entry point"},
+}
+
+// syncBootstrapFromEmbedded compares the bootstrap files embedded
+// in this agent binary against the on-NAND copies and replaces any
+// that differ. Runs once on agent startup. Atomic via tmp-file +
+// rename; on any failure we leave the existing file in place and
+// log so the next diagnostic bundle captures the reason. Skipped
+// silently in dev environments where /mnt/nv does not exist.
+func syncBootstrapFromEmbedded(logger *slog.Logger) (changed bool) {
+	if _, err := os.Stat("/mnt/nv"); err != nil {
+		// Not on the box (developer machine, CI). No-op.
+		return false
+	}
+	stickFS := usbstick.Files()
+	for _, t := range bootstrapTargets {
+		embedded, err := fs.ReadFile(stickFS, t.embedded)
+		if err != nil {
+			logger.Warn("bootstrap sync: embedded file not readable",
+				"name", t.embedded, "err", err)
+			continue
+		}
+		current, _ := os.ReadFile(t.target)
+		if bytes.Equal(embedded, current) {
+			// Already current. Quiet path.
+			continue
+		}
+		// Ensure parent directory exists. /mnt/nv/stmanager may be
+		// missing on a freshly-flashed-and-reset box that still has
+		// the old rc.local but no stmanager dir tree yet.
+		if i := strings.LastIndex(t.target, "/"); i > 0 {
+			_ = os.MkdirAll(t.target[:i], 0o755)
+		}
+		tmp := t.target + ".stm-bootstrap-sync"
+		_ = os.Remove(tmp) // tolerate stale tmp from a previous crashed run
+		if err := os.WriteFile(tmp, embedded, 0o755); err != nil {
+			logger.Warn("bootstrap sync: write failed",
+				"tmp", tmp, "err", err)
+			continue
+		}
+		if err := os.Rename(tmp, t.target); err != nil {
+			logger.Warn("bootstrap sync: atomic rename failed, leaving old in place",
+				"tmp", tmp, "target", t.target, "err", err)
+			_ = os.Remove(tmp)
+			continue
+		}
+		// WARN so a diagnostic bundle pinpoints the boot where the
+		// bootstrap layer caught up. The replacement only takes effect
+		// on the NEXT boot: this boot's already-running shelby_local
+		// and run-override.sh are whatever they were before the sync.
+		logger.Warn("bootstrap sync: replaced on-NAND file with embedded copy",
+			"target", t.target,
+			"desc", t.desc,
+			"oldBytes", len(current),
+			"newBytes", len(embedded),
+			"effective", "next boot")
+		changed = true
+	}
+	return changed
+}
+
+// bootstrapRebootStampPath records the fingerprint of the embedded
+// bootstrap set we last rebooted for. It is the loop breaker: if a
+// NAND write silently fails to persist, syncBootstrapFromEmbedded
+// would report "changed" on every boot, and an unconditional
+// post-sync reboot would turn that into a boot loop that bricks the
+// box. We reboot at most once per embedded fingerprint.
+const bootstrapRebootStampPath = "/mnt/nv/stmanager/.stm-bootstrap-reboot-stamp"
+
+// embeddedBootstrapStamp is a stable fingerprint of the bootstrap
+// files embedded in THIS binary. It changes only when the embedded
+// run.sh / rc.local change, i.e. across agent releases that touch the
+// boot path. Returns "" if the embedded files cannot be read, in
+// which case the caller must not reboot (it cannot guard the loop).
+func embeddedBootstrapStamp() string {
+	h := sha256.New()
+	stickFS := usbstick.Files()
+	for _, t := range bootstrapTargets {
+		b, err := fs.ReadFile(stickFS, t.embedded)
+		if err != nil {
+			return ""
+		}
+		_, _ = h.Write([]byte(t.embedded))
+		_, _ = h.Write(b)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// coprocessorWLANMode returns the box's wlan-mode when its Wi-Fi is driven by
+// the BCO coprocessor rather than by Linux, and "" otherwise. run.sh writes
+// this file at every boot from its own chassis detection; the values are
+// "bco", "taigan-bco", "wlan0", "wlan1" and "ethernet-only".
+//
+// On the two coprocessor values the Wi-Fi does not belong to the kernel at all:
+// it is programmed over the USB bridge from AirplayConfiguration.xml, and the
+// only thing that reprograms it is a boot. Records what that looks like
+// when it goes wrong on this chassis: the speaker comes up without an
+// association, Ethernet recovers it instantly, and Wi-Fi is orange until
+// somebody intervenes.
+//
+// So a reboot here is not the cheap operation it is on a chassis where
+// wpa_supplicant owns the radio, and this one is STACKED on the reboot the
+// update already took. It buys almost nothing since the hands-off boot of
+// v0.9.7 (below), so the trade is not close.
+//
+// NOT because a Lifestyle needs its plug pulled after a restart: that reporter
+// was investigated the same day and his speaker is a different chassis whose
+// Wi-Fi was healthy throughout. It simply takes 108 seconds to shut down where
+// a SoundTouch 10 takes 13, and the app gave up waiting after 35. Recorded here
+// because that wrong explanation was in this comment first.
+//
+// An unreadable or unknown mode returns "", i.e. the caller keeps its old
+// behaviour. This gate must never turn a chassis we cannot classify into one
+// that silently stops updating its boot path.
+func coprocessorWLANMode() string { return coprocessorWLANModeAt(wlanModePath) }
+
+// wlanModePath is the on-NAND file run.sh writes its chassis verdict to. A
+// variable so the test can point it at a temp file.
+var wlanModePath = "/mnt/nv/stmanager/wlan-mode"
+
+func coprocessorWLANModeAt(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	switch mode := strings.TrimSpace(string(b)); mode {
+	case "bco", "taigan-bco":
+		return mode
+	}
+	return ""
+}
+
+// maybeRebootAfterBootstrapSync reboots the box once so a freshly
+// written run-override.sh / rc.local take effect immediately instead
+// of on the user's next manual power-cycle. This is the "STM reboots
+// itself into a clean state" path: after a stick install or agent OTA
+// the running boot used the OLD scripts; one clean reboot lands the
+// box on the boot path that matches the running binary.
+//
+// NOT on a coprocessor Wi-Fi chassis. This reboot is stacked on the OTA's own
+// reboot, and on those boxes a soft reboot is exactly what can leave the Wi-Fi
+// chip unassociated, with no way back except pulling the plug. It was written
+// in May 2026, when run.sh still provisioned Wi-Fi on every boot and having the
+// new script live one boot earlier mattered. Since the hands-off boot of v0.9.7
+// a normal boot's run.sh does no Wi-Fi work at all, so waiting for the next
+// natural boot costs nothing, and the difference only becomes visible at all on
+// a release that changes run.sh.
+//
+// The cost of getting that trade wrong is not symmetric, and v0.9.77 is what
+// showed it: run.sh had been byte-identical from v0.9.70 through v0.9.76, so
+// this reboot had not fired for seven releases. v0.9.77 changed run.sh, every
+// updating box therefore took a second reboot minutes after the first, and a
+// SoundTouch 20 came back on Ethernet only and never returned to Wi-Fi.
+//
+// Guarded so it can never loop:
+//   - If the embedded fingerprint cannot be computed, do not reboot.
+//   - If we already rebooted for exactly this fingerprint (marker
+//     matches) yet the sync still reported a change, the NAND write is
+//     not persisting; rebooting again would loop, so we stay up in a
+//     degraded state and log loudly instead.
+func maybeRebootAfterBootstrapSync(logger *slog.Logger) {
+	if mode := coprocessorWLANMode(); mode != "" {
+		logger.Warn("bootstrap reboot: skipped on a coprocessor Wi-Fi chassis, the refreshed boot path takes effect on this speaker's next boot instead",
+			"wlanMode", mode)
+		return
+	}
+	stamp := embeddedBootstrapStamp()
+	if stamp == "" {
+		logger.Warn("bootstrap reboot: skipped, cannot fingerprint embedded boot files (no loop guard possible)")
+		return
+	}
+	if prev, err := os.ReadFile(bootstrapRebootStampPath); err == nil &&
+		strings.TrimSpace(string(prev)) == stamp {
+		logger.Error("bootstrap reboot: on-NAND boot files STILL differ after a prior reboot for this exact version - the NAND write is not persisting; refusing to reboot again to avoid a boot loop, continuing on the stale boot path",
+			"stamp", stamp)
+		return
+	}
+	if err := os.WriteFile(bootstrapRebootStampPath, []byte(stamp+"\n"), 0o644); err != nil {
+		logger.Warn("bootstrap reboot: could not persist loop-guard stamp, refusing to reboot",
+			"path", bootstrapRebootStampPath, "err", err)
+		return
+	}
+	logger.Warn("bootstrap reboot: boot path was refreshed, rebooting once so the new run-override.sh/rc.local run this cycle instead of waiting for a manual power-cycle",
+		"stamp", stamp)
+	// A reboot fired seconds after boot — stacked on the install/bootstrap/OTA
+	// reboot — trips Bose's shepherdd watchdog into --recovery mode, where the
+	// Bose services never start and radio cannot play until a manual power-cycle
+	// (the box shows the alternating amber LED pattern). First seen on the lisa
+	// chassis (Wave, SA-4) and now confirmed on ginger (SoundTouch 300,
+	// reported 2026-07-11 after a v0.9.4 OTA). Wait for the Bose stack to come up
+	// first so shepherd marks this boot successful and resets its crash-loop
+	// counter; the reboot that follows is then a clean single reboot.
+	settleBeforeFragileReboot(logger)
+	// Flush pending writes (the stick log, the bootstrap files and the
+	// guard stamp on NAND) before we pull the rug out. busybox `sync`
+	// keeps this portable at compile time, matching the reboot exec.
+	_ = exec.Command("sync").Run()
+	time.Sleep(2 * time.Second)
+	if err := exec.Command("reboot").Run(); err != nil {
+		logger.Error("bootstrap reboot: reboot command failed, continuing on stale boot path", "err", err)
+	}
+}
+
+// boxVariant returns the Bose chassis codename from /proc/variant (e.g. "lisa",
+// "taigan", "rhino", "mojo"), lowercased, or "" when it cannot be read.
+func boxVariant() string {
+	b, err := os.ReadFile("/proc/variant")
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(string(b)))
+}
+
+// verifiedFastRebootChassis are the Bose chassis codenames Jens has
+// hardware-verified to survive a stacked early-boot reboot without shepherdd
+// entering --recovery, so they skip the settle wait and reboot immediately.
+// Every OTHER chassis (lisa/Wave/SA-4, ginger/ST300, and any unknown or
+// unreadable variant) waits for the Bose stack first: the amber-recovery trip
+// turned out NOT to be lisa-only, so the safe default is to settle unless a
+// chassis is on this proven-fast allowlist.
+var verifiedFastRebootChassis = map[string]bool{
+	// rhino (ST10) was removed 2026-07-14: two field ST10s went network-unstable
+	// on an OTA reboot until a manual power-cycle, the same shepherdd
+	// --recovery trip as lisa and ginger/ST300 (a56b0ae). Three of this
+	// allowlist's assumptions have now been disproven, so only chassis with
+	// repeated first-hand confirmation stay: mojo and taigan have each survived
+	// many stacked reboots on Jens' own boxes. The settle wait is a cheap
+	// best-effort with no downside on a genuinely fast box.
+	"mojo":   true, // SoundTouch 30 (scm/sm2)
+	"taigan": true, // SoundTouch Portable
+}
+
+// settleBeforeFragileReboot delays a STM-initiated early-boot reboot until the
+// Bose service stack has come up on this boot, so a reboot stacked on the
+// install/bootstrap/OTA reboot does not trip shepherdd into --recovery mode
+// (the alternating amber LED lockup that needs a manual power-cycle, lisa +
+// ginger/ST300). Waiting for :8090 to answer means shepherd has marked this boot
+// successful and reset its crash-loop counter. Skipped on the hardware-verified
+// fast chassis; best-effort everywhere else — after the settle window it reboots
+// anyway.
+func settleBeforeFragileReboot(logger *slog.Logger) {
+	variant := boxVariant()
+	if verifiedFastRebootChassis[variant] {
+		return
+	}
+	const (
+		maxWait = 100 * time.Second
+		grace   = 5 * time.Second
+	)
+	logger.Info("bootstrap reboot: waiting for the Bose stack (:8090) before rebooting so shepherdd does not enter recovery (#372)", "variant", variant)
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if dialable("127.0.0.1", 8090) {
+			logger.Info("bootstrap reboot: Bose stack is up (:8090); shepherd boot marked healthy, proceeding with a single clean reboot")
+			time.Sleep(grace) // let shepherd finish marking the boot successful
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	logger.Warn("bootstrap reboot: Bose stack did not come up within the settle window; rebooting anyway (best-effort)", "variant", variant)
+}
+
+// stampVersionFiles writes this binary's version (semver + build stamp)
+// to the on-box version.txt files so the desktop always sees the
+// version that is actually running, not whatever the last stick-prep
+// wrote. Without it, an OTA (which replaces only the binary) left
+// version.txt at the old build and the box kept reporting the
+// pre-update version. NAND is the reliable target; the FAT32
+// stick copy is best-effort (one small write, not in the boot-critical
+// path). Atomic via tmp + rename; skipped where the parent dir is
+// absent (dev host, no stick).
+func stampVersionFiles(logger *slog.Logger) {
+	stamp := version
+	if buildStamp != "" && buildStamp != "dev" {
+		stamp = version + "+" + buildStamp
+	}
+	for _, p := range []string{"/mnt/nv/stmanager/version.txt", "/media/sda1/version.txt"} {
+		dir := p[:strings.LastIndex(p, "/")]
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		tmp := p + ".stm-new"
+		if err := os.WriteFile(tmp, []byte(stamp+"\n"), 0o644); err != nil {
+			logger.Debug("version stamp: write failed", "path", p, "err", err)
+			continue
+		}
+		if err := os.Rename(tmp, p); err != nil {
+			logger.Debug("version stamp: rename failed", "path", p, "err", err)
+			_ = os.Remove(tmp)
+		}
+	}
+}
+
+// Best-effort: if sshd is already running, the init script
+// no-ops; if no sshd init script exists (unexpected on Bose
+// firmware), we just log and continue.
+// sshOptInMarkers are the files that mean "this speaker is meant to be
+// reachable over SSH". Both live on NAND and survive a reboot, and both are
+// what internal/webui reads to tell the app that SSH is deliberately open.
+var sshOptInMarkers = []string{
+	"/mnt/nv/stmanager/enable-ssh",
+	"/mnt/nv/remote_services",
+}
+
+// sshOptedIn reports whether one of those markers is present.
+func sshOptedIn() bool {
+	for _, p := range sshOptInMarkers {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureSshdRunning(logger *slog.Logger) {
+	if !sshOptedIn() {
+		// Nothing to say on the happy path: this is every speaker, every boot,
+		// and a line per boot on every box in the field is wear for no reader.
+		return
+	}
+	// Cheap pre-check: avoid spawning the init script if sshd is
+	// already up - saves a fork on every agent restart.
+	if out, err := exec.Command("pidof", "sshd").Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return
+	}
+	for _, attempt := range [][]string{
+		{"/etc/init.d/sshd", "start"},
+		{"/usr/sbin/sshd"},
+	} {
+		cmd := exec.Command(attempt[0], attempt[1:]...)
+		if err := cmd.Run(); err != nil {
+			continue
+		}
+		// Exit zero is not the same as a running sshd, and on this firmware it
+		// regularly is not: Bose's /etc/init.d/sshd gates on a remote_services
+		// marker and exits 0 while declining to start. The agent believed it and
+		// logged "sshd started" on three speakers that had nothing listening on
+		// 22 at all, which is a diagnostic saying the opposite of the truth and a
+		// desktop action (Reset speaker setup) walking into a handshake that
+		// could never connect. So the claim is now checked before it is made.
+		if sshdListening() {
+			logger.Info("sshd started", "via", attempt[0])
+			return
+		}
+		logger.Warn("sshd start: the init script reported success but nothing is listening on 22; SSH stays unavailable",
+			"via", attempt[0])
+	}
+	logger.Warn("sshd start: no usable init script found, SSH will not come up from agent")
+}
+
+// sshdListening reports whether something is actually accepting on port 22.
+//
+// pidof is not enough on its own: the process can exist while the daemon has
+// declined to bind. The listener table is the thing the desktop app's SSH
+// paths will meet, so it is the thing worth checking.
+func sshdListening() bool {
+	// A short grace: an init script returns before its daemon has bound.
+	for i := 0; i < 6; i++ {
+		if tcpPortListening(22) {
+			return true
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return false
+}
+
+// procNetTCPPaths is where the listener table is read from. A var so a test
+// can hand it a table instead of the running kernel's.
+var procNetTCPPaths = []string{"/proc/net/tcp", "/proc/net/tcp6"}
+
+// tcpPortListening reads /proc/net/tcp for a socket in LISTEN on port.
+// Procfs rather than a dial, so a firewall rule cannot turn a listening
+// daemon into "not listening".
+func tcpPortListening(port int) bool {
+	for _, path := range procNetTCPPaths {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(body), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) < 4 || f[3] != "0A" { // 0A = TCP_LISTEN
+				continue
+			}
+			local := f[1]
+			i := strings.LastIndex(local, ":")
+			if i < 0 {
+				continue
+			}
+			if v, err := strconv.ParseInt(local[i+1:], 16, 32); err == nil && int(v) == port {
+				return true
+			}
+		}
+	}
+	return false
+}

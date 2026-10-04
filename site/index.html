@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SoundTouch Manager: keep your Bose SoundTouch working without the cloud</title>
+  <meta name="description" content="Free, open-source app that brings back internet radio, presets, Spotify and remote control to Bose SoundTouch speakers after the Bose cloud shutdown.">
+  <link rel="alternate" hreflang="es" href="https://jcbenitezhe.github.io/SoundTouchManager/es/">
+  <link rel="alternate" hreflang="en" href="https://jcbenitezhe.github.io/SoundTouchManager/">
+  <meta property="og:title" content="SoundTouch Manager">
+  <meta property="og:description" content="Keep your Bose SoundTouch speakers working without the Bose cloud.">
+  <meta property="og:image" content="https://jcbenitezhe.github.io/SoundTouchManager/img/app-listen-en.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="wrap">
+      <a class="brand" href="./"><span class="logo" aria-hidden="true">STM</span>SoundTouch <em>Manager</em></a>
+      <nav>
+        <a href="#features">Features</a>
+        <a href="#install">Install</a>
+        <a href="#faq">FAQ</a>
+        <a href="#support">Support</a>
+        <a class="lang" href="es/" hreflang="es" lang="es">Español</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <div class="hero">
+      <h1>Your Bose SoundTouch, working again.</h1>
+      <p class="lead">Bose switched off the SoundTouch cloud on 6 May 2026. SoundTouch Manager brings back internet radio, the preset buttons, Spotify and remote control, all running locally on your speaker, with no account and no cloud.</p>
+      <div class="cta">
+        <a class="btn btn-primary" href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest">Download for Windows, macOS, Linux</a>
+        <a class="btn" href="https://github.com/jcbenitezhe/SoundTouchManager">View on GitHub</a>
+      </div>
+      <small>Free and open source (MIT license).</small>
+      <img class="shot" src="img/app-listen-en.png" width="2200" height="1560" alt="The SoundTouch Manager desktop app showing a speaker, the now-playing station and six preset keys">
+    </div>
+
+    <section id="features">
+      <h2>What it brings back</h2>
+      <div class="grid">
+        <div class="card"><h3>Internet radio</h3><p>Search thousands of stations from radio-browser.info and play them on any speaker.</p></div>
+        <div class="card"><h3>Preset buttons 1 to 6</h3><p>The hardware buttons on the speaker and remote work again, with the stations you choose.</p></div>
+        <div class="card"><h3>Spotify Connect</h3><p>Play Spotify on the speaker and save playlists to the preset buttons.</p></div>
+        <div class="card"><h3>Your own music</h3><p>Browse DLNA media servers on your network (FRITZ!Box, Synology, Plex, miniDLNA).</p></div>
+        <div class="card"><h3>Multiroom and stereo</h3><p>Group speakers to play in sync, or pair two as left and right.</p></div>
+        <div class="card"><h3>Phone remote</h3><p>Each speaker serves a remote for your phone's browser. No app store, no account.</p></div>
+      </div>
+    </section>
+
+    <section id="install">
+      <h2>Install in three steps</h2>
+      <ol class="steps">
+        <li><strong>Download the app</strong> for your computer from the <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest">latest release</a>.</li>
+        <li><strong>Open it on the same network as your speaker.</strong> It finds your SoundTouch speakers automatically.</li>
+        <li><strong>Choose "Set up speaker".</strong> The app installs a small agent onto the speaker over your home network. No USB stick needed; one remains available as a fallback.</li>
+      </ol>
+      <details>
+        <summary>Windows or macOS warns that the app is from an unknown developer</summary>
+        <p>A build that is not code-signed triggers a warning the first time you open it.</p>
+        <ul>
+          <li><strong>Windows (SmartScreen):</strong> click <em>More info</em>, then <em>Run anyway</em>.</li>
+          <li><strong>macOS (Gatekeeper):</strong> right-click the app, choose <em>Open</em>, then <em>Open</em> again. Or go to <em>System Settings, Privacy &amp; Security</em> and click <em>Open Anyway</em>.</li>
+        </ul>
+        <p>To check that your download is intact, compare its SHA-256 with the <code>SHA256SUMS</code> file attached to the same release.</p>
+      </details>
+    </section>
+
+    <section id="models">
+      <h2>Supported speakers</h2>
+      <table>
+        <thead><tr><th>Model</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>SoundTouch 10</td><td class="ok">Verified</td></tr>
+          <tr><td>SoundTouch 20</td><td class="ok">Works</td></tr>
+          <tr><td>SoundTouch 30</td><td class="ok">Works</td></tr>
+          <tr><td>SoundTouch Portable</td><td class="ok">Verified</td></tr>
+          <tr><td>SoundTouch 300, Wave III and IV, SA-4, SA-5, CineMate 520 and 130</td><td class="ok">Works (network install)</td></tr>
+        </tbody>
+      </table>
+      <p>Details per model: <a href="https://github.com/jcbenitezhe/SoundTouchManager/blob/main/docs/MODELS.md">docs/MODELS.md</a>.</p>
+    </section>
+
+    <section id="faq">
+      <h2>FAQ</h2>
+      <details>
+        <summary>Do I need a Bose account or the Bose app?</summary>
+        <p>No. Everything runs on your speaker and your computer, on your home network.</p>
+      </details>
+      <details>
+        <summary>Which speaker firmware do I need?</summary>
+        <p>SoundTouch Manager is built and tested against Bose firmware 27.0.6, the last one Bose released. Update the speaker first, then install. The <a href="https://github.com/jcbenitezhe/SoundTouchManager/blob/main/docs/FIRMWARE-UPDATE.md">firmware guide</a> explains how, using Bose's own images and a USB stick.</p>
+      </details>
+      <details>
+        <summary>The firmware update gets stuck or is refused</summary>
+        <p>Speakers on a much older firmware have been reported to refuse the jump straight to 27.0.6. What worked in the field was to go down first and then up: install <code>6.02.01</code>, then <code>27.0.6</code>. A factory reset (hold <strong>1</strong> and <strong>volume down</strong> for ten seconds) before the update can clear a half-configured state. These steps come from user reports and were not reproduced by the project; see section 4 of the <a href="https://github.com/jcbenitezhe/SoundTouchManager/blob/main/docs/FIRMWARE-UPDATE.md">firmware guide</a>.</p>
+      </details>
+      <details>
+        <summary>How do I remove it from a speaker?</summary>
+        <p>In the app, open the speaker's settings and choose <em>Remove STM</em>. A Bose factory reset alone does not remove it, so use this before you sell or give away a speaker.</p>
+      </details>
+      <details>
+        <summary>Something does not work</summary>
+        <p>Check the <a href="https://github.com/jcbenitezhe/SoundTouchManager/issues">open issues</a> or open a new one. In the app, <em>Save diagnostic logs</em> in the footer creates an anonymised report you can attach.</p>
+      </details>
+    </section>
+
+    <section id="support">
+      <h2>Support the project</h2>
+      <p>SoundTouch Manager is free. If it saved your speakers, a coffee helps keep it going.</p>
+      <div class="donate">
+        <a class="d-gh" href="https://github.com/sponsors/jcbenitezhe">GitHub Sponsors</a>
+        <a class="d-pp" href="https://www.paypal.com/paypalme/jcbenitezhe">PayPal</a>
+        <a class="d-kofi" href="https://ko-fi.com/jcbenitezhe">Ko-fi</a>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>SoundTouch Manager by Juan Carlos Benitez, based on <a href="https://github.com/JRpersonal/streborn">ST Manager (STM)</a> by Jens Roggenfelder. MIT license. Provided as is; use at your own risk.</p>
+      <p>"SoundTouch" and "Bose" are registered trademarks of Bose Corporation. SoundTouch Manager is an unofficial, community-built project, not affiliated with, endorsed by, or authorized by Bose.</p>
+      <p>Privacy: this site sets no cookies and uses no analytics. It is hosted by GitHub Pages, which may log visitor IP addresses; see the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>.</p>
+    </div>
+  </footer>
+</body>
+</html>

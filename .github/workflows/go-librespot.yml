@@ -1,0 +1,130 @@
+name: go-librespot
+
+# Builds the Spotify Connect receiver go-librespot (devgianlu, GPL-3.0)
+# from the fork vendored in third_party/go-librespot (which carries the
+# Ogg-passthrough) for the speaker target and attests it with Sigstore,
+# exactly like the STM agent. This keeps the bundled binary transparent and
+# reproducible: no opaque third-party blob ever ships to a user's speaker, and
+# the fork's source is in this repository. Primary Spotify backend
+# (docs/streaming/spotify.md); librespot.yml stays as a documented
+# fallback.
+#
+# Why go-librespot over librespot-org: it ships a local HTTP control API
+# (POST /player/play {uri}) so hardware preset buttons can recall a saved
+# Spotify playlist autonomously, with no phone app and no Spotify Web API
+# token stored on the box.
+#
+# STM-LEAN BUILD (pure Go, no cgo). STM runs the engine EXCLUSIVELY with the
+# pipe_passthrough backend (the legacy audio_output_pipe_passthrough flag is
+# still accepted as an alias), so the raw Ogg/Vorbis container is written to
+# the pipe and no decoding ever happens in the engine. The cgo decoders
+# (libvorbis/libogg for Vorbis, libFLAC for FLAC, libmpg123 for MP3) are
+# therefore dead weight, and this workflow strips them:
+#   - vorbis/decoder.go, flac/decoder.go, mp3/decoder.go and the ALSA output
+#     driver are replaced by pure-Go error stubs (same technique for all
+#     four, below);
+#   - .github/patches/go-librespot-cgo-free.patch swaps the last libogg use
+#     (the Spotify metadata-page extraction in vorbis/metadata.go) for a
+#     pure-Go Ogg first-page parser with tests, and pins the format selection
+#     to Vorbis whenever passthrough is on, so no selection path can route
+#     into a stripped decoder (FLAC requests fall back to the nearest-bitrate
+#     Vorbis file; a residual FLAC stream errors out cleanly, it cannot
+#     crash).
+# With the last cgo dependency gone the build is CGO_ENABLED=0 GOARM=5
+# (softfloat): fully static without any Alpine/musl machinery, and immune to
+# the latent-SIGILL class on early SoundTouch CPUs without working VFP that
+# the hardfloat arm/v7 cgo build carried (the exact failure class the agent
+# already avoids with GOARM=5).
+#
+# HARDWARE VERIFICATION REQUIRED for every engine built from a materially
+# changed source (an upstream merge, a passthrough change). Before it ships
+# to any user (embed, OTA, or a release), verify on a real speaker:
+#   1. Spotify Connect playback (start, pause, seek, track change),
+#   2. hardware preset recall of a saved Spotify preset,
+#   3. a FLAC/lossless selection attempt (must fall back to Vorbis playback
+#      or a clean error, never a crash or silent hang).
+# The first cgo-free softfloat engine passed this on the Portable on
+# 2026-08-01; release.yml's engine job uses the same lean recipe since
+# 2026-08-19 (it previously carried the hardfloat cgo/Alpine build, whose
+# latent-SIGILL class was the reason for the lean recipe).
+#
+# Run it from the Actions tab (workflow_dispatch). The artifact is the
+# attested go-librespot-armv7l plus its SHA256, for the on-box test. (The
+# name is the deployment name on the armv7 boxes; like the agent's
+# stmanager-armv7l it is a GOARM=5 softfloat binary.)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout STM (vendored engine source + cgo-free patch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Copy go-librespot (vendored fork) + strip cgo decoders
+        run: |
+          # The fork has the Ogg-passthrough (audio_output_pipe_passthrough)
+          # merged, so the source we ship is third_party/go-librespot plus the
+          # STM-lean strip below, all public and reviewable. The prep script
+          # patches with `git apply`, so the copy gets its own repository.
+          cp -R third_party/go-librespot go-librespot
+          git -C go-librespot init -q
+          echo "Built from third_party/go-librespot at STM commit $GITHUB_SHA"
+          mkdir -p dist
+
+          # The strip/stub/patch prep is shared with release.yml's engine job
+          # via one script, so the two lean builds cannot drift apart.
+          sh .github/scripts/golibrespot-lean-prep.sh
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go-librespot/go.mod
+          cache-dependency-path: go-librespot/go.sum
+
+      - name: Test the pure-Go Ogg parser
+        working-directory: go-librespot
+        run: CGO_ENABLED=0 go test ./vorbis/
+
+      - name: Build (pure Go, static, softfloat arm)
+        working-directory: go-librespot
+        # -buildvcs=false: the clone is shallow and the commit is logged in the
+        # clone step, so the VCS stamp is not needed. GOARM=5 = softfloat, see
+        # the header. CGO_ENABLED=0 makes the binary fully static by itself; no
+        # container, no QEMU, no musl toolchain.
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 \
+            go build -trimpath -buildvcs=false -ldflags "-s -w" \
+            -o ../dist/go-librespot-armv7l ./cmd/daemon
+
+      - name: Collect + checksum
+        run: |
+          chmod +x dist/go-librespot-armv7l
+          file dist/go-librespot-armv7l || true
+          if [ "$(head -c 4 dist/go-librespot-armv7l | xxd -p)" != "7f454c46" ]; then
+            echo "not an ELF binary" >&2
+            exit 1
+          fi
+          sha256sum dist/go-librespot-armv7l | tee dist/go-librespot-armv7l.sha256
+          echo "size: $(stat -c %s dist/go-librespot-armv7l) bytes"
+
+      - name: Attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/go-librespot-armv7l
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-librespot-armv7l
+          path: dist/*
+          if-no-files-found: error

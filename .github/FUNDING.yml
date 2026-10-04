@@ -1,0 +1,6 @@
+# Shows a "Sponsor" button on the repository page. Only list accounts that
+# exist. Keep in sync with DONATE_URLS in desktop-app/frontend/src/donate.js.
+github: jcbenitezhe
+ko_fi: jcbenitezhe
+custom:
+  - "https://www.paypal.com/paypalme/jcbenitezhe"
