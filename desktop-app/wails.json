@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "SoundTouch Manager",
+  "outputfilename": "SoundTouch Manager",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Juan Carlos Benitez",
+    "email": ""
+  },
+  "info": {
+    "companyName": "SoundTouch Manager",
+    "productName": "SoundTouch Manager",
+    "copyright": "Copyright (c) 2026",
+    "comments": "SoundTouch Manager - local control for Bose SoundTouch speakers after the cloud shutdown. Unofficial, not affiliated with or endorsed by Bose.",
+    "productVersion": "0.9.48.0"
+  }
+}

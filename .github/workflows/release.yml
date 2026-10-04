@@ -1,0 +1,1893 @@
+name: release
+
+# Triggered by signed tags vX.Y.Z. Produces:
+#   - stmanager-armv7l                  (stick agent for the Bose speaker hardware)
+#   - STM-Windows-vX.Y.Z.exe           (desktop app, Windows x64)
+#   - STM-macOS-vX.Y.Z.dmg             (desktop app, universal Mac binary inside a DMG)
+#   - STM-macOS-vX.Y.Z.zip             (same signed app, for the in-app update's bundle swap)
+#   - STM-Linux-x64-vX.Y.Z.tar.gz      (desktop app, Linux x64)
+#   - SHA256SUMS                       (combined checksums)
+#   - manifest.json                    (machine-readable index for the website)
+# Every artifact is attested via Sigstore (actions/attest-build-provenance).
+# Desktop app filenames carry the version so users can tell builds apart; the
+# website + in-app update resolve them through manifest.json's per-version
+# `url`. The stick agent binaries keep stable names, so
+# https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/<name>
+# still works for them.
+on:
+  # NOTE: there is deliberately NO tag-push trigger. The publish step creates
+  # the tag itself, and it does so with a PAT, which (unlike GITHUB_TOKEN) DOES
+  # start further workflow runs. A tag trigger therefore fired a SECOND full
+  # pipeline on the tag the first one had just created - and that second run
+  # had no `version` input, so the signing gate turned itself off, the
+  # sign-windows job was skipped, and the publish step happily uploaded the
+  # UNSIGNED Windows build over the signed one. That is exactly what happened
+  # to v0.9.22 (published 2026-07-27, found unsigned on 2026-07-28). Releases
+  # are cut with `gh workflow run release.yml -f version=vX.Y.Z`.
+  workflow_dispatch:
+    inputs:
+      version:
+        # Leave empty for a build-only dry-run: the full pipeline
+        # runs (verify-source, build-agent, all three desktop OS
+        # builds, Sigstore attestation of every artifact) but the
+        # final publish step is skipped. Use this after any
+        # Dependabot bump of a release-only action
+        # (attest-build-provenance, action-gh-release, or
+        # upload-artifact's release.yml usage pattern) to confirm
+        # the next real tag will work.
+        description: 'Release version (vX.Y.Z, e.g. v0.3.0). Leave empty for a build-only dry-run.'
+        required: false
+        type: string
+      notarize:
+        # An escape hatch, not a preference. Apple's notary service can sit on a
+        # submission for over an hour without returning a verdict (three in a
+        # row on 2026-08-04, while Apple reported the service healthy), and the
+        # macOS wait then holds a release that is finished and green on every
+        # other platform. Turning this off ships the Mac app ad-hoc signed, the
+        # way it shipped before notarization existed: users see the
+        # unidentified-developer warning again, which the website still
+        # documents. Leave it ON unless notarization is actually blocking.
+        description: 'Notarize the macOS build with Apple. Turn off to ship without it when Apple is slow.'
+        required: false
+        default: true
+        type: boolean
+      preview:
+        # The preview channel: a signed, installable build for a handful of
+        # testers, without it becoming everyone's download.
+        #
+        # It publishes a GitHub pre-release under vX.Y.Z-preview.N. Everything
+        # that decides what the public gets asks GitHub for the LATEST release,
+        # and GitHub's "latest" excludes pre-releases: the website download
+        # page, the stable /releases/latest/download/<file> links, and the
+        # in-app update check (which reads the website's api/update.json, built
+        # from the same source). So a preview is reachable by its link and by
+        # nothing else.
+        #
+        # The one thing that would break that is the website dispatch, which
+        # PINS the tag it is handed and would deploy the preview as the download
+        # for everybody. It is skipped here, and so is its verification step.
+        #
+        # Signing and notarization run exactly as for a release: a build testers
+        # cannot install is not a test. SmartScreen blocks an unsigned exe,
+        # which is why a dry-run artifact is no substitute.
+        description: 'Preview build: publish as a pre-release for testers, leave the website and the in-app update alone.'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Weekly automatic dry-run, Sundays 04:30 UTC. Catches breakage
+    # introduced by Dependabot bumps of release-only actions
+    # (attest-build-provenance, action-gh-release, upload-artifact)
+    # before the next real tag. The publish step is gated on a
+    # non-empty version input, so a scheduled run is build-only.
+    - cron: "30 4 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # 1. Source verification. Lockfiles match, deps verifiable, no
+  # known vulnerabilities, tests green. Anything that should fail
+  # a release fails here, not after a 10 minute multi-OS build.
+  verify-source:
+    runs-on: ubuntu-latest
+    # sign_windows steers whether the sign-windows job (self-hosted runner on
+    # the maintainer's machine) runs at all. Job-level `if:` cannot read
+    # secrets directly, so the gate is exported here as a job output. Two
+    # conditions: CERT_THUMBPRINT present AND a real version input. Signing
+    # needs the maintainer's live SimplySign session, which no scheduled or
+    # manual DRY-run can have - the first post-signing dry-run (2026-07-27)
+    # failed only on that human prerequisite and would have turned every
+    # weekly dry-run red. Dry-runs (empty version) now skip the job and stay
+    # meaningful; real releases still hard-require the signature.
+    outputs:
+      sign_windows: ${{ steps.signgate.outputs.enabled }}
+      # ONE build stamp for the whole release, taken here, once.
+      #
+      # It used to be taken inside build-agent, which is a three-leg matrix, so
+      # `date` ran three times on three runners and the job output was whatever
+      # leg finished last. On v0.9.88 the amd64 leg queued 37 seconds behind and
+      # crossed a minute boundary: the desktop apps were stamped
+      # 2026-09-26-2023 while the ARM agent they embed and push carried
+      # 2026-09-26-2022. Same commit, one minute apart, and every speaker in
+      # the field then looked permanently out of date to its own app.
+      build_stamp: ${{ steps.stamp.outputs.stamp }}
+    steps:
+      # One clock reading for the whole release. Everything downstream, the
+      # three agent legs and all three desktop builds, is stamped from this.
+      - name: Take the build stamp, once
+        id: stamp
+        run: echo "stamp=$(date -u '+%Y-%m-%d-%H%M')" >> "$GITHUB_OUTPUT"
+      # The two channels must not be confusable, in either direction. A real
+      # release tagged -preview would reach nobody; a preview tagged as a plain
+      # version would become everyone's download the moment it published. Both
+      # are one checkbox away, so the version string has to agree with the box.
+      - name: Channel matches the version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          IS_PREVIEW: ${{ inputs.preview }}
+        run: |
+          case "${RELEASE_VERSION}" in
+            *-preview.*) tagged=true ;;
+            *)           tagged=false ;;
+          esac
+          if [ "${IS_PREVIEW}" = "true" ] && [ "${tagged}" != "true" ]; then
+            echo "::error::a preview must be tagged vX.Y.Z-preview.N, got ${RELEASE_VERSION}"
+            exit 1
+          fi
+          if [ "${IS_PREVIEW}" != "true" ] && [ "${tagged}" = "true" ]; then
+            echo "::error::${RELEASE_VERSION} looks like a preview tag but the preview box is not ticked; it would publish as everyone's download"
+            exit 1
+          fi
+          echo "channel ok: version=${RELEASE_VERSION} preview=${IS_PREVIEW}"
+      - name: Signing gate
+        id: signgate
+        env:
+          CERT_THUMBPRINT: ${{ secrets.CERT_THUMBPRINT }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "${CERT_THUMBPRINT}" ] && [ -n "${RELEASE_VERSION}" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+          # Both modules: the desktop-app vet/test steps below share this
+          # toolchain and cache.
+          cache-dependency-path: |
+            go.sum
+            desktop-app/go.sum
+
+      - name: Verify go.mod and go.sum
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::go.mod or go.sum out of sync"
+            exit 1
+          fi
+
+      - name: Vulnerability scan
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          # Same continue-on-error reasoning as build.yml: setup-go's
+          # manifest sometimes lags Go's stdlib patch releases. The
+          # scan still runs and posts results; do not block the
+          # release on a stdlib finding the runner cannot install
+          # a fix for.
+          govulncheck ./... || true
+
+      - name: Run tests
+        run: go test ./...
+
+      # The desktop app is a SECOND Go module (stmanager-app); the root
+      # `go test ./...` above never descends into it. Without this gate a
+      # broken desktop-app commit only surfaces 10 minutes into the
+      # multi-OS wails builds. It vets/tests on a clean checkout because
+      # frontend/dist/.gitkeep keeps the //go:embed target present (same
+      # reasoning as the desktop-go job in build.yml). Plain go tooling is
+      # fine on "stable" — the 1.26.x pin in the desktop build jobs only
+      # exists for the wails CLI.
+      - name: Vet desktop app
+        working-directory: desktop-app
+        run: go vet ./...
+
+      - name: Test desktop app
+        working-directory: desktop-app
+        run: go test ./... -count=1
+
+  # 2a. Build the stick agent for ARMv7l (the only target that
+  # actually runs on a Bose SoundTouch speaker). Linux amd64/arm64
+  # are useful as developer-side tools and as the OTA payload for
+  # any future model on a different CPU.
+  build-agent:
+    needs: verify-source
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm
+            # GOARM=5 (softfloat), not 7: some early SoundTouch CPUs lack
+            # working VFP and a hardware-float binary SIGILLs at os.init and
+            # soft-bricks the box. GOARM=5 runs on every
+            # revision. Must match Makefile/build.yml. Filename stays armv7l.
+            goarm: "5"
+            suffix: armv7l
+          - goos: linux
+            goarch: arm64
+            suffix: arm64
+          - goos: linux
+            goarch: amd64
+            suffix: amd64
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build_stamp: ${{ steps.version.outputs.build_stamp }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Derive version and build stamp
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          BUILD_STAMP: ${{ needs.verify-source.outputs.build_stamp }}
+        run: |
+          # Three ways to enter this workflow:
+          #   1. push of a vX.Y.Z tag      → use the tag
+          #   2. workflow_dispatch + input → validate + use the input
+          #   3. workflow_dispatch w/o input (legacy) → dev build
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${INPUT_VERSION}" ]]; then
+            VERSION="${INPUT_VERSION}"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+          fi
+          # Validate any tag- or input-supplied version against a strict
+          # semver pattern. A git tag name can legally contain shell
+          # metacharacters, and VERSION flows into later build steps that
+          # hold the Sigstore signing identity (id-token / attestations:
+          # write), so an unchecked tag like 'v1.0.0;<cmd>' would be a
+          # template-injection foothold. Pinning it to vX.Y.Z[-suffix] at
+          # the source removes that surface everywhere downstream. The dev
+          # fallback is a hex short-hash and needs no check.
+          if [[ "${GITHUB_REF}" == refs/tags/* || -n "${INPUT_VERSION}" ]]; then
+            if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::version '$VERSION' does not match vX.Y.Z[-suffix]"
+              exit 1
+            fi
+          fi
+          # From verify-source, so all three matrix legs and every desktop
+          # build carry the SAME stamp. See the build_stamp output there.
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build_stamp=${BUILD_STAMP}" >> "$GITHUB_OUTPUT"
+
+      - name: Build agent
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+          # Passed as env, not interpolated into the script, so the value can
+          # never break out of the shell (defence in depth on top of the strict
+          # version validation in the derive-version step).
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_STAMP: ${{ steps.version.outputs.build_stamp }}
+        run: |
+          mkdir -p out
+          OUT="out/stmanager-${{ matrix.suffix }}"
+          go build \
+            -trimpath \
+            -buildvcs=true \
+            -ldflags="-s -w -X main.version=${VERSION} -X main.buildStamp=${BUILD_STAMP}" \
+            -o "${OUT}" \
+            ./cmd/agent
+
+      # Regression guard: the agent binary must carry the version
+      # string we just stamped. A previous local-build workflow
+      # forgot the -X flags entirely, producing binaries that
+      # forever reported `{"version":"1.0.0","build":"dev"}` even
+      # though the user had clearly installed a newer release.
+      # The desktop-app's update banner then claimed "update
+      # available" on every refresh. Tested by grepping the
+      # stripped binary for the literal version string we passed in.
+      #
+      # The grep only proves the string exists SOMEWHERE in the binary
+      # (docs and embedded files can carry version strings too), so the
+      # amd64 build — which runs natively on this runner — is additionally
+      # EXECUTED and its `-version` output compared exactly. That makes
+      # the check authoritative for the whole matrix: all three targets
+      # are linked from the same source with the same ldflags, so a wrong
+      # stamp cannot hit one architecture only. Suspected
+      # exactly this kind of release-pipeline mispackaging (a v0.9.5
+      # asset reporting v0.9.4); the executed check settles it per release.
+      - name: Verify agent version stamp
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD_STAMP: ${{ steps.version.outputs.build_stamp }}
+        run: |
+          OUT="out/stmanager-${{ matrix.suffix }}"
+          VER="${VERSION}"
+          STAMP="${BUILD_STAMP}"
+          if ! grep -q "${VER}" "${OUT}"; then
+            echo "::error::agent binary ${OUT} does not contain version string ${VER}; ldflags not applied"
+            exit 1
+          fi
+          if ! grep -q "${STAMP}" "${OUT}"; then
+            echo "::error::agent binary ${OUT} does not contain build stamp ${STAMP}; ldflags not applied"
+            exit 1
+          fi
+          if [ "${{ matrix.suffix }}" = "amd64" ]; then
+            GOT="$("${OUT}" -version)"
+            if [ "${GOT}" != "${VER}" ]; then
+              echo "::error::agent binary ${OUT} reports version '${GOT}', expected '${VER}'; the release would ship a wrongly-stamped agent (#381)"
+              exit 1
+            fi
+            echo "agent ${OUT} executed: reports version=${GOT}"
+          fi
+          echo "agent ${OUT} contains version=${VER} build=${STAMP}"
+
+      - name: SHA256
+        run: |
+          cd out
+          sha256sum "stmanager-${{ matrix.suffix }}" > "stmanager-${{ matrix.suffix }}.sha256"
+          cat "stmanager-${{ matrix.suffix }}.sha256"
+
+      # Build the LD_PRELOAD shim that hijacks Bose's SoftwareUpdate
+      # daemon on :17008 and forwards inbound connections to the STM
+      # webui on 127.0.0.1:8888. Only the armv7l matrix entry runs
+      # this step — the shim is loaded by the Bose binary on the
+      # speaker and not used on any host architecture. Targets
+      # glibc-2.15 explicitly because Bose firmware ships 2.15;
+      # newer default targets pull in GLIBC_2.34 and refuse to load.
+      # See usb-stick/shim/README.md for the chipset-whitelist story.
+      - name: Setup zig (for shim cross-compile)
+        if: matrix.suffix == 'armv7l'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.13.0
+
+      - name: Build shim
+        if: matrix.suffix == 'armv7l'
+        run: |
+          zig cc -target arm-linux-gnueabihf.2.15 -shared -fPIC -O2 \
+                 -ldl -lpthread \
+                 -o out/stm-shim.so usb-stick/shim/shim.c
+          ls -la out/stm-shim.so
+          sha256sum out/stm-shim.so > out/stm-shim.so.sha256
+          # Sanity check the resulting ELF: must be ARM EABI shared object.
+          # `file` is not on the Go runner image by default; head the magic.
+          if [ "$(head -c 4 out/stm-shim.so | xxd -p)" != "7f454c46" ]; then
+            echo "::error::shim build produced something that is not ELF"
+            exit 1
+          fi
+
+      - name: Sigstore attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/stmanager-${{ matrix.suffix }}
+
+      - name: Sigstore attestation (shim)
+        if: matrix.suffix == 'armv7l'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: out/stm-shim.so
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agent-${{ matrix.suffix }}
+          path: |
+            out/stmanager-${{ matrix.suffix }}
+            out/stmanager-${{ matrix.suffix }}.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload shim artifact
+        if: matrix.suffix == 'armv7l'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shim-armv7l
+          path: |
+            out/stm-shim.so
+            out/stm-shim.so.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # 2a-bis. Build the go-librespot Spotify Connect sidecar (GPL-3.0) from the
+  # fork vendored in third_party/go-librespot (carries the Ogg-passthrough), with
+  # the SAME lean recipe as go-librespot.yml: pure Go, CGO_ENABLED=0, GOARM=5
+  # softfloat (hardware-verified on the Portable 2026-08-01). The previous
+  # hardfloat cgo/Alpine build carried the latent-SIGILL class on early
+  # SoundTouch CPUs without working VFP. Built on EVERY release (not
+  # only on manual dispatch) so the sidecar actually ships: the desktop jobs
+  # embed it and the agent stick/OTA delivers it. This is the fix for Spotify
+  # never working on a normally-installed box: the binary was
+  # previously never delivered by the installer or OTA at all.
+  build-go-librespot:
+    needs: verify-source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout STM (vendored engine source, lean-prep script, cgo-free patch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Copy go-librespot (vendored fork) + strip cgo decoders
+        run: |
+          # The prep script patches with `git apply`, so the copy gets its own
+          # repository.
+          cp -R third_party/go-librespot go-librespot
+          git -C go-librespot init -q
+          echo "Built from third_party/go-librespot at STM commit $GITHUB_SHA"
+          mkdir -p dist
+          # The strip/stub/patch prep is shared with go-librespot.yml via one
+          # script, so the two lean builds cannot drift apart.
+          sh .github/scripts/golibrespot-lean-prep.sh
+
+      - name: Set up Go (engine)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go-librespot/go.mod
+          cache-dependency-path: go-librespot/go.sum
+
+      - name: Test the pure-Go Ogg parser
+        working-directory: go-librespot
+        run: CGO_ENABLED=0 go test ./vorbis/
+
+      - name: Build (pure Go, static, softfloat arm)
+        working-directory: go-librespot
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=5 \
+            go build -trimpath -buildvcs=false -ldflags "-s -w" \
+            -o ../dist/go-librespot-armv7l ./cmd/daemon
+
+      - name: Collect + checksum
+        run: |
+          sudo chmod +x dist/go-librespot-armv7l
+          if [ "$(head -c 4 dist/go-librespot-armv7l | xxd -p)" != "7f454c46" ]; then
+            echo "::error::go-librespot build produced something that is not ELF"
+            exit 1
+          fi
+          sha256sum dist/go-librespot-armv7l > dist/go-librespot-armv7l.sha256
+          echo "size: $(stat -c %s dist/go-librespot-armv7l) bytes"
+
+      - name: Sigstore attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/go-librespot-armv7l
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-librespot-armv7l
+          path: |
+            dist/go-librespot-armv7l
+            dist/go-librespot-armv7l.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # 2b. Build the Wails desktop app for Windows. The ARM agent
+  # binary built in build-agent is downloaded and dropped into
+  # desktop-app/agentbin so go:embed picks it up — the desktop app
+  # must ship with the matching agent for OTA updates.
+  build-desktop-windows:
+    needs: [build-agent, build-go-librespot]
+    runs-on: windows-latest
+    # Code signing happens in the separate sign-windows job below (self-hosted
+    # runner with the maintainer's live SimplySign session), gated on the same
+    # CERT_THUMBPRINT secret via the verify-source signing gate. This build job
+    # stays hosted-runner-only and always produces the plain unsigned build,
+    # so dry-runs and forks never depend on the self-hosted runner.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Pinned, not "stable": the hosted runners moved to Go 1.27.0 on
+          # 2026-08-21 and the pinned wails CLI v2.12.0 dies under it with
+          # `internal error: package "embed" without types` before compiling
+          # anything. 1.26.x is the combination every release up to v0.9.52
+          # shipped with. Lift the pin together with a tested wails CLI bump.
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop-app/frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Download ARM agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent-armv7l
+          path: agent-download
+
+      - name: Download shim
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: shim-armv7l
+          path: shim-download
+
+      - name: Download go-librespot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: go-librespot-armv7l
+          path: glr-download
+
+      - name: Embed ARM agent + shim + go-librespot
+        shell: bash
+        run: |
+          cp agent-download/stmanager-armv7l desktop-app/agentbin/stmanager-armv7l
+          cp shim-download/stm-shim.so usb-stick/stm-shim.so
+          cp glr-download/go-librespot-armv7l desktop-app/agentbin/go-librespot-armv7l
+          ls -la desktop-app/agentbin/ usb-stick/stm-shim.so
+
+      # The stamp the app is about to get MUST be the one inside the agent it
+      # just embedded. They are built in different jobs, and on v0.9.88 they
+      # came out a minute apart, which made every speaker in the field look
+      # permanently out of date to its own app. A release is the wrong place
+      # to discover that, so it fails here instead.
+      - name: The embedded agent must carry this build stamp
+        shell: bash
+        env:
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          if ! grep -q "${BUILD_STAMP}" desktop-app/agentbin/stmanager-armv7l; then
+            echo "::error::the embedded agent does not carry the app build stamp ${BUILD_STAMP}"
+            exit 1
+          fi
+          echo "embedded agent carries ${BUILD_STAMP}"
+
+      # Build the winformat helper the desktop app embeds via
+      # go:embed. Without this step the empty stub in
+      # sticksetup/embedded/winformat.exe ends up inside the
+      # released SoundTouch Manager.exe and the in-app "format stick" button
+      # fails with "Format failed: winformat Helper fehlt im Build"
+      # (observed live by a v0.5.1 user on Windows).
+      # Built on the windows runner so the resulting binary is a
+      # real PE32 .exe that Wails can embed.
+      - name: Build winformat helper
+        shell: bash
+        run: |
+          go build -trimpath -ldflags "-s -w" -o sticksetup/embedded/winformat.exe ./cmd/winformat
+          ls -la sticksetup/embedded/winformat.exe
+
+      # Regression guard: assert the embed slot is actually
+      # populated. The release_assert build tag selects a stricter
+      # test variant that fails when the embed is empty (PR CI
+      # without this step would also fail, which is why we tag it).
+      # Runs AFTER 'Build winformat helper' on purpose so a future
+      # reorder of these steps cannot silently break it.
+      - name: Verify winformat embed
+        shell: bash
+        run: |
+          go test -tags=release_assert -run TestWinformatEmbedIsNonEmptyInReleaseBuild ./sticksetup/...
+
+      # The Windows binary carried no version information at all: reading its
+      # resources showed an icon and a manifest and no version block, so Explorer
+      # and the first-run warning had no publisher or product name to show, and an
+      # antivirus heuristic sees an executable that says nothing about itself.
+      # Wails is meant to write it from build/windows/info.json and silently does
+      # not. So STM writes the whole resource, and the build below passes
+      # -nopackage because the Go linker refuses a second resource section.
+      - name: Generate the Windows resource (icon, manifest, version)
+        working-directory: desktop-app
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+        shell: bash
+        run: |
+          go run ./cmd/winresgen \
+            -out rsrc_windows_amd64.syso \
+            -version "${VERSION}" \
+            -comments "SoundTouch Manager. Unofficial, not affiliated with or endorsed by Bose."
+          ls -l rsrc_windows_amd64.syso
+
+      - name: Build Windows desktop app
+        working-directory: desktop-app
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        shell: bash
+        run: |
+          wails build \
+            -platform windows/amd64 \
+            -ldflags "-s -w -X main.appVersion=${VERSION} -X main.appBuild=${BUILD_STAMP}" \
+            -trimpath \
+            -clean \
+            -nopackage
+
+      - name: Rename and hash output
+        shell: bash
+        run: |
+          mkdir -p release-out
+          # wails.json sets outputfilename to "SoundTouch Manager" — the
+          # raw filename has a space which is awkward for URLs.
+          # Rename to a hyphenated stable name.
+          cp "desktop-app/build/bin/SoundTouch Manager.exe" "release-out/STM-Windows.exe"
+          cd release-out
+          sha256sum "STM-Windows.exe" > "STM-Windows.exe.sha256"
+          cat "STM-Windows.exe.sha256"
+          # ZIP fallback: SmartScreen / some browsers block a bare .exe
+          # download but not a .zip. The website surfaces this as a discreet
+          # fallback link under the SmartScreen note (only when the asset
+          # exists in the release, so no 404). Same .exe, just wrapped.
+          powershell -NoProfile -Command "Compress-Archive -Path 'STM-Windows.exe' -DestinationPath 'STM-Windows.zip' -Force"
+          sha256sum "STM-Windows.zip" > "STM-Windows.zip.sha256"
+          cat "STM-Windows.zip.sha256"
+
+      - name: Sigstore attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-out/STM-Windows.exe
+            release-out/STM-Windows.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-windows
+          path: |
+            release-out/STM-Windows.exe
+            release-out/STM-Windows.exe.sha256
+            release-out/STM-Windows.zip
+            release-out/STM-Windows.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # 2b-sign. Sign the Windows app with the Certum "Open Source" certificate.
+  # Runs on the maintainer's self-hosted runner (labels: self-hosted, windows,
+  # signing) where a SimplySign Desktop session is opened MANUALLY before the
+  # release (the cloud key is only reachable through such a session; there is
+  # no reliable headless login, see PR history). The job is skipped
+  # entirely when CERT_THUMBPRINT is unset (verify-source gate), so PRs,
+  # forks, dry-runs, and the weekly schedule never queue on the private
+  # runner. It downloads the unsigned build, signs + verifies by thumbprint,
+  # rebuilds the zip fallback from the signed exe, attests BOTH signed
+  # artifacts (attestation binds to the digest, so the signed exe needs its
+  # own), and uploads them under -signed names; the release job swaps them in
+  # before hashing, so SHA256SUMS, manifest.json, and VirusTotal all cover
+  # exactly the bytes users download.
+  #
+  # A Certum signature stamps the verified publisher name and lets
+  # SmartScreen reputation build; it does not chain to a Microsoft root, so
+  # Smart App Control acceptance still depends on accrued reputation.
+  sign-windows:
+    needs: [verify-source, build-desktop-windows]
+    if: needs.verify-source.outputs.sign_windows == 'true'
+    runs-on: [self-hosted, windows, signing]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      CERT_THUMBPRINT: ${{ secrets.CERT_THUMBPRINT }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download unsigned Windows build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-windows
+          path: release-out
+
+      - name: Sign and verify (Certum SimplySign session must be open)
+        shell: powershell
+        run: .\tools\certum-sign.ps1 -File "release-out/STM-Windows.exe"
+
+      - name: Repackage signed outputs
+        shell: powershell
+        working-directory: release-out
+        run: |
+          # Rebuild the zip fallback around the SIGNED exe (the zip carries the
+          # exe under its stable inner name), then move both to -signed names
+          # so the merged artifact download in the release job cannot collide
+          # with the unsigned files of the same name.
+          Compress-Archive -Path 'STM-Windows.exe' -DestinationPath 'STM-Windows-signed.zip' -Force
+          Move-Item 'STM-Windows.exe' 'STM-Windows-signed.exe' -Force
+          Get-ChildItem
+
+      - name: Sigstore attestation (signed)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-out/STM-Windows-signed.exe
+            release-out/STM-Windows-signed.zip
+
+      - name: Upload signed artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-windows-signed
+          path: |
+            release-out/STM-Windows-signed.exe
+            release-out/STM-Windows-signed.zip
+          if-no-files-found: error
+          retention-days: 90
+
+  # 2c. Build the Wails desktop app for Linux x86_64. Pinned to
+  # ubuntu-22.04 deliberately — its libwebkit2gtk-4.1 and libsoup
+  # versions are present on Ubuntu 22.04+ / Debian 12+ / Fedora 38+
+  # / current Arch. Building on ubuntu-24.04 would link against a
+  # newer libwebkit that's missing on common LTS distros.
+  build-desktop-linux:
+    needs: [build-agent, build-go-librespot]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Pinned, not "stable": the hosted runners moved to Go 1.27.0 on
+          # 2026-08-21 and the pinned wails CLI v2.12.0 dies under it with
+          # `internal error: package "embed" without types` before compiling
+          # anything. 1.26.x is the combination every release up to v0.9.52
+          # shipped with. Lift the pin together with a tested wails CLI bump.
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop-app/frontend/package-lock.json
+
+      - name: Install Wails build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Download ARM agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent-armv7l
+          path: agent-download
+
+      - name: Download go-librespot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: go-librespot-armv7l
+          path: glr-download
+
+      - name: Embed ARM agent + go-librespot
+        run: |
+          cp agent-download/stmanager-armv7l desktop-app/agentbin/stmanager-armv7l
+          cp glr-download/go-librespot-armv7l desktop-app/agentbin/go-librespot-armv7l
+          ls -la desktop-app/agentbin/
+
+      # The stamp the app is about to get MUST be the one inside the agent it
+      # just embedded. They are built in different jobs, and on v0.9.88 they
+      # came out a minute apart, which made every speaker in the field look
+      # permanently out of date to its own app. A release is the wrong place
+      # to discover that, so it fails here instead.
+      - name: The embedded agent must carry this build stamp
+        shell: bash
+        env:
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          if ! grep -q "${BUILD_STAMP}" desktop-app/agentbin/stmanager-armv7l; then
+            echo "::error::the embedded agent does not carry the app build stamp ${BUILD_STAMP}"
+            exit 1
+          fi
+          echo "embedded agent carries ${BUILD_STAMP}"
+
+      - name: Build Linux desktop app
+        working-directory: desktop-app
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          wails build \
+            -platform linux/amd64 \
+            -tags webkit2_41 \
+            -ldflags "-s -w -X main.appVersion=${VERSION} -X main.appBuild=${BUILD_STAMP}" \
+            -trimpath \
+            -clean
+
+      - name: Package as tar.gz
+        run: |
+          mkdir -p release-out
+          # Bundle the binary, the app icon, a desktop-integration installer,
+          # and a tiny README so the runtime webkit dependency is visible
+          # without forcing users to check a separate doc.
+          cp "desktop-app/build/bin/SoundTouch Manager" "release-out/STM-Linux-x64"
+          chmod +x "release-out/STM-Linux-x64"
+          cp desktop-app/build/appicon.png release-out/STM.png
+          cat > release-out/README-linux.txt <<'TXT'
+          STM for Linux x86_64
+          --------------------
+
+          Quick start:
+              chmod +x STM-Linux-x64
+              ./STM-Linux-x64
+
+          Add to your app menu (with icon):
+              ./install.sh
+          This installs a launcher to ~/.local/bin, the icon to
+          ~/.local/share/icons, and a menu entry to
+          ~/.local/share/applications, so SoundTouch Manager appears in your
+          application menu with its icon (no root needed). Re-run after
+          updating to a new version.
+
+          Required runtime libraries (any current desktop distro):
+              libgtk-3-0
+              libwebkit2gtk-4.1-0   (or libwebkit2gtk-4.0-37 with a symlink)
+              libsoup-3.0
+
+          If the binary refuses to start with a missing-library error,
+          install the package matching your distro:
+              Debian/Ubuntu:  apt install libgtk-3-0 libwebkit2gtk-4.1-0 libsoup-3.0-0
+              Fedora:         dnf install gtk3 webkit2gtk4.1 libsoup3
+              Arch:           pacman -S gtk3 webkit2gtk-4.1 libsoup3
+          TXT
+          # Per-user desktop integration installer (no root). Generates the
+          # .desktop entry on the user's machine so Exec/Icon point at the
+          # real installed paths. Fixes the "no menu entry, no icon" report
+          # on Zorin/GNOME. The outer 'INSTALL' heredoc is quoted so
+          # nothing expands at package time; the inner DESKTOP heredoc is
+          # unquoted so $HOME etc. expand when the user runs install.sh.
+          cat > release-out/install.sh <<'INSTALL'
+          #!/bin/sh
+          set -e
+          DIR="$(cd "$(dirname "$0")" && pwd)"
+          BINDIR="$HOME/.local/bin"
+          APPDIR="$HOME/.local/share/applications"
+          ICONDIR="$HOME/.local/share/icons"
+          mkdir -p "$BINDIR" "$APPDIR" "$ICONDIR"
+          install -m 755 "$DIR/STM-Linux-x64" "$BINDIR/st-manager"
+          install -m 644 "$DIR/STM.png" "$ICONDIR/st-manager.png"
+          cat > "$APPDIR/st-manager.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=SoundTouch Manager
+          GenericName=SoundTouch controller
+          Comment=Revive Bose SoundTouch speakers without the Bose cloud
+          Exec=$BINDIR/st-manager
+          Icon=$ICONDIR/st-manager.png
+          Terminal=false
+          Categories=AudioVideo;Audio;
+          StartupWMClass=SoundTouch Manager
+          DESKTOP
+          update-desktop-database "$APPDIR" 2>/dev/null || true
+          echo "SoundTouch Manager installed. Open it from your app menu, or run: $BINDIR/st-manager"
+          INSTALL
+          chmod +x release-out/install.sh
+          cd release-out
+          tar -czf STM-Linux-x64.tar.gz STM-Linux-x64 STM.png install.sh README-linux.txt
+          rm STM-Linux-x64 STM.png install.sh README-linux.txt
+          sha256sum "STM-Linux-x64.tar.gz" > "STM-Linux-x64.tar.gz.sha256"
+          cat "STM-Linux-x64.tar.gz.sha256"
+
+      - name: Sigstore attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-out/STM-Linux-x64.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-linux
+          path: |
+            release-out/STM-Linux-x64.tar.gz
+            release-out/STM-Linux-x64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # 2d. Build the Wails desktop app for macOS. Universal binary
+  # covers both Intel and Apple Silicon. Wrap in a DMG so end
+  # users can drag-drop. Signed with a Developer ID certificate and notarized by
+  # Apple when the credentials are configured, see the applegate step below.
+  build-desktop-macos:
+    needs: [build-agent, build-go-librespot]
+    runs-on: macos-latest
+    # Signing waits on Apple's timestamp authority and notarization waits on
+    # Apple's notary service, both of which can stall. Without a ceiling a stall
+    # holds the whole release for the six-hour default (sign-windows carries the
+    # same guard for the same reason). Two submissions, each allowed to wait out
+    # a slow queue (see .github/scripts/notarize.sh), plus the build itself.
+    timeout-minutes: 200
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    # Exported so the publish job can refuse to ship an unnotarized DMG the same
+    # way it refuses an unsigned Windows build. Two outputs, not one: `configured`
+    # says the Apple credentials exist at all, `notarized` says notarization
+    # actually succeeded. The guard fires only when the credentials ARE
+    # configured, so a release still works before they are set up and hard-fails
+    # the moment notarization silently stops working afterwards.
+    outputs:
+      configured: ${{ steps.applegate.outputs.configured }}
+      notarized: ${{ steps.notarize.outputs.notary_result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Pinned, not "stable": the hosted runners moved to Go 1.27.0 on
+          # 2026-08-21 and the pinned wails CLI v2.12.0 dies under it with
+          # `internal error: package "embed" without types` before compiling
+          # anything. 1.26.x is the combination every release up to v0.9.52
+          # shipped with. Lift the pin together with a tested wails CLI bump.
+          go-version: "1.26.x"
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop-app/frontend/package-lock.json
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+
+      - name: Download ARM agent
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: agent-armv7l
+          path: agent-download
+
+      - name: Download go-librespot
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: go-librespot-armv7l
+          path: glr-download
+
+      - name: Embed ARM agent + go-librespot
+        run: |
+          cp agent-download/stmanager-armv7l desktop-app/agentbin/stmanager-armv7l
+          cp glr-download/go-librespot-armv7l desktop-app/agentbin/go-librespot-armv7l
+          ls -la desktop-app/agentbin/
+
+      # The stamp the app is about to get MUST be the one inside the agent it
+      # just embedded. They are built in different jobs, and on v0.9.88 they
+      # came out a minute apart, which made every speaker in the field look
+      # permanently out of date to its own app. A release is the wrong place
+      # to discover that, so it fails here instead.
+      - name: The embedded agent must carry this build stamp
+        shell: bash
+        env:
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          if ! grep -q "${BUILD_STAMP}" desktop-app/agentbin/stmanager-armv7l; then
+            echo "::error::the embedded agent does not carry the app build stamp ${BUILD_STAMP}"
+            exit 1
+          fi
+          echo "embedded agent carries ${BUILD_STAMP}"
+
+      - name: Build macOS desktop app (universal)
+        working-directory: desktop-app
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          wails build \
+            -platform darwin/universal \
+            -ldflags "-s -w -X main.appVersion=${VERSION} -X main.appBuild=${BUILD_STAMP}" \
+            -trimpath \
+            -clean
+
+      - name: Apple signing gate
+        id: applegate
+        # Job-level `if:` cannot read secrets, so the presence of the Apple
+        # credentials is exported as an output, exactly like the Windows signing
+        # gate does with CERT_THUMBPRINT. Everything Apple-related below hangs off
+        # this, so a fork, a dry-run, or a checkout without the secrets still
+        # produces a working (ad-hoc signed) build instead of a red job.
+        env:
+          P12: ${{ secrets.APPLE_CERT_P12 }}
+          KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+          WANTED: ${{ inputs.notarize }}
+        run: |
+          if [ "${WANTED}" = "false" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Notarization was switched off for this run. The macOS build ships ad-hoc signed and shows the unidentified-developer warning on first launch."
+          elif [ -n "${P12}" ] && [ -n "${KEY}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Apple signing credentials are not configured; falling back to an ad-hoc signature."
+          fi
+
+      - name: Import the Developer ID certificate
+        if: steps.applegate.outputs.configured == 'true'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/signing.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          # Generated here rather than kept as a secret: it protects a keychain
+          # that lives for one job on a VM that is destroyed afterwards, so a
+          # stored secret would add rotation surface for nothing. Masked at once
+          # so no later error path can print it.
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+
+          # Into RUNNER_TEMP, never the workspace: upload-artifact globs are
+          # workspace-relative and release-out/ is uploaded.
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # The default keychain re-locks after 300s idle, which lands mid-build
+          # in a job this long and fails signing with an unhelpful error.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERT_PASSWORD" -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security
+          # The step everyone forgets. Without it codesign trips the keychain ACL
+          # and raises a GUI password prompt, which on a headless runner means the
+          # job hangs to the timeout instead of failing.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
+          # -s REPLACES the search list, so re-append what was there.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY="$(security find-identity -p codesigning -v "$KEYCHAIN_PATH" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)"/\1/')"
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No 'Developer ID Application' identity in the imported certificate. Apple Development and Apple Distribution certificates cannot be used to notarize."
+            security find-identity -p codesigning -v "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+          echo "Signing identity: $IDENTITY"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$CERT_PATH"
+
+      - name: Sign the app bundle
+        # No --deep: Apple's own guidance is that it is the wrong tool, and a
+        # Wails bundle has no nested code to reach anyway. The check below fails
+        # the build if that ever stops being true, because the parts would then
+        # need signing individually, innermost first.
+        #
+        # No --entitlements either. Entitlements grant EXCEPTIONS to the hardened
+        # runtime, and this app needs none: no cgo, no third-party dylibs, no JIT.
+        # The usual "network client" entitlement would be both unnecessary here
+        # (nothing is sandboxed) and wrong for an app that also listens for
+        # inbound connections and multicast.
+        #
+        # --timestamp and --options runtime are not optional: Apple rejects a
+        # submission that lacks either.
+        run: |
+          set -euo pipefail
+          APP="desktop-app/build/bin/SoundTouch Manager.app"
+
+          NESTED="$(find "$APP/Contents" -type d -name '*.framework' -o -type d -name '*.appex' -o -type d -name '*.bundle' 2>/dev/null || true)"
+          if [ -n "$NESTED" ]; then
+            echo "::error::The bundle now contains nested code, which must be signed innermost-first before the bundle itself:"
+            echo "$NESTED"
+            exit 1
+          fi
+
+          if [ "${{ steps.applegate.outputs.configured }}" = "true" ]; then
+            codesign --force --timestamp --options runtime --keychain "$KEYCHAIN_PATH" --sign "$SIGN_IDENTITY" "$APP"
+          else
+            # No credentials: an ad-hoc signature still gives the bundle a stable
+            # identity, which is what makes "Open Anyway" work at all. It cannot
+            # be notarized, so the first-launch warning stays.
+            codesign --force --sign - "$APP"
+          fi
+          codesign --verify --strict --verbose=2 "$APP"
+
+      - name: Notarize and staple the app
+        if: steps.applegate.outputs.configured == 'true'
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        # The app is notarized and stapled BEFORE the DMG is built, so the copy
+        # the user drags into their Applications folder carries its own ticket.
+        # Stapling only the DMG passes every check and then fails on a machine
+        # that is offline at first launch: Gatekeeper cannot look the ticket up,
+        # refuses the app, and it bounces in the Dock and never opens. That is
+        # exactly the symptom this whole change exists to remove.
+        run: |
+          set -euo pipefail
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+          echo "APPLE_KEY_FILE=$KEY" >> "$GITHUB_ENV"
+          export APPLE_KEY_FILE="$KEY"
+          # 30 minutes, then ship without it. Apple took 27 to 28 hours over
+          # the first three submissions from this Developer ID and accepted
+          # every one of them, so a long wait says nothing about the build. A
+          # release that is done on every other platform does not sit behind it.
+          export NOTARY_DEADLINE_MIN=30
+          export NOTARY_ON_TIMEOUT=continue
+          .github/scripts/notarize.sh "desktop-app/build/bin/SoundTouch Manager.app"
+
+      - name: Free disk space for DMG
+        # Runs AFTER the build (which needs the toolchain) and BEFORE packaging,
+        # since hdiutil/ditto are plain /usr/bin system tools. The first attempt
+        # removed the simulator RUNTIMES, which sit on the read-only system
+        # volume, so it only logged "Read-only file system" and freed nothing and
+        # the DMG still ran out of space. Reclaim the large, WRITABLE extra Xcode
+        # installs instead (the build is already done) so hdiutil has scratch room
+        # for the universal-binary DMG. Best-effort: never fail on a miss.
+        #
+        # The ACTIVE Xcode is now excluded. notarytool is not a standalone tool:
+        # xcrun resolves it inside the selected developer directory, so deleting
+        # every Xcode here would remove the tool the DMG notarization below needs
+        # and turn a working release into a confusing "notarytool not found".
+        run: |
+          df -h /
+          ACTIVE="$(xcode-select -p 2>/dev/null || true)"
+          echo "active developer dir: ${ACTIVE:-none}"
+          for x in /Applications/Xcode_*.app; do
+            [ -e "$x" ] || continue
+            case "$ACTIVE" in
+              "$x"/*) echo "keeping active $x"; continue ;;
+            esac
+            sudo rm -rf "$x" || true
+          done
+          rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          rm -rf ~/Library/Developer/CoreSimulator/Devices/* || true
+          # Prove the tool survived rather than finding out 20 minutes later.
+          xcrun --find notarytool
+          df -h /
+
+      - name: Package as DMG
+        run: |
+          mkdir -p release-out
+          # ditto preserves extended attrs and resource forks. It also carries the
+          # stapled notarization ticket, which lives in the bundle: a plain cp -r
+          # would leave the shipped app without one.
+          ditto "desktop-app/build/bin/SoundTouch Manager.app" "release-out/dmg-stage/SoundTouch Manager.app"
+          ln -s /Applications "release-out/dmg-stage/Applications"
+          # Build the DMG via an EXPLICITLY sized read-write image, then convert to
+          # compressed UDZO. hdiutil's -srcfolder auto-size was marginal for the
+          # universal app and intermittently failed the copy with "hdiutil: create
+          # failed - No space left on device" on /Volumes/STM (the DMG volume, not
+          # the runner disk: v0.8.12 squeaked through, v0.8.13 did not). Sizing the
+          # RW image at the staged content + 200 MB slack makes the copy fit every
+          # time; the final UDZO is still compressed to the real size.
+          STAGE_MB=$(du -sm release-out/dmg-stage | awk '{print $1}')
+          SIZE_MB=$((STAGE_MB + 200))
+          echo "dmg-stage=${STAGE_MB}MB, rw image=${SIZE_MB}MB"
+          hdiutil create -volname "STM" -fs HFS+ -size "${SIZE_MB}m" -ov \
+            "release-out/STM-macOS-rw.dmg"
+          DEV=$(hdiutil attach -nobrowse -noverify -noautoopen "release-out/STM-macOS-rw.dmg" | awk '/Apple_HFS/{print $1; exit}')
+          ditto "release-out/dmg-stage/SoundTouch Manager.app" "/Volumes/STM/SoundTouch Manager.app"
+          ln -s /Applications "/Volumes/STM/Applications"
+          sync
+          hdiutil detach "$DEV"
+          hdiutil convert "release-out/STM-macOS-rw.dmg" -format UDZO -ov -o "release-out/STM-macOS.dmg"
+          rm -f "release-out/STM-macOS-rw.dmg"
+          rm -rf release-out/dmg-stage
+
+      - name: Notarize and staple the DMG
+        id: notarize
+        if: steps.applegate.outputs.configured == 'true'
+        env:
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        # Sign, notarize and staple the disk image itself, on top of the app
+        # inside it. Both tickets matter: the DMG's covers the download the user
+        # opens, the app's covers the copy they drag out of it.
+        #
+        # ALL of this has to finish before the checksum and the attestation
+        # below, because stapling rewrites the file. A ticket added after the
+        # hash was taken would publish a SHA256 that matches nothing anyone
+        # downloads, and the Verify page would report a tampered file for a
+        # perfectly good build.
+        run: |
+          set -euo pipefail
+          DMG="release-out/STM-macOS.dmg"
+
+          # notarytool takes a read-only UDIF image; the read-write one it was
+          # built from is rejected. The convert above produces UDZO, so assert
+          # it rather than learning it from Apple's error message.
+          hdiutil imageinfo "$DMG" | grep -i "Format:" || true
+          if ! hdiutil imageinfo "$DMG" | grep -qi "Format: UDZO"; then
+            echo "::error::The DMG is not a compressed read-only image; notarytool will reject it."
+            exit 1
+          fi
+
+          codesign --force --timestamp --keychain "$KEYCHAIN_PATH"             --identifier "io.github.jcbenitezhe.soundtouchmanager.dmg" --sign "$SIGN_IDENTITY" "$DMG"
+
+          export NOTARY_DEADLINE_MIN=30
+          export NOTARY_ON_TIMEOUT=continue
+          .github/scripts/notarize.sh "$DMG"
+          # notary_result is written by the script: accepted / timeout.
+          # A rejection never reaches here, it exits non-zero.
+
+      - name: Verify the shipped app, not just the container
+        # Only when notarization actually happened. After a timeout the build
+        # is signed but carries no ticket, and stapler would rightly refuse it.
+        if: steps.applegate.outputs.configured == 'true' && steps.notarize.outputs.notary_result == 'accepted'
+        # Every check so far looked at the disk image. An app with the hardened
+        # runtime missing, or carrying an entitlement it must not have, passes all
+        # of them and then fails the moment a user double-clicks it. So mount what
+        # is actually being shipped and assert on the app inside.
+        run: |
+          set -euo pipefail
+          DMG="release-out/STM-macOS.dmg"
+          xcrun stapler validate "$DMG"
+
+          MNT="$RUNNER_TEMP/verify-mnt"
+          mkdir -p "$MNT"
+          hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MNT"
+          APP="$MNT/SoundTouch Manager.app"
+
+          echo "--- signature ---"
+          codesign -dv --verbose=4 "$APP" 2>&1 | tee "$RUNNER_TEMP/sig.txt"
+          grep -q "flags=.*runtime" "$RUNNER_TEMP/sig.txt" || {
+            echo "::error::The shipped app does not have the hardened runtime enabled."
+            hdiutil detach "$MNT" || true; exit 1; }
+          grep -q "Authority=Developer ID Application" "$RUNNER_TEMP/sig.txt" || {
+            echo "::error::The shipped app is not signed with a Developer ID Application certificate."
+            hdiutil detach "$MNT" || true; exit 1; }
+
+          echo "--- entitlements (expected: none) ---"
+          codesign -d --entitlements - "$APP" 2>&1 | tee "$RUNNER_TEMP/ents.txt" || true
+          for bad in com.apple.security.app-sandbox com.apple.security.get-task-allow; do
+            if grep -q "$bad" "$RUNNER_TEMP/ents.txt"; then
+              echo "::error::The shipped app carries $bad, which breaks it for users."
+              hdiutil detach "$MNT" || true; exit 1
+            fi
+          done
+
+          echo "--- ticket + Gatekeeper ---"
+          xcrun stapler validate "$APP"
+          spctl -a -vvv -t exec "$APP"
+
+          hdiutil detach "$MNT"
+
+      - name: Package the app as a ZIP for the in-app update
+        # The DMG is for humans: it carries the Applications symlink and the
+        # drag-and-drop gesture people know. The ZIP is for the app itself,
+        # which since v0.9.42 replaces its own bundle instead of asking the
+        # user to drag it in again on every release (see
+        # desktop-app/update_macos.go).
+        #
+        # ditto, not zip: a bundle carries symlinks, extended attributes and a
+        # code signature, and a plain zip quietly breaks the signature so the
+        # swapped-in copy would be refused. --keepParent puts the .app itself in
+        # the archive rather than its contents.
+        #
+        # Built from the SAME stapled bundle the DMG was staged from, so the
+        # ticket rides along inside and the extracted copy opens offline. No
+        # second notarization round is needed for the archive; Apple notarizes
+        # what is in it, not the container.
+        run: |
+          set -euo pipefail
+          APP="desktop-app/build/bin/SoundTouch Manager.app"
+          /usr/bin/ditto -c -k --keepParent "$APP" "release-out/STM-macOS.zip"
+          # Prove the archive still holds a valid signature: an unpack here is
+          # cheap, and finding this out on a user's Mac is not.
+          rm -rf "$RUNNER_TEMP/zipcheck"
+          /usr/bin/ditto -x -k "release-out/STM-macOS.zip" "$RUNNER_TEMP/zipcheck"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/zipcheck/SoundTouch Manager.app"
+          rm -rf "$RUNNER_TEMP/zipcheck"
+
+      - name: Checksum the DMG and the ZIP
+        # AFTER stapling: a ticket is written into the file, so a hash taken
+        # before it would not match the published download.
+        run: |
+          cd release-out
+          shasum -a 256 "STM-macOS.dmg" > "STM-macOS.dmg.sha256"
+          shasum -a 256 "STM-macOS.zip" > "STM-macOS.zip.sha256"
+          cat "STM-macOS.dmg.sha256" "STM-macOS.zip.sha256"
+
+      - name: Remove the signing keychain
+        if: always()
+        # Defence in depth: the runner is ephemeral, but a future artifact glob or
+        # a debug step could widen its reach mid-job. The credentials live in
+        # RUNNER_TEMP rather than the workspace for the same reason.
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/AuthKey.p8" "$RUNNER_TEMP/cert.p12" 2>/dev/null || true
+
+      - name: Sigstore attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release-out/STM-macOS.dmg
+            release-out/STM-macOS.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-macos
+          path: |
+            release-out/STM-macOS.dmg
+            release-out/STM-macOS.dmg.sha256
+            release-out/STM-macOS.zip
+            release-out/STM-macOS.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # 3. Collect all artifacts, build a combined SHA256SUMS and a
+  # JSON manifest, publish the GitHub Release. The website fetches
+  # manifest.json to display version + download links without
+  # scraping the GitHub Releases UI.
+  release:
+    needs:
+      - build-agent
+      - build-go-librespot
+      - build-desktop-windows
+      - build-desktop-linux
+      - build-desktop-macos
+      - sign-windows
+    # The release job runs on every trigger (tag push, workflow_dispatch,
+    # schedule) so a dry-run also exercises change-note generation, the
+    # manifest, and attestation. Only the final Publish and Notify steps
+    # are gated on a real release (a tag, or a dispatch with a version),
+    # so a no-version dispatch / scheduled run builds everything but
+    # publishes nothing.
+    #
+    # sign-windows is allowed to be SKIPPED, but ONLY on a dry-run: a skipped
+    # signing job on a real release means the build would go out unsigned, and
+    # the guard step below turns that into a hard failure rather than a quietly
+    # unsigned download. Every build job must still have succeeded; the explicit
+    # result checks are required because a skipped job in `needs` would
+    # otherwise skip this job entirely.
+    if: |
+      !cancelled() &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event_name == 'schedule') &&
+      needs.build-agent.result == 'success' &&
+      needs.build-go-librespot.result == 'success' &&
+      needs.build-desktop-windows.result == 'success' &&
+      needs.build-desktop-linux.result == 'success' &&
+      needs.build-desktop-macos.result == 'success' &&
+      (needs.sign-windows.result == 'success' || needs.sign-windows.result == 'skipped')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    # Job-level so the VirusTotal step can gate its `if` on the secret being
+    # present (a step's own env block is not reliably visible to its own `if`).
+    env:
+      VT_API_KEY: ${{ secrets.VT_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Swap in the signed Windows build
+        # Replaces the unsigned exe/zip with the signed ones (distinct -signed
+        # names avoid any merge collision above). Runs BEFORE the rename and
+        # SHA256SUMS steps, so every published hash, the manifest, and the
+        # VirusTotal scan cover the signed bytes users actually download.
+        if: needs.sign-windows.result == 'success'
+        working-directory: dist
+        run: |
+          mv -f "STM-Windows-signed.exe" "STM-Windows.exe"
+          mv -f "STM-Windows-signed.zip" "STM-Windows.zip"
+          ls -la
+
+      - name: Version the desktop download filenames
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+        run: |
+          # Put the version in the desktop app filenames so users can tell
+          # builds apart in their Downloads folder. Done here, after the build
+          # jobs attested the files: attestation binds to the file's digest,
+          # not its name, so the rename does not affect `gh attestation verify`.
+          # The agent binaries keep fixed names. The desktop apps therefore no
+          # longer have stable /releases/latest/download/<name> URLs; the
+          # website + the in-app update read manifest.json's per-version `url`.
+          mv "STM-Windows.exe"      "STM-Windows-${VERSION}.exe"
+          mv "STM-Windows.zip"      "STM-Windows-${VERSION}.zip"
+          mv "STM-macOS.dmg"        "STM-macOS-${VERSION}.dmg"
+          mv "STM-macOS.zip"        "STM-macOS-${VERSION}.zip"
+          mv "STM-Linux-x64.tar.gz" "STM-Linux-x64-${VERSION}.tar.gz"
+          ls -la
+
+      - name: Combined SHA256SUMS
+        working-directory: dist
+        run: |
+          # Drop the per-asset .sha256 files now that we have the
+          # final binaries — replace with one SHA256SUMS in the
+          # standard format used by the verification instructions.
+          rm -f ./*.sha256
+          sha256sum stmanager-* STM-* stm-shim.so go-librespot-armv7l > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate change notes
+        # Build human-facing release notes from the Conventional Commit
+        # subjects since the previous tag. Produces dist/changelog.md
+        # (Markdown, inserted into the GitHub Release body) and
+        # dist/notes.json ({markdown, items}, merged into manifest.json
+        # so the website and the desktop app can show the same list).
+        # relnotes auto-detects the previous tag from <to>^, so passing
+        # the commit SHA works for both tag-push and dispatch releases.
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+        run: |
+          go run ./cmd/relnotes \
+            -version "${VERSION}" \
+            -to "${GITHUB_SHA}" \
+            -out-md dist/changelog.md \
+            -out-json dist/notes.json
+          echo "----- changelog.md -----"; cat dist/changelog.md
+          echo "----- notes.json -----";   cat dist/notes.json
+
+      - name: Generate manifest.json
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+          BUILD_STAMP: ${{ needs.build-agent.outputs.build_stamp }}
+        run: |
+          BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}"
+          LATEST_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/latest/download"
+          released_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          sha() { awk -v f="$1" '$2==f { print $1 }' SHA256SUMS; }
+          # Linux is shipped as a tarball, not a raw binary, so the
+          # SHA256SUMS line uses the .tar.gz filename. Look up that
+          # exact name; do not strip the suffix.
+          cat > manifest.json <<JSON
+          {
+            "version": "${VERSION}",
+            "build": "${BUILD_STAMP}",
+            "released_at": "${released_at}",
+            "commit": "${GITHUB_SHA}",
+            "supported_models": ["SoundTouch 10", "SoundTouch 20", "SoundTouch 30", "Wave SoundTouch IV"],
+            "artifacts": {
+              "desktop_windows": {
+                "url": "${BASE}/STM-Windows-${VERSION}.exe",
+                "sha256": "$(sha STM-Windows-${VERSION}.exe)",
+                "platform": "windows",
+                "arch": "amd64",
+                "filename": "STM-Windows-${VERSION}.exe"
+              },
+              "desktop_macos": {
+                "url": "${BASE}/STM-macOS-${VERSION}.dmg",
+                "sha256": "$(sha STM-macOS-${VERSION}.dmg)",
+                "platform": "macos",
+                "arch": "universal",
+                "filename": "STM-macOS-${VERSION}.dmg"
+              },
+              "desktop_macos_zip": {
+                "url": "${BASE}/STM-macOS-${VERSION}.zip",
+                "sha256": "$(sha STM-macOS-${VERSION}.zip)",
+                "platform": "macos",
+                "arch": "universal",
+                "filename": "STM-macOS-${VERSION}.zip"
+              },
+              "desktop_linux": {
+                "url": "${BASE}/STM-Linux-x64-${VERSION}.tar.gz",
+                "sha256": "$(sha STM-Linux-x64-${VERSION}.tar.gz)",
+                "platform": "linux",
+                "arch": "amd64",
+                "filename": "STM-Linux-x64-${VERSION}.tar.gz",
+                "runtime_libs": ["libgtk-3-0", "libwebkit2gtk-4.1-0", "libsoup-3.0"]
+              },
+              "agent_armv7l": {
+                "url": "${BASE}/stmanager-armv7l",
+                "latest_url": "${LATEST_BASE}/stmanager-armv7l",
+                "sha256": "$(sha stmanager-armv7l)",
+                "platform": "linux",
+                "arch": "armv7l",
+                "filename": "stmanager-armv7l",
+                "purpose": "stick agent, runs on the Bose SoundTouch speaker"
+              },
+              "agent_arm64": {
+                "url": "${BASE}/stmanager-arm64",
+                "latest_url": "${LATEST_BASE}/stmanager-arm64",
+                "sha256": "$(sha stmanager-arm64)",
+                "platform": "linux",
+                "arch": "arm64",
+                "filename": "stmanager-arm64",
+                "purpose": "developer / reserve target"
+              },
+              "agent_amd64": {
+                "url": "${BASE}/stmanager-amd64",
+                "latest_url": "${LATEST_BASE}/stmanager-amd64",
+                "sha256": "$(sha stmanager-amd64)",
+                "platform": "linux",
+                "arch": "amd64",
+                "filename": "stmanager-amd64",
+                "purpose": "developer / test rig"
+              },
+              "spotify_sidecar_armv7l": {
+                "url": "${BASE}/go-librespot-armv7l",
+                "latest_url": "${LATEST_BASE}/go-librespot-armv7l",
+                "sha256": "$(sha go-librespot-armv7l)",
+                "platform": "linux",
+                "arch": "armv7l",
+                "filename": "go-librespot-armv7l",
+                "purpose": "Spotify Connect sidecar (go-librespot, GPL-3.0), runs on the speaker"
+              }
+            },
+            "checksums_file": {
+              "url": "${BASE}/SHA256SUMS",
+              "latest_url": "${LATEST_BASE}/SHA256SUMS"
+            },
+            "verify_with_gh_cli": "gh attestation verify <file> --owner ${GITHUB_REPOSITORY_OWNER}"
+          }
+          JSON
+          # Merge the generated change notes ({markdown, items}) under
+          # "notes" so the website and the desktop app read the same
+          # source of truth. jq is preinstalled on ubuntu runners.
+          jq --slurpfile n notes.json '. + {notes: $n[0]}' manifest.json > manifest.tmp
+          mv manifest.tmp manifest.json
+          cat manifest.json
+
+      - name: Attest manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
+        with:
+          subject-path: dist/manifest.json
+
+      - name: VirusTotal scan (upload binaries)
+        # Upload the desktop binaries to VirusTotal so each release's hash is
+        # known to VT. We do NOT use the action's update_release_body: it only
+        # works on a `release` event, and this pipeline publishes via a tag push
+        # (the release is created later in this same job), so there is no release
+        # object for it to edit. Instead the notes step below links to the
+        # permanent per-hash report (virustotal.com/gui/file/<sha256>), which is
+        # also what the website renders from manifest.json's sha256. A young
+        # signature draws heuristic false-positives in some engines (signing
+        # raised the floor, it did not remove them), so a public scan link per
+        # release stays the rebuttal a user can check for themselves. Runs
+        # before the notes so the links resolve at publish time.
+        # Skipped automatically when VT_API_KEY is absent (forks, dry-run), and
+        # never fails the release.
+        if: |
+          (startsWith(github.ref, 'refs/tags/') ||
+           (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')) &&
+          env.VT_API_KEY != ''
+        continue-on-error: true
+        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          update_release_body: false
+          # Free public API allows 4 lookups/minute; stay within it.
+          request_rate: 4
+          files: |
+            dist/STM-Windows-*.exe
+            dist/STM-macOS-*.dmg
+            dist/STM-Linux-x64-*.tar.gz
+
+      - name: VirusTotal gate (stop the release on heavy detection)
+        # Waits for the scans of the just-uploaded desktop apps to complete and
+        # stops the release if an artifact is flagged by too many engines. A
+        # handful of heuristic false-positives is normal for a desktop app with
+        # a young signature and must NOT block a release; only a broad detection
+        # (>= 10 engines OR >= 15% of them calling it malicious) does.
+        # If VirusTotal does not finish in the time budget we proceed and warn,
+        # so a VT outage never holds a release hostage. Skipped without VT_API_KEY.
+        if: |
+          (startsWith(github.ref, 'refs/tags/') ||
+           (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '')) &&
+          env.VT_API_KEY != ''
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+        run: |
+          set -u
+          THRESHOLD=10   # fail if at least this many engines call it malicious
+          RATIO_PCT=15   # ...or at least this percent of all engines do
+          DEADLINE=$(( $(date +%s) + 360 ))  # ~6 min for the scans to finish
+          fail=0
+          for f in "STM-Windows-${VERSION}.exe" "STM-macOS-${VERSION}.dmg" "STM-Linux-x64-${VERSION}.tar.gz"; do
+            sha=$(awk -v n="$f" '$2==n{print $1}' SHA256SUMS)
+            if [ -z "$sha" ]; then echo "::warning::no SHA256 for $f, not gating it"; continue; fi
+            mal=""; total=""; resp=""
+            while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+              resp=$(curl -s -H "x-apikey: $VT_API_KEY" "https://www.virustotal.com/api/v3/files/$sha" || true)
+              # Wait for the scan to actually carry engine verdicts. A freshly
+              # uploaded file briefly reports an all-zero stats block (total 0)
+              # before engines report; breaking on that would pass the gate
+              # trivially and could miss a real detection (seen v0.8.30: 0/0).
+              total=$(printf '%s' "$resp" | jq -r '[.data.attributes.last_analysis_stats[]?] | add // 0' 2>/dev/null || echo 0)
+              if [ "${total:-0}" -gt 0 ]; then
+                mal=$(printf '%s' "$resp" | jq -r '.data.attributes.last_analysis_stats.malicious // 0')
+                break
+              fi
+              sleep 20
+            done
+            if [ -z "$mal" ]; then
+              echo "::warning::VirusTotal scan for $f did not complete in time; releasing without gating it"
+              continue
+            fi
+            pct=0; if [ "${total:-0}" -gt 0 ]; then pct=$(( mal * 100 / total )); fi
+            echo "$f: $mal/$total engines malicious (${pct}%)"
+            # Name the flagging engines + their detection names, so a heuristic
+            # false-positive can be reported to the vendor, and a real
+            # detection is identifiable at a glance instead of just a count.
+            if [ "${mal:-0}" -gt 0 ]; then
+              printf '%s' "$resp" | jq -r '.data.attributes.last_analysis_results | to_entries[] | select(.value.category=="malicious" or .value.category=="suspicious") | "    \(.value.category): \(.key) -> \(.value.result)"' 2>/dev/null || true
+            fi
+            if [ "$mal" -ge "$THRESHOLD" ] || [ "$pct" -ge "$RATIO_PCT" ]; then
+              echo "::error::$f is flagged malicious by $mal of $total engines (${pct}%), above the gate"
+              fail=1
+            fi
+          done
+          if [ "$fail" = 1 ]; then
+            echo "::error::VirusTotal gate: a release artifact is flagged above the threshold. Release stopped, investigate the report before retrying."
+            exit 1
+          fi
+          echo "VirusTotal gate passed (heuristic false-positives are below the threshold)."
+
+      - name: Generate release notes
+        working-directory: dist
+        env:
+          VERSION: ${{ needs.build-agent.outputs.version }}
+          # Presence toggles the signing paragraph in the notes below so they
+          # match what the Windows build job actually did with the same secret.
+          CERT_THUMBPRINT: ${{ secrets.CERT_THUMBPRINT }}
+          # The same idea for the Mac half, from the macOS job's own outputs
+          # rather than a fixed sentence. The notes used to state "macOS builds
+          # are not notarized yet" unconditionally, and kept saying it for every
+          # release after notarization started working, on downloads that
+          # Gatekeeper opens without a word.
+          MAC_CONFIGURED: ${{ needs.build-desktop-macos.outputs.configured }}
+          MAC_NOTARIZED: ${{ needs.build-desktop-macos.outputs.notarized }}
+          IS_PREVIEW: ${{ inputs.preview }}
+        run: |
+          {
+            echo "## STM ${VERSION}"
+            echo
+            # A tester arriving from a link should not have to work out what
+            # they are holding, so it says so up front, plus the two things
+            # that differ from a release: it is not what the website offers,
+            # and the app will not offer it as an update either.
+            if [ "${IS_PREVIEW}" = "true" ]; then
+              echo "> **Preview build.** Signed and installable like any release, but published for testing rather than for everyone."
+              echo "> It is not marked as the latest release, and the app's update check will not offer it, so an installed preview"
+              echo "> stays put until you replace it yourself. Tell me what breaks."
+              echo
+            fi
+            echo "**Built from commit:** \`${GITHUB_SHA}\`"
+            echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo
+            cat changelog.md
+            echo
+            cat <<MD
+          ### Downloads
+
+          | Platform | File |
+          |---|---|
+          | Windows desktop app | [STM-Windows-${VERSION}.exe](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/STM-Windows-${VERSION}.exe) |
+          | macOS desktop app | [STM-macOS-${VERSION}.dmg](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/STM-macOS-${VERSION}.dmg) |
+          | Linux desktop app (x86_64) | [STM-Linux-x64-${VERSION}.tar.gz](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/STM-Linux-x64-${VERSION}.tar.gz) |
+          | Stick agent (ARMv7l, real target) | [stmanager-armv7l](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/stmanager-armv7l) |
+          | Stick agent (ARM64, reserve) | [stmanager-arm64](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/stmanager-arm64) |
+          | Stick agent (amd64, test rig) | [stmanager-amd64](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/stmanager-amd64) |
+          | Spotify sidecar (go-librespot, ARMv7l) | [go-librespot-armv7l](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/go-librespot-armv7l) |
+          | Checksums | [SHA256SUMS](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/SHA256SUMS) |
+          | Machine-readable | [manifest.json](https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}/manifest.json) |
+
+          \`manifest.json\` lists every file with its checksum for tools that fetch the current downloads. The desktop app filenames carry the version; the stick agent binaries keep stable \`/releases/latest/download/<file>\` URLs for direct linking.
+
+          ### System requirements
+
+          | | |
+          |---|---|
+          | Windows | Windows 10 or 11, 64-bit. The app uses Microsoft Edge WebView2; Windows 7 and 8 are not supported. |
+          | macOS | macOS 12 Monterey or newer. |
+          | Linux | 64-bit (x86_64) with WebKitGTK (webkit2gtk 4.x) on a current glibc-based distribution. |
+          | Speaker | Bose SoundTouch 10, 20, 30 or Portable on the final Bose firmware (27.0.6). |
+
+          ### Verify your download
+
+          Every binary in this release is attested by GitHub's build provenance system.
+
+          \`\`\`bash
+          # SHA256 checksum
+          sha256sum -c SHA256SUMS
+
+          # Sigstore attestation (requires GitHub CLI)
+          gh attestation verify STM-Windows-${VERSION}.exe --owner ${GITHUB_REPOSITORY_OWNER}
+          \`\`\`
+
+          MD
+          # Signing status, one line per platform, each written from the same
+          # signal that gates the signing work in that platform's build job, so
+          # the notes cannot claim a state the binaries do not have. The macOS
+          # cases mirror the "Refuse to publish an unnotarized macOS build"
+          # guard below: accepted means a stapled ticket shipped, timeout means
+          # the submission is still queued at Apple and the build went out
+          # signed but without a ticket.
+          echo "### Code signing"
+          echo
+          if [ -n "${CERT_THUMBPRINT}" ]; then
+            echo "**Windows:** signed with a Certum Open Source code signing certificate. SmartScreen may still warn while the signature builds download reputation."
+          else
+            echo "**Windows:** this build is not code-signed, so SmartScreen warns on first download."
+          fi
+          echo
+          case "${MAC_CONFIGURED}:${MAC_NOTARIZED}" in
+            true:accepted)
+              echo "**macOS:** signed with a Developer ID certificate and notarized by Apple. The app and the disk image each carry a stapled ticket, so Gatekeeper opens them without a warning, offline included." ;;
+            true:*)
+              echo "**macOS:** signed with a Developer ID certificate, but Apple's notary service did not return a verdict in time for this build, so Gatekeeper warns on first launch." ;;
+            *)
+              echo "**macOS:** this build is ad-hoc signed and not notarized, so Gatekeeper warns on first launch." ;;
+          esac
+          echo
+          echo "Any warning you do see, and the exact click path past it, is documented on the website Verify page."
+          # VirusTotal: linked to the permanent per-hash report so it survives and
+          # matches what the website renders from manifest.json's sha256. Only when
+          # VT_API_KEY is set (the upload step above ran), else the links would 404.
+          if [ -n "${VT_API_KEY}" ]; then
+            wsha=$(awk -v f="STM-Windows-${VERSION}.exe" '$2==f{print $1}' SHA256SUMS)
+            msha=$(awk -v f="STM-macOS-${VERSION}.dmg" '$2==f{print $1}' SHA256SUMS)
+            lsha=$(awk -v f="STM-Linux-x64-${VERSION}.tar.gz" '$2==f{print $1}' SHA256SUMS)
+            echo
+            echo "### VirusTotal scan"
+            echo
+            echo "Each binary in this release is uploaded to VirusTotal on build, so the unsigned apps' heuristic false-positives are checkable. Live reports for this exact build:"
+            echo
+            echo "| Platform | Report |"
+            echo "|---|---|"
+            [ -n "$wsha" ] && echo "| Windows | [VirusTotal](https://www.virustotal.com/gui/file/$wsha) |"
+            [ -n "$msha" ] && echo "| macOS | [VirusTotal](https://www.virustotal.com/gui/file/$msha) |"
+            [ -n "$lsha" ] && echo "| Linux | [VirusTotal](https://www.virustotal.com/gui/file/$lsha) |"
+          fi
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Refuse to publish an unsigned Windows build
+        # Last line of defence for the v0.9.22 accident: a real release whose
+        # signing job did not succeed must FAIL here, loudly, instead of
+        # publishing a Windows download that trips SmartScreen for everyone.
+        if: github.event.inputs.version != ''
+        env:
+          SIGN_RESULT: ${{ needs.sign-windows.result }}
+        run: |
+          if [ "${SIGN_RESULT}" != "success" ]; then
+            echo "::error::sign-windows did not succeed (result: ${SIGN_RESULT}). Refusing to publish an unsigned Windows build. Connect the SimplySign session and run the workflow again."
+            exit 1
+          fi
+          echo "Windows build is signed."
+
+      - name: Refuse to publish an unnotarized macOS build
+        # The macOS counterpart of the guard above, with one difference: it only
+        # bites once the Apple credentials are actually configured. Before that a
+        # release still ships (ad-hoc signed, as it did before), and afterwards a
+        # notarization that silently stops working blocks the release instead of
+        # publishing a download that Gatekeeper refuses.
+        if: github.event.inputs.version != ''
+        env:
+          MAC_CONFIGURED: ${{ needs.build-desktop-macos.outputs.configured }}
+          MAC_NOTARIZED: ${{ needs.build-desktop-macos.outputs.notarized }}
+        run: |
+          # A REJECTION blocks: Apple looked at the build and refused it, and
+          # the macOS job fails outright in that case, so this never sees
+          # "rejected" as a result. A TIMEOUT does not block: the submission is
+          # still queued at Apple and says nothing about the build, and holding
+          # a finished release for it helps nobody.
+          case "${MAC_CONFIGURED}:${MAC_NOTARIZED}" in
+            true:accepted)
+              echo "macOS build is signed, notarized and stapled." ;;
+            true:timeout)
+              echo "::warning::Apple did not return a verdict in time. The macOS build ships signed but NOT notarized, so it shows the first-launch warning. The submission is still queued at Apple; the website's macOS instructions stay as they are for this release." ;;
+            true:*)
+              echo "::warning::The macOS build was signed but notarization did not complete (result: '${MAC_NOTARIZED}'). It ships without a ticket." ;;
+            *)
+              echo "::warning::Apple credentials are not configured; the macOS build is ad-hoc signed and shows the unidentified-developer warning on first launch." ;;
+          esac
+
+      - name: Publish GitHub Release
+        # Only on a real release: a dispatch with a version input. A no-version
+        # dispatch / scheduled run reaches here but skips publishing (build +
+        # manifest + notes only).
+        if: github.event.inputs.version != ''
+        # tag_name is explicit so the workflow_dispatch path works:
+        # the action creates the tag at github.sha when it does not
+        # already exist. The tag-push path uses the same value (the
+        # version derived from the pushed tag), so behaviour matches.
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          # RELEASE_PUBLISH_PAT (fine-grained PAT, this repo, Contents R/W):
+          # GitHub now rejects the built-in GITHUB_TOKEN for release
+          # creates/updates whose tag is not the CURRENT branch head
+          # ("Resource not accessible by integration", v0.9.21 post-mortem
+          # 2026-07-27 - main had moved during the 30-minute build). A PAT has
+          # no head restriction, so the publish succeeds no matter what lands
+          # on main mid-run. Falls back to the built-in token when the secret
+          # is absent (dry-runs, forks), where nothing is published anyway.
+          token: ${{ secrets.RELEASE_PUBLISH_PAT || github.token }}
+          tag_name: ${{ needs.build-agent.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/STM-Windows-*.exe
+            dist/STM-Windows-*.zip
+            dist/STM-macOS-*.dmg
+            dist/STM-macOS-*.zip
+            dist/STM-Linux-x64-*.tar.gz
+            dist/stmanager-armv7l
+            dist/stmanager-arm64
+            dist/stmanager-amd64
+            dist/go-librespot-armv7l
+            dist/stm-shim.so
+            dist/SHA256SUMS
+            dist/manifest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: false
+          draft: false
+          # This is what keeps a preview out of everyone's way: GitHub's
+          # "latest" (the website download, the stable
+          # /releases/latest/download links, and the in-app update check that
+          # reads from them) skips pre-releases entirely.
+          prerelease: ${{ inputs.preview == true }}
+          make_latest: ${{ inputs.preview == true && 'false' || 'legacy' }}

@@ -1,0 +1,475 @@
+// Command relnotes generates human-facing release notes from the
+// Conventional Commit subjects between two git refs.
+//
+// It is run by the release workflow to produce two artifacts:
+//
+//   - a Markdown "What's changed" block, inserted at the top of the
+//     GitHub Release body, and
+//   - a JSON object ({"markdown": ..., "items": [...]}) merged into
+//     manifest.json as the "notes" field, so the website and the
+//     desktop app can show the same change list without scraping the
+//     Releases UI.
+//
+// Only user-facing commit types are kept (feat, fix, perf) plus any
+// commit flagged breaking (a "!" before the colon). Noise like chore,
+// ci, build, test, style, refactor, and docs is dropped, so a user
+// reading the notes sees only what tells them whether the upgrade is
+// worth it.
+//
+// It is intentionally dependency-free (standard library + the git CLI)
+// to stay inside the project's supply-chain posture: no new third-party
+// action or module in the release path.
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// change is one parsed Conventional Commit that made the cut.
+type change struct {
+	Type     string `json:"type"`
+	Scope    string `json:"scope,omitempty"`
+	Summary  string `json:"summary"`
+	Breaking bool   `json:"breaking"`
+	Commit   string `json:"commit,omitempty"`
+}
+
+// notes is the JSON shape merged into manifest.json under "notes".
+type notes struct {
+	Markdown string   `json:"markdown"`
+	Items    []change `json:"items"`
+}
+
+// sectionOrder is the display order and titles for the kept commit
+// types. Anything not listed here (and not breaking) is dropped.
+var sectionOrder = []struct{ key, title string }{
+	{"feat", "New features"},
+	{"fix", "Fixes"},
+	{"perf", "Performance"},
+}
+
+// subjectRE parses "type(scope)!: summary". scope and "!" are optional.
+var subjectRE = regexp.MustCompile(`^([a-z]+)(?:\(([^)]*)\))?(!)?:\s*(.+)$`)
+
+func main() {
+	var (
+		from    = flag.String("from", "", "start ref (exclusive); auto-detected as the previous tag when empty")
+		to      = flag.String("to", "HEAD", "end ref (inclusive)")
+		ver     = flag.String("version", "", "version label shown in the heading, e.g. v0.6.21")
+		outMD   = flag.String("out-md", "", "write the Markdown block to this file (default stdout)")
+		outJSON = flag.String("out-json", "", "write the notes JSON object to this file")
+	)
+	flag.Parse()
+
+	start := *from
+	if start == "" {
+		start = previousTag(*to) // may stay empty for the very first release
+	}
+
+	changes, err := collect(start, *to)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "relnotes:", err)
+		os.Exit(1)
+	}
+
+	md := renderMarkdown(*ver, changes)
+
+	if *outMD != "" {
+		if err := os.WriteFile(*outMD, []byte(md), 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "relnotes:", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Print(md)
+	}
+
+	if *outJSON != "" {
+		b, err := json.MarshalIndent(notes{Markdown: md, Items: changes}, "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "relnotes:", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(*outJSON, b, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "relnotes:", err)
+			os.Exit(1)
+		}
+	}
+}
+
+// previewTagGlob matches the tags of the preview channel, which go to a handful
+// of testers and never to everyone.
+//
+// They must not bound a release's notes. A preview tagged between two real
+// releases is the newest tag by every measure git knows, so the next real
+// release would list only what changed since the preview and silently drop
+// everything before it: exactly the changes the preview existed to try out,
+// missing from the notes of the release that finally carries them.
+const previewTagGlob = "*-preview.*"
+
+// previousTag returns the most recent non-preview tag reachable from before
+// ref, or "" when there is none (the first release). Errors are treated as "no
+// previous tag" so a fresh repo still produces notes.
+func previousTag(ref string) string {
+	out, err := exec.Command("git", "describe", "--tags", "--abbrev=0",
+		"--exclude", previewTagGlob, ref+"^").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// collect runs git log over (start, end] and returns the kept changes
+// in commit order (newest first), de-duplicated by type+scope+summary.
+func collect(start, end string) ([]change, error) {
+	rng := end
+	if start != "" {
+		rng = start + ".." + end
+	}
+	// %H<TAB>%s<TAB>%b, one record per commit, no merges. The body is included
+	// so a commit can declare extra entries via Release-Note trailers; records
+	// are separated by a NUL because bodies contain newlines.
+	args := []string{"log", "--no-merges", "--pretty=format:%H\t%s\t%b%x00", rng}
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return nil, fmt.Errorf("git log %s: %w", rng, err)
+	}
+
+	var changes []change
+	seen := map[string]bool{}
+	dropped := map[string]bool{}
+	add := func(c change, hash string) {
+		c.Commit = shortHash(hash)
+		key := c.Type + "|" + c.Scope + "|" + c.Summary
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		changes = append(changes, c)
+	}
+	for _, rec := range strings.Split(string(out), "\x00") {
+		rec = strings.TrimLeft(rec, "\n")
+		if strings.TrimSpace(rec) == "" {
+			continue
+		}
+		hash, rest, ok := strings.Cut(rec, "\t")
+		if !ok {
+			continue
+		}
+		subject, body, _ := strings.Cut(rest, "\t")
+		// The subject is ALWAYS listed (when it is a user-facing type), and
+		// trailers ADD entries. Trailers used to REPLACE the subject, on the
+		// theory that a commit spelling out its changes had already said what
+		// it wants said; in practice that rule swallowed real entries three
+		// times in one day (2026-08-25): a commit fixing one thing and carrying
+		// a Release-Note trailer for a DIFFERENT change it also made lost its
+		// own subject line, silently. A commit that fixes one thing does not
+		// think of itself as "declaring entries". Exact repeats are folded by
+		// the type|scope|summary dedup below, so an author who restates the
+		// subject as a trailer still gets one line; an author who wants the
+		// subject GONE says so with a Release-Note-Drop.
+		// Withdrawals are read FIRST and unconditionally: a commit whose only
+		// purpose is to take back an entry carries no trailers of its own, and
+		// reading drops inside the trailer branch silently ignored exactly that
+		// commit.
+		for _, d := range parseNoteDrops(body) {
+			dropped[strings.ToLower(d)] = true
+		}
+		trailers := parseNoteTrailers(body)
+		if c, keep := parseSubject(subject); keep {
+			// A trailer that restates the subject in other words is the
+			// author's polished wording of the SAME entry, not a second
+			// change: on 2026-09-06 two such commits produced four lines for
+			// two fixes. The trailer wins, the subject is folded into it.
+			if !restatedBy(c, trailers) {
+				add(c, hash)
+			}
+		}
+		for _, c := range trailers {
+			add(c, hash)
+		}
+	}
+	// Withdraw entries a later commit invalidated. Direction changes inside one
+	// release window are normal, and announcing a behaviour that was removed
+	// again before anyone could see it is worse than saying nothing: it sends
+	// users looking for something that is not there.
+	if len(dropped) > 0 {
+		kept := changes[:0]
+		for _, c := range changes {
+			if dropped[strings.ToLower(c.Summary)] {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		changes = kept
+	}
+	return changes, nil
+}
+
+// prNumberSuffixRE matches the "" that a squash merge appends to the
+// subject. It is bookkeeping for the repository, not something a user reading
+// "what changed" needs, so it is trimmed off the displayed summary.
+var prNumberSuffixRE = regexp.MustCompile(`\s*\(#\d+\)\s*$`)
+
+// noteTrailerRE matches a "Release-Note: type(scope): summary" line anywhere
+// in a commit body.
+var noteTrailerRE = regexp.MustCompile(`(?im)^[ \t]*Release-Note:[ \t]*(.+?)[ \t]*$`)
+
+// noteDropRE matches a "Release-Note-Drop: <exact summary>" line.
+var noteDropRE = regexp.MustCompile(`(?im)^[ 	]*Release-Note-Drop:[ 	]*(.+?)[ 	]*$`)
+
+// parseNoteDrops extracts entries this commit withdraws from the notes.
+//
+// For work that was announced and then changed course before the release went
+// out. The match is on the rendered summary, case-insensitively, because that
+// is what a reader of the preview can see and copy.
+func parseNoteDrops(body string) []string {
+	var out []string
+	for _, m := range noteDropRE.FindAllStringSubmatch(body, -1) {
+		if v := capitalize(strings.TrimSpace(m[1])); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parseNoteTrailers extracts the entries a commit declares in its body.
+//
+// A squash merge collapses a branch into ONE subject, so a pull request that
+// fixed three separate user-visible things announced only the one the subject
+// happened to name and the other two shipped silently. Any commit can now name
+// additional entries:
+//
+//	Release-Note: fix(webui): saving a very long playlist as a preset works
+//
+// Each trailer is parsed exactly like a subject, so the same type filter and
+// the same "the summary is shown to users almost verbatim" rule apply, and a
+// commit whose own type is not user-facing (chore, docs) can still carry them.
+// A trailer that does not parse is REPORTED, not silently dropped. Three
+// commits in one release wrote theirs as prose over two lines with no
+// type(scope): prefix (2026-09-11); all three vanished, the notes fell back to
+// the rougher commit subject, and there was no output anywhere to say so. The
+// prefix stays required, because it carries the type filter and the scope label
+// that ends up in brackets after every line. What changes is that losing one is
+// now loud.
+func parseNoteTrailers(body string) []change {
+	var out []change
+	for _, m := range noteTrailerRE.FindAllStringSubmatch(body, -1) {
+		c, keep := parseSubject(m[1])
+		if !keep {
+			noteTrailerProblem(m[1], "it does not start with type(scope): so it was not added to the notes")
+			continue
+		}
+		out = append(out, c)
+	}
+	// A trailer wrapped over two lines loses its tail to the line-anchored
+	// regex above, which is the quieter half of the same mistake: the entry
+	// still appears, truncated mid-sentence, and reads as a typo in the
+	// release rather than as a broken trailer.
+	for _, line := range wrappedNoteTrailers(body) {
+		noteTrailerProblem(line, "it is wrapped onto a second line, so only the first line was read")
+	}
+	return out
+}
+
+// noteTrailerProblems collects what went wrong, so a caller can decide whether
+// to warn or to fail. Package-level because the parse is called per commit from
+// several places and the report belongs to the run, not to one commit.
+var noteTrailerProblems []string
+
+// noteTrailerProblem records one broken trailer and prints it immediately on
+// stderr, where it lands in the release job's log next to the preview.
+func noteTrailerProblem(payload, why string) {
+	msg := fmt.Sprintf("release-note trailer ignored: %q: %s", payload, why)
+	noteTrailerProblems = append(noteTrailerProblems, msg)
+	fmt.Fprintln(os.Stderr, "warning: "+msg)
+}
+
+// wrappedNoteTrailers finds "Release-Note:" lines whose sentence continues on
+// the next line. A continuation is an indented, non-empty line that is not
+// itself a trailer and does not start a new paragraph.
+func wrappedNoteTrailers(body string) []string {
+	var out []string
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToLower(t), "release-note:") {
+			continue
+		}
+		if i+1 >= len(lines) {
+			continue
+		}
+		next := lines[i+1]
+		if strings.TrimSpace(next) == "" || !strings.HasPrefix(next, " ") && !strings.HasPrefix(next, "\t") {
+			continue
+		}
+		nt := strings.ToLower(strings.TrimSpace(next))
+		if strings.HasPrefix(nt, "release-note") || strings.HasPrefix(nt, "co-authored-by:") ||
+			strings.HasPrefix(nt, "claude-session:") || strings.HasPrefix(nt, "signed-off-by:") {
+			continue
+		}
+		out = append(out, strings.TrimSpace(strings.TrimPrefix(t, "Release-Note:")))
+	}
+	return out
+}
+
+func shortHash(h string) string {
+	if len(h) > 9 {
+		return h[:9]
+	}
+	return h
+}
+
+// parseSubject parses one commit subject. It returns keep=false when the
+// subject is not a Conventional Commit or its type is not user-facing
+// (and it is not flagged breaking).
+func parseSubject(subject string) (change, bool) {
+	m := subjectRE.FindStringSubmatch(strings.TrimSpace(subject))
+	if m == nil {
+		return change{}, false
+	}
+	c := change{
+		Type:     m[1],
+		Scope:    m[2],
+		Breaking: m[3] == "!",
+		Summary:  capitalize(strings.TrimSpace(prNumberSuffixRE.ReplaceAllString(m[4], ""))),
+	}
+	if c.Breaking {
+		return c, true
+	}
+	for _, s := range sectionOrder {
+		if s.key == c.Type {
+			return c, true
+		}
+	}
+	return change{}, false
+}
+
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	r[0] = []rune(strings.ToUpper(string(r[0])))[0]
+	return string(r)
+}
+
+// renderMarkdown builds the "What's changed" block: a Breaking changes
+// section first (when any), then one section per kept type in
+// sectionOrder. Each line is "- Summary (scope)".
+func renderMarkdown(version string, changes []change) string {
+	var b strings.Builder
+	if version != "" {
+		fmt.Fprintf(&b, "## What's changed in %s\n\n", version)
+	} else {
+		b.WriteString("## What's changed\n\n")
+	}
+
+	if len(changes) == 0 {
+		b.WriteString("Maintenance release: internal improvements only, no user-facing changes.\n")
+		return b.String()
+	}
+
+	var breaking []change
+	for _, c := range changes {
+		if c.Breaking {
+			breaking = append(breaking, c)
+		}
+	}
+	if len(breaking) > 0 {
+		b.WriteString("### Breaking changes\n\n")
+		writeList(&b, breaking)
+		b.WriteString("\n")
+	}
+
+	for _, s := range sectionOrder {
+		var bucket []change
+		for _, c := range changes {
+			if c.Type == s.key && !c.Breaking {
+				bucket = append(bucket, c)
+			}
+		}
+		if len(bucket) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "### %s\n\n", s.title)
+		writeList(&b, bucket)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func writeList(b *strings.Builder, cs []change) {
+	// Stable, readable order within a section: by scope, then summary.
+	sort.SliceStable(cs, func(i, j int) bool {
+		if cs[i].Scope != cs[j].Scope {
+			return cs[i].Scope < cs[j].Scope
+		}
+		return cs[i].Summary < cs[j].Summary
+	})
+	for _, c := range cs {
+		if c.Scope != "" {
+			fmt.Fprintf(b, "- %s (%s)\n", c.Summary, c.Scope)
+		} else {
+			fmt.Fprintf(b, "- %s\n", c.Summary)
+		}
+	}
+}
+
+// restatedBy reports whether one of the trailers says the same thing as the
+// subject entry: same type and scope, and most of the words in common. Exact
+// repeats are already folded by the type|scope|summary key; this catches the
+// reworded repeat. Word overlap is measured on the shorter of the two word
+// sets so a longer trailer that adds a clause still counts as a restatement.
+func restatedBy(subject change, trailers []change) bool {
+	sw := significantWords(subject.Summary)
+	if len(sw) == 0 {
+		return false
+	}
+	for _, t := range trailers {
+		if t.Type != subject.Type || t.Scope != subject.Scope {
+			continue
+		}
+		tw := significantWords(t.Summary)
+		if len(tw) == 0 {
+			continue
+		}
+		common := 0
+		for w := range sw {
+			if tw[w] {
+				common++
+			}
+		}
+		shorter := len(sw)
+		if len(tw) < shorter {
+			shorter = len(tw)
+		}
+		if common*10 >= shorter*6 { // 60% of the shorter set
+			return true
+		}
+	}
+	return false
+}
+
+// significantWords is the set of lower-cased words in a summary minus the
+// function words that every sentence shares.
+func significantWords(s string) map[string]bool {
+	stop := map[string]bool{"a": true, "an": true, "the": true, "no": true, "not": true, "now": true, "is": true, "of": true,
+		"so": true, "with": true, "it": true, "its": true, "and": true, "or": true, "to": true, "in": true, "on": true,
+		"longer": true, "instead": true, "there": true, "that": true, "this": true, "as": true, "at": true, "by": true}
+	out := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
+	}) {
+		if !stop[w] {
+			out[w] = true
+		}
+	}
+	return out
+}

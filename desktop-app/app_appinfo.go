@@ -1,0 +1,269 @@
+package main
+
+// This file was split out of app.go (wave-1 move-only refactor):
+// app version/info and the app update check.
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"runtime"
+	"stmanager-app/agentbin"
+	"strings"
+	"sync"
+	"time"
+)
+
+// AppVersion returns the semver version of the running app.
+func (a *App) AppVersion() string { return appVersion }
+
+// AppInfo returns app metadata (version, build, author, URLs) for
+// the About dialog, footer and auto-update check.
+//
+// UpdateManifestURL points to a small JSON file of the form
+//
+//	{"version":"1.1.0","build":"2026-06-01-0900","downloadUrl":"https://.../app-windows-amd64.exe","notes":"..."}
+//
+// On startup the app checks whether the remote version is greater than its
+// own and then shows an update banner. Empty = auto-update off.
+type AppInfo struct {
+	Version           string `json:"version"`
+	Build             string `json:"build"`
+	Author            string `json:"author"`
+	GitHubURL         string `json:"githubUrl"`
+	WebsiteURL        string `json:"websiteUrl"`
+	DonateURL         string `json:"donateUrl"`
+	DonateSlogan      string `json:"donateSlogan"`
+	UpdateManifestURL string `json:"updateManifestUrl"`
+	// AgentSha256 is the hex SHA256 of the ARM agent this build carries. It is
+	// what decides whether a speaker is current, because it is the only answer
+	// that cannot drift: the speaker reports the same hash for the binary it
+	// runs (agentBinarySha256).
+	//
+	// The version and build stamp alone were not enough, and v0.9.88 is why.
+	// The release workflow took its build stamp inside a three-leg matrix, so
+	// the app was stamped 2026-09-26-2023 while the agent it embeds and pushes
+	// carried 2026-09-26-2022, one minute apart, same commit. Every speaker on
+	// earth then looked permanently out of date to its own app, and a retry ran
+	// the full wait and ended in "the update did not take effect", which was
+	// false. The stamp is fixed at the source too, but a clock should not have
+	// been the authority in the first place.
+	AgentSha256 string `json:"agentSha256"`
+	// No agent-binary size here on purpose. It used to be exported so the
+	// frontend could run its own pre-OTA storage check, and that check compared
+	// the RAW size against the box's free figure and told a user his update
+	// needed 13.9 MB when the real, compression-credited need was about 10.7 MB
+	// (2026-08-22). The verdict now comes from BoxStoragePreflight, which goes
+	// through the same nandNeedCompressed gate as the push itself; handing the
+	// raw size back to the UI again would only invite that second, wrong
+	// implementation to grow back.
+}
+
+// Versions are set via -ldflags X in the build; defaults are for
+// development only.
+var (
+	appVersion = "1.0.0"
+	appBuild   = "dev"
+)
+
+func (a *App) AppInfo() AppInfo {
+	return AppInfo{
+		Version:     appVersion,
+		Build:       appBuild,
+		AgentSha256: embeddedAgentSha256(),
+		Author:      "Juan Carlos Benitez (jcbenitezhe)",
+		GitHubURL:   projectURL,
+		WebsiteURL:  siteURL,
+		DonateURL:   "", // populated once the PayPal link on the website is live
+		// DonateSlogan is left empty so the frontend renders the
+		// locale-aware fallback from the i18n bundle. Hardcoding
+		// German here would shadow the bundle for every locale.
+		DonateSlogan: "",
+		// Empty disables the update check: this build has no update endpoint
+		// of its own. CheckAppUpdate appends the running client's context
+		// (?v=&b=&os=&arch=&lang=) to whatever URL is set here or in
+		// STM_UPDATE_MANIFEST_URL; see it for the request/response contract.
+		UpdateManifestURL: "",
+	}
+}
+
+// projectURL is the repository; siteURL the GitHub Pages website published
+// from site/. Keep in sync with desktop-app/frontend/src/project.js.
+const (
+	projectURL = "https://github.com/jcbenitezhe/SoundTouchManager"
+	siteURL    = "https://jcbenitezhe.github.io/SoundTouchManager"
+)
+
+// versionLess reports whether dotted numeric version a is strictly less
+// than b. Both may carry a leading "v" and a git-describe suffix
+// ("-3-gabc123-dirty"); only the leading numeric segments are compared,
+// so a dev build off tag v0.6.5 compares equal to the v0.6.5 release.
+func versionLess(a, b string) bool {
+	pa, pb := parseVersionParts(a), parseVersionParts(b)
+	for i := 0; i < len(pa) || i < len(pb); i++ {
+		var x, y int
+		if i < len(pa) {
+			x = pa[i]
+		}
+		if i < len(pb) {
+			y = pb[i]
+		}
+		if x != y {
+			return x < y
+		}
+	}
+	return false
+}
+
+func parseVersionParts(v string) []int {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	var parts []int
+	for _, seg := range strings.Split(v, ".") {
+		n, ok := 0, false
+		for _, r := range seg { // stop at the first non-numeric rune (git suffix)
+			if r < '0' || r > '9' {
+				break
+			}
+			n, ok = n*10+int(r-'0'), true
+		}
+		if !ok {
+			break
+		}
+		parts = append(parts, n)
+	}
+	return parts
+}
+
+// CheckAppUpdate fetches the UpdateManifestURL and returns the manifest
+// when the remote version is strictly newer than the running one.
+//
+// Request: GET UpdateManifestURL with the running client's context as
+// query parameters (all non-identifying, no device/network data):
+//
+//	v     running app version    e.g. v0.6.5
+//	b     build stamp            e.g. 2026-06-01-1150
+//	os    runtime GOOS           windows | darwin | linux
+//	arch  runtime GOARCH         amd64 | arm64
+//	lang  active UI locale       e.g. de | en | uk (omitted if unset)
+//
+// Response: a small JSON object with string fields. version is required;
+// downloadUrl and notes are optional. The server may either always return
+// the latest release (the client filters with versionLess below) or only
+// respond with a body when v is older. Example:
+//
+//	{"version":"v0.6.6","build":"...","downloadUrl":"https://example.org/download/windows","notes":"..."}
+func (a *App) CheckAppUpdate() (result map[string]string, err error) {
+	// A failed check must be visible in the log. Somebody on whose machine
+	// this request always fails (firewall, AV proxy, DNS) otherwise presses
+	// the manual check for weeks, sees nothing, and reads the silence as "no
+	// update exists"; the exported log is the only place the real reason can
+	// surface. Declared before the recover defer so it runs after it and
+	// also logs a recovered panic.
+	defer func() {
+		if err != nil && a.logger != nil {
+			a.logger.Warn("app update check failed", "err", err)
+		}
+	}()
+	// The update check is best-effort and must never take the app down.
+	// Any unforeseen panic (a malformed response that trips a code path,
+	// a nil deref, etc.) is recovered here and reported as a plain error,
+	// so an unreachable or garbage endpoint can only ever mean "no banner".
+	defer func() {
+		if r := recover(); r != nil {
+			if a.logger != nil {
+				a.logger.Warn("CheckAppUpdate recovered from panic", "panic", r)
+			}
+			result, err = nil, fmt.Errorf("update check failed")
+		}
+	}()
+	// Kill switch to A/B test whether the startup update check is behind a
+	// report (e.g. a macOS start crash). With STM_NO_UPDATE_CHECK set
+	// the check is a no-op, so a user can run with it fully off and see if
+	// the crash persists.
+	if strings.TrimSpace(os.Getenv("STM_NO_UPDATE_CHECK")) != "" {
+		return map[string]string{}, nil
+	}
+	info := a.AppInfo()
+	manifestURL := info.UpdateManifestURL
+	// Dev/staging override: point the update check at a different
+	// manifest (a local mock or the staging endpoint) without
+	// rebuilding the baked-in production URL. Empty/unset uses the
+	// shipped URL, so this is inert in normal operation.
+	if override := strings.TrimSpace(os.Getenv("STM_UPDATE_MANIFEST_URL")); override != "" {
+		manifestURL = override
+	}
+	if manifestURL == "" {
+		return map[string]string{}, nil
+	}
+	reqURL := manifestURL
+	if u, perr := url.Parse(reqURL); perr == nil {
+		q := u.Query()
+		q.Set("v", info.Version)
+		q.Set("b", info.Build)
+		q.Set("os", runtime.GOOS)
+		q.Set("arch", runtime.GOARCH)
+		if loc := a.appLocale(); loc != "" {
+			q.Set("lang", loc)
+		}
+		u.RawQuery = q.Encode()
+		reqURL = u.String()
+	}
+	ctx, cancel := context.WithTimeout(a.appCtx(), 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Stable, identifiable agent string so the server can filter bots and
+	// keep meaningful update-check stats.
+	req.Header.Set("User-Agent", "STManager-Desktop/"+info.Version+" ("+runtime.GOOS+"; "+runtime.GOARCH+")")
+	// Use the pure-Go update client (embedded RootCAs + PreferGo), NOT the
+	// shared httpClient. The shared one leaves TLS verification to the
+	// platform, which on macOS runs through cgo (Security.framework) and
+	// crashed an old Mac on this very call. See updateHTTPClient.
+	resp, err := updateHTTPClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("manifest status %d", resp.StatusCode)
+	}
+	var m map[string]string
+	// Read cap is generous on purpose: the server caps notes at 1500
+	// *characters*, which in heavy multi-byte text (emoji/CJK) can be
+	// several KB. 4 KB risked truncating the JSON mid-notes and failing
+	// the decode (no banner); 16 KB leaves comfortable headroom.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16384)).Decode(&m); err != nil {
+		return nil, err
+	}
+	rv := m["version"]
+	// Only surface the banner when the remote version is strictly newer
+	// than the running one; equal or older (e.g. a dev build ahead of the
+	// published tag) stays silent.
+	if rv == "" || !versionLess(info.Version, rv) {
+		return map[string]string{}, nil
+	}
+	return m, nil
+}
+
+// embeddedAgentSha256 is the hash of the ARM agent compiled into this build,
+// computed once. An empty string on a dev build whose embed slot is the tracked
+// stub, which is correct: nothing to compare against, so the caller falls back
+// to the version and stamp.
+var embeddedAgentShaOnce = sync.OnceValue(func() string {
+	b := agentbin.Bytes()
+	if len(b) == 0 {
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+})
+
+func embeddedAgentSha256() string { return embeddedAgentShaOnce() }

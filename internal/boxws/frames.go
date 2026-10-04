@@ -1,0 +1,403 @@
+// Typed gabbo frame shapes for the <updates> envelope, plus the helpers for
+// bare-root frames (errorUpdate / userActivityUpdate) the envelope parse misses.
+
+package boxws
+
+import (
+	"encoding/xml"
+	"strings"
+)
+
+// handleMessage parses an incoming XML notification.
+//
+// Bose's WebSocket format for hardware preset buttons (measured 2026-05-15):
+//
+//	<updates deviceID="...">
+//	  <nowSelectionUpdated>
+//	    <preset id="1" ... >
+//	      <ContentItem source="UPNP" location="http://..." sourceAccount="..." isPresetable="true">
+//	        <itemName>NDR Info</itemName>
+//	      </ContentItem>
+//	    </preset>
+//	  </nowSelectionUpdated>
+//	</updates>
+//
+// The box follows up with `<nowSelectionUpdated><preset id="0">` and
+// INVALID_SOURCE when it cannot activate the source. We only care about the
+// first event with id >= 1.
+// wsContentItem is the <ContentItem> Bose nests inside a preset or nowPlaying.
+type wsContentItem struct {
+	Source        string `xml:"source,attr"`
+	Type          string `xml:"type,attr"`
+	Location      string `xml:"location,attr"`
+	SourceAccount string `xml:"sourceAccount,attr"`
+	IsPresetable  string `xml:"isPresetable,attr"`
+	ItemName      string `xml:"itemName"`
+}
+
+// wsPreset is a <preset> element (nowSelectionUpdated / presetSelectionUpdated /
+// presetsUpdated). Inner keeps the raw element body so a status marker like
+// INVALID_SOURCE / DO_NOT_RESUME can be matched within this element only, never
+// against an unrelated frame's track title.
+type wsPreset struct {
+	ID          string        `xml:"id,attr"`
+	ContentItem wsContentItem `xml:"ContentItem"`
+	Inner       string        `xml:",innerxml"`
+}
+
+// wsNowPlaying is the <nowPlaying> body. Bose has shipped playStatus both as a
+// child element and as an attribute across firmware builds, so capture both and
+// resolve with playStatus(); reading it typed is what stops a track title that
+// merely contains "STOP_STATE" from firing the user-stop suppressor.
+type wsNowPlaying struct {
+	Source         string        `xml:"source,attr"`
+	PlayStatusEl   string        `xml:"playStatus"`
+	PlayStatusAttr string        `xml:"playStatus,attr"`
+	ContentItem    wsContentItem `xml:"ContentItem"`
+}
+
+func (n wsNowPlaying) playStatus() string {
+	if n.PlayStatusEl != "" {
+		return n.PlayStatusEl
+	}
+	return n.PlayStatusAttr
+}
+
+// gabboFrame is the typed view of one <updates> notification. Bose sends one
+// update child per frame; the rest stay nil. Dispatching on which child is
+// present (and reading status markers from typed sub-fields) replaces the old
+// whole-frame strings.Contains sniffing, which mis-fired whenever a station
+// name or track title happened to contain a marker word such as STOP_STATE,
+// INVALID_SOURCE, or even an update element name.
+type gabboFrame struct {
+	XMLName        xml.Name      `xml:"updates"`
+	NowSelection   *wsPreset     `xml:"nowSelectionUpdated>preset"`
+	PresetSelected *wsPreset     `xml:"presetSelectionUpdated>preset"`
+	NowPlaying     *wsNowPlaying `xml:"nowPlayingUpdated>nowPlaying"`
+
+	// Presence-plus-body markers. The *struct with an Inner field is non-nil
+	// exactly when the child element is in the frame; Inner bounds any substring
+	// match (e.g. STANDBY) to that element's own body.
+	ConnectionState *struct {
+		Inner string `xml:",innerxml"`
+	} `xml:"connectionStateUpdated"`
+	PowerState *struct {
+		Inner string `xml:",innerxml"`
+	} `xml:"powerStateUpdated"`
+	VolumeUpdated *struct{} `xml:"volumeUpdated"`
+	// BassUpdated is the same shape for the bass control. Turning the bass knob
+	// on the speaker or its remote emits a burst of these, and until now every
+	// one was logged as an unrecognized frame: seven in 400 ms filled a field
+	// log while the real point, that this IS identifiable user activity, was
+	// lost (ST30 bundle, 2026-07-29).
+	BassUpdated *struct{} `xml:"bassUpdated"`
+	// BalanceUpdated is the same shape again, for the left/right balance of a
+	// stereo pair. It carries no value, and STM has nothing to do with it today
+	// beyond recognising it: the balance is read over HTTP, and the desktop app
+	// refreshes it on the events it already has. Typed so it stops being logged
+	// as an unrecognized shape on every source change (30 occurrences in one
+	// field bundle, 2026-09-09).
+	BalanceUpdated *struct{} `xml:"balanceUpdated"`
+	UserActivity   *struct{} `xml:"userActivityUpdate"`
+
+	// PresetsUpdated carries the box's full preset list when it changes; the
+	// landing spot for preset sync from the box.
+	PresetsUpdated *struct {
+		Presets []wsPreset `xml:"presets>preset"`
+	} `xml:"presetsUpdated"`
+
+	// ZoneUpdated carries the box's multiroom zone / stereo-pair membership when
+	// it changes. Non-nil whenever a <zoneUpdated><zone> is present; an empty
+	// <zone/> (Master == "") means the zone dissolved (Klaus 2026-06-12).
+	ZoneUpdated *wsZone `xml:"zoneUpdated>zone"`
+
+	// GroupUpdated carries the STEREO PAIR, which the firmware keeps separate
+	// from the zone: pairing two speakers emits groupUpdated, not zoneUpdated,
+	// and /getZone keeps reporting no members throughout. An empty <group />
+	// means the pair was torn down.
+	//
+	// Both speakers emit their own frame, which is what makes this the reliable
+	// place to notice a teardown. Undoing a pair in the BOSE app tells STM's
+	// cloud stand-in on the master only, so the other speaker kept its pair
+	// record forever - and a speaker that believes it is still half of a pair
+	// is no longer offered for pairing (field, 2026-08-04, three SoundTouch
+	// 10s). The frames were arriving the whole time and were logged as
+	// unrecognized.
+	GroupUpdated *wsGroupUpdated `xml:"groupUpdated"`
+
+	// LanguageUpdated carries the box's sysLanguage whenever it changes. Parsed
+	// typed (not left as an unrecognized frame) because the Wave firmware
+	// overwrites a user's language save within ~40-200 ms (2 then 3 back to
+	// back, live bundle 2026-07-25) and the revert can only be root-caused by
+	// timing the two frames against what else touched the box in that window.
+	LanguageUpdated *struct {
+		Sys string `xml:"sysLanguage"`
+	} `xml:"languageUpdated"`
+
+	// SourcesUpdated is the WRAPPED form of the sources-changed signal
+	// (<updates><sourcesUpdated/></updates>, doc 13.1.11). The box also sends
+	// it as a bare root element, recovered in the bare-root switch; both forms
+	// are on the wire. Only the bare form was handled at first, and three days
+	// later the wrapped one was measured as unrecognized noise on a live
+	// Portable, one per source change (2026-08-06), meaning the sources-changed
+	// callback never fired on wrapped-form chassis at all.
+	SourcesUpdated *struct{} `xml:"sourcesUpdated"`
+
+	// Known-and-ignored frames, named so routine box housekeeping stops
+	// surfacing as unmapped events in bundles and the hourly roll-up. The doc
+	// marks swUpdateStatusUpdated and siteSurveyResultsUpdated as requiring no
+	// client action, and swUpdateStatusUpdated rides along with every source
+	// change in the field. RecentsUpdated's documented body carries the box's
+	// new recents list; it is deliberately discarded because STM has no
+	// consumer for it (STM's own recents store is fed from its recall paths
+	// and the Spotify hook, never from the box). InfoUpdated just says a /info
+	// field such as the device name changed, which STM re-reads on demand.
+	// NONE of these feed noteExplainedActivity: they accompany source changes
+	// and box housekeeping, not user presses, and marking them "explained"
+	// would suppress real thumb detections.
+	SwUpdateStatus    *struct{} `xml:"swUpdateStatusUpdated"`
+	SiteSurveyResults *struct{} `xml:"siteSurveyResultsUpdated"`
+	RecentsUpdated    *struct{} `xml:"recentsUpdated"`
+	InfoUpdated       *struct{} `xml:"infoUpdated"`
+
+	// AcctModeUpdated announces that the box's cloud-account association
+	// changed (doc 13.1.3). Stated plainly: no field bundle has ever shown
+	// this frame on 27.0.6 and it may never fire. It is parsed anyway because
+	// the install pins acctMode=local, so IF it fires it is a direct marker of
+	// the association flipping, which would timestamp the state behind a 1036
+	// storm independently of the first rejected recall.
+	AcctModeUpdated *struct{} `xml:"acctModeUpdated"`
+
+	// SetupAPUpdated is the firmware announcing that its OWN setup access
+	// point went up or down: <updates><setupAPUpdated>true</setupAPUpdated>.
+	//
+	// It is the firmware saying in its own words that the speaker is about to
+	// leave the LAN, and it went into the unrecognized bucket. It
+	// is NOT the first sign: on the reporter's ST10 it arrived five seconds
+	// AFTER the source flipped to SETUP, so the source flip is what leads. It
+	// is the unambiguous one - a source of SETUP also happens on a box whose
+	// source is merely stuck and whose radio never goes anywhere.
+	//
+	// That capture sat seven and a half minutes into an install window in
+	// which the desktop app could reach the speaker at nothing, at any layer,
+	// and therefore reported a successful install as a failure.
+	//
+	// The body is the boolean as text, so a *string captures it and an absent
+	// element stays nil. Anything other than "true" is the AP going away.
+	SetupAPUpdated *string `xml:"setupAPUpdated"`
+}
+
+// wsGroupUpdated is the <groupUpdated> body. A self-closing <group /> still
+// yields a non-nil Group with no id and no roles: that is the teardown signal.
+type wsGroupUpdated struct {
+	Group *struct {
+		ID     string `xml:"id,attr"`
+		Name   string `xml:"name"`
+		Master string `xml:"masterDeviceId"`
+		Roles  []struct {
+			DeviceID string `xml:"deviceId"`
+			Role     string `xml:"role"`
+			IP       string `xml:"ipAddress"`
+		} `xml:"roles>groupRole"`
+	} `xml:"group"`
+}
+
+// toState flattens the frame into a GroupState.
+func (g *wsGroupUpdated) toState() GroupState {
+	var st GroupState
+	if g == nil || g.Group == nil {
+		return st
+	}
+	st.ID = strings.TrimSpace(g.Group.ID)
+	st.Name = strings.TrimSpace(g.Group.Name)
+	st.Master = strings.TrimSpace(g.Group.Master)
+	for _, r := range g.Group.Roles {
+		st.Members = append(st.Members, GroupMember{
+			DeviceID: strings.TrimSpace(r.DeviceID),
+			Role:     strings.TrimSpace(r.Role),
+			IP:       strings.TrimSpace(r.IP),
+		})
+	}
+	return st
+}
+
+// GroupState is a stereo pair as the box reports it. Paired reports whether a
+// pair exists at all; the zero value means the pair was torn down.
+type GroupState struct {
+	ID      string
+	Name    string
+	Master  string
+	Members []GroupMember
+}
+
+// GroupMember is one speaker in a stereo pair, with its LEFT/RIGHT role.
+type GroupMember struct {
+	DeviceID string
+	Role     string
+	IP       string
+}
+
+// Paired reports whether this state describes an existing pair.
+func (g GroupState) Paired() bool { return g.ID != "" || len(g.Members) > 0 }
+
+// wsZone is the <zone> body of a zoneUpdated frame. Bose puts the master's
+// deviceID in the master attr, its LAN IP in senderIPAddress, whether THIS box
+// leads in senderIsMaster, and one <member ipaddress="..">deviceID</member> per
+// follower.
+type wsZone struct {
+	Master         string         `xml:"master,attr"`
+	SenderIP       string         `xml:"senderIPAddress,attr"`
+	SenderIsMaster string         `xml:"senderIsMaster,attr"`
+	Members        []wsZoneMember `xml:"member"`
+}
+
+type wsZoneMember struct {
+	DeviceID string `xml:",chardata"`
+	IP       string `xml:"ipaddress,attr"`
+	Role     string `xml:"role,attr"`
+}
+
+func (z *wsZone) toState() ZoneState {
+	st := ZoneState{
+		Master:         strings.TrimSpace(z.Master),
+		SenderIP:       strings.TrimSpace(z.SenderIP),
+		SenderIsMaster: strings.EqualFold(strings.TrimSpace(z.SenderIsMaster), "true"),
+	}
+	for _, m := range z.Members {
+		st.Members = append(st.Members, ZoneMemberState{
+			DeviceID: strings.TrimSpace(m.DeviceID),
+			IP:       strings.TrimSpace(m.IP),
+			Role:     strings.TrimSpace(m.Role),
+		})
+	}
+	return st
+}
+
+// ZoneState is the typed multiroom/stereo-pair membership delivered to the
+// handler on a zoneUpdated frame. Master == "" means the zone dissolved.
+type ZoneState struct {
+	Master         string
+	SenderIP       string
+	SenderIsMaster bool
+	Members        []ZoneMemberState
+}
+
+// ZoneMemberState is one follower in a ZoneState.
+type ZoneMemberState struct {
+	DeviceID string
+	IP       string
+	Role     string
+}
+
+// rootLocalName returns the local name of the first XML start element (the
+// frame's root), or "" if the data is not parseable. Used to recognise
+// bare-root frames the <updates>-typed parse does not capture.
+// parseBoxError extracts the fields of a bare <errorUpdate><error .../></errorUpdate>
+// gabbo frame. Returns an empty value when s is not an error frame, so the caller
+// can fall through to the generic unrecognized-frame path.
+func parseBoxError(s string) (value, name, severity, detail string) {
+	var e struct {
+		XMLName xml.Name `xml:"errorUpdate"`
+		Error   struct {
+			Value    string `xml:"value,attr"`
+			Name     string `xml:"name,attr"`
+			Severity string `xml:"severity,attr"`
+			Detail   string `xml:",chardata"`
+		} `xml:"error"`
+	}
+	if err := xml.Unmarshal([]byte(s), &e); err != nil {
+		return "", "", "", ""
+	}
+	return e.Error.Value, e.Error.Name, e.Error.Severity, strings.TrimSpace(e.Error.Detail)
+}
+
+// elementText returns the character data of the first <name> element, for the
+// bare-root frames the typed <updates> parse leaves nil. Empty when the
+// element is absent, self-closing, or the document does not parse.
+func elementText(s, name string) string {
+	var v struct {
+		Text string `xml:",chardata"`
+	}
+	dec := xml.NewDecoder(strings.NewReader(s))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		se, ok := tok.(xml.StartElement)
+		if !ok || se.Name.Local != name {
+			continue
+		}
+		if err := dec.DecodeElement(&v, &se); err != nil {
+			return ""
+		}
+		return strings.TrimSpace(v.Text)
+	}
+}
+
+func rootLocalName(s string) string {
+	dec := xml.NewDecoder(strings.NewReader(s))
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if se, ok := tok.(xml.StartElement); ok {
+			return se.Name.Local
+		}
+	}
+}
+
+// gabboResponse is the firmware's ANSWER to a request STM sent on the socket.
+//
+// Measured on 2026-09-10, on the first write STM ever made on this bus (a
+// balance write to a live pair of SoundTouch 10s). The speaker replies on the
+// same socket with the request echoed, msgType="RESPONSE", and the whole
+// document it just wrote:
+//
+//	<?xml version="1.0" encoding="UTF-8" ?><msg><header deviceID="..."
+//	 url="balance" method="POST"><request requestID="1" msgType="RESPONSE">
+//	 <info mainNode="balanceSet" type="new" /></request></header><body>
+//	 <balance ...><targetBalance>-3</targetBalance>
+//	 <actualBalance>-3</actualBalance></balance></body></msg>
+//
+// Two things follow from that, and neither is built yet. The requestID comes
+// back, so a general request/response helper has something to correlate on; and
+// the answer carries the value, so such a helper could confirm a write without
+// reading anything back over HTTP. The HTTP read-back confirms in about 50 ms
+// (measured in the same run), so correlation is infrastructure this one write
+// does not need.
+//
+// What could not wait is smaller. Untyped, this frame falls into the
+// unrecognized-frame capture, under the shape "?xml": the bucket that every
+// declaration-prefixed frame shares. STM's own acknowledgements would have
+// permanently occupied the slot whose entire purpose is to log the first body of
+// each NEW shape the firmware sends. (frameShape now looks past the declaration
+// as well, so the bucket is per element again either way.)
+type gabboResponse struct {
+	XMLName xml.Name `xml:"msg"`
+	Header  struct {
+		DeviceID string `xml:"deviceID,attr"`
+		URL      string `xml:"url,attr"`
+		Method   string `xml:"method,attr"`
+		Request  struct {
+			ID      string `xml:"requestID,attr"`
+			MsgType string `xml:"msgType,attr"`
+		} `xml:"request"`
+	} `xml:"header"`
+}
+
+// parseGabboResponse reports whether data is the speaker answering something STM
+// asked for. The string pre-check is there so the common case (an <updates>
+// notification) is not unmarshalled a second time on every single frame.
+func parseGabboResponse(data []byte) (gabboResponse, bool) {
+	var r gabboResponse
+	s := string(data)
+	if !strings.Contains(s, "<msg") || !strings.Contains(s, `msgType="RESPONSE"`) {
+		return r, false
+	}
+	if err := xml.Unmarshal(data, &r); err != nil {
+		return r, false
+	}
+	return r, strings.EqualFold(r.Header.Request.MsgType, "RESPONSE")
+}

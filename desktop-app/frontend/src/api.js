@@ -1,0 +1,441 @@
+// api.js — single entry point for talking to the backend.
+//
+// Re-exports the Wails-generated bindings (so view modules do not
+// need to know the wailsjs path) and adds a couple of HTTP helpers
+// for the agent endpoints that are not yet wrapped on the Go side
+// (status XML, radio search, etc.).
+
+export {
+  DiscoverBoxes,
+  RefreshKnownBoxes,
+  AddBoxByIP,
+  GetPresets,
+  SetPreset,
+  RenamePreset,
+  DeletePreset,
+  PlaySlot,
+  PlayURL,
+  StartQueue,
+  QueueNext,
+  QueuePrev,
+  QueueShuffle,
+  QueueRepeat,
+  GetQueue,
+  PhoneQR,
+  PhoneAddressFor,
+  RebootBox,
+  RecordUpdateIntent,
+  ClearUpdateIntent,
+  PendingUpdateIntent,
+  UpdateFailureReport,
+  SetOTARunning,
+  TrackPosition,
+  RemoveConflictingMod,
+  WakeBox,
+  SyncBoxPresets,
+  PushStereoPairNameToBox,
+  BoxPresets,
+  BoxSnapshot,
+  RestoreBoxSnapshot,
+  RecallBoxPreset,
+  CopyPresetsAcrossBoxes,
+  GetBoxFirmware,
+  BoxInstallReachable,
+  Pause,
+  Resume,
+  Stop,
+  Next,
+  Prev,
+  Status,
+  ListDrives,
+  WriteStickFiles,
+  FormatStick,
+  StickVersion,
+  CheckStick,
+  StickConfigs,
+  AppInfo,
+  EjectDrive,
+  BoxAgentVersion,
+  BoxStoragePreflight,
+  UpdateBoxAgent,
+  EnsureSpotifyEngine,
+  RecordOTAOutcome,
+  ClassifyOTAResult,
+  WriteWLANConfig,
+  WriteRegionConfig,
+  WriteNameConfig,
+  WriteLangConfig,
+  SetAppLocale,
+  SuggestBoxLanguage,
+  ListWiFiProfiles,
+  BoxWifiScan,
+  TryWiFiPassword,
+  ListBoxMediaServers,
+  EnableBoxMediaServer,
+  DisableBoxMediaServer,
+  CurrentWiFi,
+  CheckAppUpdate,
+  ExportBackup,
+  ImportBackup,
+  ResolveStationLogo,
+  BoxSettings,
+  SetBoxName,
+  SetBoxVolume,
+  SetBoxBass,
+  SelectBoxSource,
+  GetClockDisplay,
+  SetClockDisplay,
+  GetClockFormat24,
+  GetBoxLanguage,
+  SetBoxLanguage,
+  GetAirplayOpt,
+  SetAirplayOpt,
+  BoxSSHStatus,
+  SetBoxSSHPersistent,
+  RestoreGroupAfterUpdate,
+  GetResumeOnPowerOn,
+  SetResumeOnPowerOn,
+  GetDisplayTrack,
+  SetDisplayTrack,
+  AnnounceExample,
+  SendAnnounce,
+  Translate,
+  ResolveUpdateAsset,
+  DownloadUpdate,
+  ApplyUpdate,
+  RevealUpdateFile,
+  GetAppFlag,
+  SetAppFlag,
+  GetStereoPairName,
+  SetStereoPairName,
+  RescuedSpeakerCount,
+  GetWebhooks,
+  SetWebhooks,
+  SaveWebhookConfig,
+  GetGroupKeys,
+  SaveGroupKeys,
+  TestWebhook,
+  TestWebhookAction,
+  StreamBitrate,
+  StreamTitle,
+  SpotifyBitrate,
+  SpotifyQuality,
+  SetSpotifyQuality,
+  SpotifyNowPlaying,
+  SaveSpotifyPreset,
+  SaveLibraryPreset,
+  SaveFolderPreset,
+  RecentPlayed,
+  ClearRecent,
+  DeleteRecentCard,
+  SaveDiagnosticBundle,
+  GetLogFilePath,
+  InstallSTMOnBox,
+  RepairInstallViaSSH,
+  RadioSearch,
+  RadioTags,
+  RadioLanguages,
+  RadioVote,
+  RadioClick,
+  TrueFactoryReset,
+  UninstallSTM,
+  ProbeSetupAP,
+  PushWLANToBox,
+  ListMediaServers,
+  BrowseLibrary,
+  AddMediaServerByURL,
+  RemoveManualMediaServer,
+  LogClientError,
+  GetZoneState,
+  FormZone,
+  DissolveZone,
+  ForgetPermanentGroup,
+  DissolveStereoPair,
+  SyncSpotifyLogin,
+} from '../wailsjs/go/main/App';
+
+export { BrowserOpenURL, EventsOn, EventsOff } from '../wailsjs/runtime/runtime';
+
+// Optional bindings. The wailsjs bindings are regenerated only when the Go
+// backend and the frontend are built together, so a frontend change that
+// starts using a brand-new Go method must not name-import it above: the named
+// re-export would fail to build against the older generated App module. The
+// namespace import below always builds; the wrapper turns a missing binding
+// into a rejected promise carrying MISSING_BINDING so callers can fall back
+// to the older binding set instead of crashing.
+import * as AppBindings from '../wailsjs/go/main/App';
+
+const MISSING_BINDING = 'STM_MISSING_BINDING';
+
+// isMissingBinding says whether a rejection came from calling an optional
+// binding that this build's generated bindings do not have (as opposed to a
+// real backend failure, which callers must surface, not silently fall back on).
+export function isMissingBinding(err) {
+  if (!err) return false;
+  if (err.code === MISSING_BINDING) return true;
+  return String(err.message || err).includes(MISSING_BINDING);
+}
+
+function callOptionalBinding(name, args) {
+  const fn = AppBindings[name];
+  if (typeof fn !== 'function') {
+    const e = new Error(`${MISSING_BINDING}: ${name} is not available in this build`);
+    e.code = MISSING_BINDING;
+    return Promise.reject(e);
+  }
+  return fn(...args);
+}
+
+// RemoveGroupMember takes ONE speaker out of a saved permanent group, leaving
+// the rest of the group standing. An optional binding, per the note above: it
+// is brand new, so naming it in the re-export list at the top would break the
+// frontend build against an older generated App module.
+export function RemoveGroupMember(masterHost, masterPort, memberIP) {
+  return callOptionalBinding('RemoveGroupMember', [masterHost, masterPort, memberIP]);
+}
+
+// ReplayFolderCard replays a Recently-played FOLDER card as the whole folder
+// again instead of as its first track. Optional binding, per the note above; a
+// speaker whose agent predates the endpoint rejects it with
+// folder_replay_unsupported and the caller falls back to the old single play.
+export function ReplayFolderCard(host, port, key, name, art) {
+  return callOptionalBinding('ReplayFolderCard', [host, port, key, name, art]);
+}
+
+// LogSpotifySaveGate records what the app knew about the speaker's Spotify state
+// when it saved a key, so a report about the warning that appeared can be read out
+// of a diagnostic bundle. Optional binding, per the note above; logging must never
+// be the reason a save fails, so callers ignore the rejection.
+export function LogSpotifySaveGate(host, slot, canRecall, premiumRequired, notice) {
+  return callOptionalBinding('LogSpotifySaveGate', [host, slot, canRecall, premiumRequired, notice]);
+}
+
+// PushFavorites stores the starred stations on one speaker, so the phone page
+// shows the same list. Optional binding, per the note above.
+export function PushFavorites(host, port, favoritesJSON) {
+  return callOptionalBinding('PushFavorites', [host, port, favoritesJSON]);
+}
+
+// GetStartVolume / SetStartVolume drive the per-box level the speaker returns
+// to when it wakes and plays again. Optional bindings, per the note above.
+export function GetStartVolume(host, port) {
+  return callOptionalBinding('GetStartVolume', [host, port]);
+}
+
+export function SetStartVolume(host, port, volume) {
+  return callOptionalBinding('SetStartVolume', [host, port, volume]);
+}
+
+// BoxForeignInfluence / UndoForeignFinding are the safe-haven view: what other
+// tools have done to this speaker, and taking one of those things back.
+// Optional bindings, per the note above.
+export function BoxForeignInfluence(host, port) {
+  return callOptionalBinding('BoxForeignInfluence', [host, port]);
+}
+
+export function UndoForeignFinding(host, port, id) {
+  return callOptionalBinding('UndoForeignFinding', [host, port, id]);
+}
+
+// RestoreSTMCloud puts STM's cloud address back on the given speakers, one at
+// a time, restarting each and verifying it afterwards. Optional binding, per
+// the note above: brand new, so a named re-export would break the frontend
+// build against an older generated App module.
+export function RestoreSTMCloud(targets) {
+  return callOptionalBinding('RestoreSTMCloud', [targets]);
+}
+
+// BoxSpeakerLevels / SetBoxSpeakerLevel drive the front-centre and
+// rear-surround levels of a home theater system. Optional bindings, per the
+// note above: both are brand new, so naming them in the re-export list at the
+// top would break the frontend build against an older generated App module.
+//
+// The rejection is also the right behaviour at runtime. An app whose bindings
+// predate these methods simply shows no surround section, which is the same
+// thing every speaker without surrounds shows.
+export function BoxSpeakerLevels(host, port) {
+  return callOptionalBinding('BoxSpeakerLevels', [host, port]);
+}
+
+export function SetBoxSpeakerLevel(host, port, level, value) {
+  return callOptionalBinding('SetBoxSpeakerLevel', [host, port, level, value]);
+}
+
+// RadioSearchDetailed is RadioSearch plus a relaxed flag: same opts object,
+// returns {stations, relaxed} where relaxed=true means the backend had to
+// drop the quality filters to find anything.
+export function RadioSearchDetailed(opts) {
+  return callOptionalBinding('RadioSearchDetailed', [opts]);
+}
+
+// TuneIn directory. Pages are {title, items:[{kind, text, subtext, guideId,
+// ref, image, bitrate, durationSec, children}]}; a station is
+// {id, kind, name, image, ..., ref, codec, playable, reason}. The ref
+// ("tunein:s123") is what gets played and saved; the speaker resolves it.
+export function TuneInBrowse(ref = '') {
+  return callOptionalBinding('TuneInBrowse', [ref]);
+}
+
+export function TuneInSearch(query) {
+  return callOptionalBinding('TuneInSearch', [query]);
+}
+
+export function TuneInStationInfo(id) {
+  return callOptionalBinding('TuneInStationInfo', [id]);
+}
+
+export function TuneInResolveShare(text) {
+  return callOptionalBinding('TuneInResolveShare', [text]);
+}
+
+// TuneInListenURL resolves a stream for playing on this device. The URL is
+// temporary and may carry an access key: keep it in the audio element only.
+export function TuneInListenURL(id) {
+  return callOptionalBinding('TuneInListenURL', [id]);
+}
+
+// RadioStationsByURL looks a pasted stream URL up in the radio-browser
+// directory and returns the matching stations (possibly none).
+export function RadioStationsByURL(streamURL) {
+  return callOptionalBinding('RadioStationsByURL', [streamURL]);
+}
+
+// Adding a station to radio-browser (POST /json/add) from inside the app.
+// RadioLookupForAdd lists matching entries with status working/broken/unknown;
+// RadioPrecheckSubmit returns {fields, stream, sameUrl, similarName, problems,
+// warnings, canSubmit}; RadioSubmitStation(draft, confirmed) re-runs that
+// precheck on the backend and returns {uuid, message}; RadioStationByUUID
+// returns {found, station} for the post-submit status.
+export function RadioLookupForAdd(query, country = '') {
+  return callOptionalBinding('RadioLookupForAdd', [query, country]);
+}
+
+export function RadioCheckStream(streamURL) {
+  return callOptionalBinding('RadioCheckStream', [streamURL]);
+}
+
+export function RadioPrecheckSubmit(draft) {
+  return callOptionalBinding('RadioPrecheckSubmit', [draft]);
+}
+
+export function RadioSubmitStation(draft, confirmed) {
+  return callOptionalBinding('RadioSubmitStation', [draft, confirmed]);
+}
+
+export function RadioStationByUUID(uuid) {
+  return callOptionalBinding('RadioStationByUUID', [uuid]);
+}
+
+// ClassifyStreamURL reports what a pasted URL actually serves:
+// {kind: "stream"|"playlist"|"website"|"unknown", contentType, status}.
+// Optional binding, so an older backend simply yields null and the caller
+// falls back to its previous behaviour.
+export function ClassifyStreamURL(streamURL) {
+  return callOptionalBinding('ClassifyStreamURL', [streamURL]);
+}
+
+// MovePreset takes the station on key `from` over to key `to`. Offered when a
+// save is refused because the station already sits on another key, so the user
+// can say "then move it". Optional binding: an app
+// built before the method exists rejects with MISSING_BINDING and the caller
+// shows the plain refusal it always did.
+export function MovePreset(host, port, from, to) {
+  return callOptionalBinding('MovePreset', [host, port, from, to]);
+}
+
+// boxURL builds an absolute URL for an agent endpoint on a given box.
+// Centralised so the host/port pattern is in one place and switching
+// to HTTPS later only takes touching this helper.
+export function boxURL(box, path) {
+  if (!box) return '';
+  return `http://${box.host}:${box.port}${path}`;
+}
+
+// boxFetch is a self-healing fetch for the agent's plain-HTTP endpoints
+// (region, radio search/tags/languages, stick status, WLAN). Unlike the Go
+// bindings it cannot reuse boxDo, so it replicates the same resilience in
+// JS: a hard timeout, so a flaky port can never hang the UI forever (the
+// "region keeps loading" bug on BCO boxes), plus a :8888 <-> :17008
+// failover for BCO speakers where only one of the two answers. The first
+// reachable port is remembered on the box so later calls go straight to it.
+export async function boxFetch(box, path, opts = {}, timeoutMs = 8000) {
+  if (!box) throw new Error('no box');
+  const ports = [...new Set([box.port, 17008, 8888].filter(Boolean))];
+  let lastErr;
+  for (const p of ports) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(`http://${box.host}:${p}${path}`, { ...opts, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (p !== box.port) box.port = p; // remember the reachable port
+      return r;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('box unreachable');
+}
+
+// ProbeTrackDelivery asks the media server, from the Go side, whether it hands
+// over the start of a track. It cannot be done with fetch() from here: the page
+// has its own origin and a DLNA server sends no Access-Control-Allow-Origin, so
+// the browser refuses the answer no matter how healthy the server is.
+// Optional binding, so an older build simply reports "not known".
+export function ProbeTrackDelivery(url) {
+  return callOptionalBinding('ProbeTrackDelivery', [url]);
+}
+
+// readBoxBalanceInfo reads a speaker's whole stereo-balance answer, or null when
+// the speaker does not report one or cannot be asked right now.
+//
+// The bounds matter to the caller and must come from the SPEAKER: a
+// widely-copied community implementation assumes -50..+50 and the firmware
+// answers -7..+7, so a slider built on a constant would be wrong by a factor of
+// seven. `settable` says whether the agent on the other end has a socket to
+// write the value on; an older agent simply omits it, which reads as false and
+// leaves the caller with the read-out it has always had.
+export async function readBoxBalanceInfo(box) {
+  try {
+    const r = await boxFetch(box, '/api/box/balance');
+    const b = await r.json();
+    if (!b || !b.available) return null;
+    return {
+      actual: Number(b.actual) || 0,
+      target: Number(b.target) || 0,
+      min: Number.isFinite(Number(b.min)) ? Number(b.min) : -7,
+      max: Number.isFinite(Number(b.max)) ? Number(b.max) : 7,
+      default: Number(b.default) || 0,
+      settable: !!b.settable,
+    };
+  } catch { return null; /* asleep or unreachable: show nothing rather than an error */ }
+}
+
+// readBoxBalance reads just the current position, for the two places that only
+// print it.
+export async function readBoxBalance(box) {
+  const b = await readBoxBalanceInfo(box);
+  return b ? b.actual : null;
+}
+
+// writeBoxBalance moves the balance of the pair this speaker masters.
+//
+// Always addressed to the MASTER: only the master reports a balance and only the
+// master can be written to (see groups.balanceSourceBox). The answer says
+// whether the value was accepted AND whether the speaker has confirmed it, and
+// those are two different things: the agent sends the value on the speaker's own
+// WebSocket, which acknowledges nothing, so it reads the balance back and
+// reports verified:false when the read-back has not caught up yet. Resolves to
+// the answer object, or null when the speaker could not be reached at all.
+export async function writeBoxBalance(box, target) {
+  try {
+    const r = await boxFetch(box, '/api/box/balance', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ target: Math.round(Number(target) || 0) }),
+    });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}

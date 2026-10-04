@@ -1,0 +1,592 @@
+// serve.go: the HTTP surface — ServeOgg (the box's audio fetch) and
+// ServeInfo, plus the now-playing metadata helpers behind them.
+
+package spotify
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+// PlaylistMeta returns a stable cover image URL and the human title for a
+// Spotify context URI (playlist, album, ...) via Spotify's public oEmbed
+// endpoint, which needs no token. A saved preset uses the cover as its tile logo
+// and the title as its name, so the box display and the tile show e.g.
+// "Jens Chill" instead of a bare "Spotify". Returns "","" on any failure.
+// Best-effort, called off the play path (on preset save).
+func (m *Manager) PlaylistMeta(ctx context.Context, uri string) (cover, title string) {
+	page := spotifyURItoURL(uri)
+	if page == "" {
+		return "", ""
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		"https://open.spotify.com/oembed?url="+url.QueryEscape(page), nil)
+	if err != nil {
+		return "", ""
+	}
+	resp, err := m.client.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", ""
+	}
+	var od struct {
+		ThumbnailURL string `json:"thumbnail_url"`
+		Title        string `json:"title"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<16)).Decode(&od); err != nil {
+		return "", ""
+	}
+	return od.ThumbnailURL, od.Title
+}
+
+// spotifyURItoURL converts spotify:playlist:ID (or album/track/artist) to its
+// open.spotify.com page URL, or "" for an unrecognised URI.
+func spotifyURItoURL(uri string) string {
+	parts := strings.Split(uri, ":")
+	if len(parts) != 3 || parts[0] != "spotify" {
+		return ""
+	}
+	switch parts[1] {
+	case "playlist", "album", "track", "artist":
+		return "https://open.spotify.com/" + parts[1] + "/" + parts[2]
+	}
+	return ""
+}
+
+// Bitrate returns the bitrate measured from the live stream (kbit/s), or the
+// configured nominal when nothing has streamed yet.
+func (m *Manager) Bitrate() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.actualKbps > 0 {
+		return m.actualKbps
+	}
+	return m.bitr
+}
+
+// Streaming reports whether a box is currently attached to the Ogg stream
+// (i.e. Spotify is actively playing to the speaker). The memory guard uses
+// this to avoid rebooting the box mid-playback.
+func (m *Manager) Streaming() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sink != nil
+}
+
+// liveNowPlaying pulls the current track straight from go-librespot's /status,
+// the authoritative source, and refreshes the cache with it. The cached values
+// come from pushed "metadata" events, which lag (and can be missed entirely):
+// a live capture showed /spotify/info still reporting an earlier track while
+// go-librespot had advanced several. Pulling /status on demand keeps the
+// desktop now-playing line in step with what is actually playing. Best-effort:
+// returns false and leaves the cache untouched if /status is unreachable or
+// carries no track, so the caller falls back to the cached values.
+func (m *Manager) liveNowPlaying(ctx context.Context) (track, artist, cover string, ok bool) {
+	t, a, c, state := m.liveNowPlayingState(ctx)
+	return t, a, c, state == liveStatusTrack
+}
+
+// liveTrackState is what go-librespot's /status says about a loaded track. The
+// distinction matters because "I could not ask" and "there is nothing loaded"
+// are opposite answers to the question a preset save asks, and both used to
+// arrive here as a plain false.
+type liveTrackState int
+
+const (
+	// liveStatusUnknown: the engine did not answer. Trust the cache.
+	liveStatusUnknown liveTrackState = iota
+	// liveStatusNoTrack: the engine answered and has nothing loaded.
+	liveStatusNoTrack
+	// liveStatusTrack: a track is loaded and its details are live.
+	liveStatusTrack
+)
+
+func (m *Manager) liveNowPlayingState(ctx context.Context) (track, artist, cover string, state liveTrackState) {
+	data, err := m.apiGet(ctx, "/status")
+	if err != nil {
+		return "", "", "", liveStatusUnknown
+	}
+	var st struct {
+		Track *struct {
+			URI           string   `json:"uri"`
+			Name          string   `json:"name"`
+			ArtistNames   []string `json:"artist_names"`
+			AlbumCoverURL string   `json:"album_cover_url"`
+		} `json:"track"`
+	}
+	if json.Unmarshal(data, &st) != nil {
+		return "", "", "", liveStatusUnknown
+	}
+	if st.Track == nil || st.Track.Name == "" {
+		return "", "", "", liveStatusNoTrack
+	}
+	track = st.Track.Name
+	artist = strings.Join(st.Track.ArtistNames, ", ")
+	cover = st.Track.AlbumCoverURL
+	m.mu.Lock()
+	m.curName, m.curArtist, m.curCover = track, artist, cover
+	if st.Track.URI != "" {
+		m.curTrackURI = st.Track.URI
+	}
+	m.mu.Unlock()
+	m.notifyTrack()
+	m.noteResume()
+	return track, artist, cover, liveStatusTrack
+}
+
+// SetOnTrack registers the recently-played hook (webui.NoteRecentSpotifyTrack).
+func (m *Manager) SetOnTrack(fn func(track, artist string)) {
+	m.mu.Lock()
+	m.onTrack = fn
+	m.mu.Unlock()
+}
+
+// SetOnSinkDetach registers the hook fired when the box drops a Spotify stream
+// it had been playing. The twin of streamproxy's SetOnDisconnect, which has
+// given internet radio an automatic recovery for a long time while the Spotify
+// audio path had none.
+func (m *Manager) SetOnSinkDetach(fn func(attachedMs int64)) {
+	m.mu.Lock()
+	m.onSinkDetach = fn
+	m.mu.Unlock()
+}
+
+// sinkDetachWorthRecovering is the shortest attachment that counts as "this was
+// playing and then it stopped".
+//
+// The Ogg sink also detaches on every normal preset switch and around a
+// hardware skip, and those attachments are short: a field bundle shows three
+// detaches inside sixteen seconds around one preset press, at 7986 ms and
+// 6882 ms, against 2207055 ms and 7097882 ms for the two real overnight drops
+// that motivated this. Twenty seconds sits far above the flaps and far below
+// anything a listener would call playing.
+const sinkDetachWorthRecovering = 20 * time.Second
+
+// notifyTrack fires onTrack when the current Spotify track changed since the
+// last notification, so each song is recorded once. Called after every
+// metadata/status update; the dedup on the track name keeps a repeated /status
+// poll from re-recording. The callback runs outside the lock. Cheap.
+func (m *Manager) notifyTrack() {
+	m.mu.Lock()
+	cb, track, artist := m.onTrack, m.curName, m.curArtist
+	if cb == nil || track == "" || track == m.lastNotifiedTrack {
+		m.mu.Unlock()
+		return
+	}
+	m.lastNotifiedTrack = track
+	m.mu.Unlock()
+	cb(track, artist)
+}
+
+// ServeInfo answers GET /spotify/info with the live state the UI needs: whether
+// Spotify is available, the measured bitrate, and the advertised device name.
+func (m *Manager) ServeInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	m.mu.Lock()
+	track, artist, cover, context := m.curName, m.curArtist, m.curCover, m.lastContext
+	lowDisk, lowDiskFreeKB := m.lowDisk, m.lowDiskFreeKB
+	// Whatever is cached, never a fetch: this handler is polled.
+	product := m.productType
+	m.mu.Unlock()
+	// Prefer the live track from /status over the laggy cached metadata events.
+	lt, la, lc, state := m.liveNowPlayingState(r.Context())
+	switch state {
+	case liveStatusTrack:
+		track, artist, cover = lt, la, lc
+	case liveStatusNoTrack:
+		// The engine answered and has NOTHING loaded, so the remembered context
+		// is a memory of an older session. lastContext has no clearing site at
+		// all, and this field is what a preset save writes onto a key: handing it
+		// out here puts the wrong playlist on the key, or collides with the key
+		// that already holds it and the save is refused as "already on key N".
+		//
+		// Measured on a two-speaker fleet on 2026-09-26: on the speaker where
+		// every track was being refused by Spotify, the engine never had a track
+		// loaded, so every save captured the playlist already sitting on key 2.
+		// The display keeps the cached track, which is only cosmetic; what is
+		// about to be WRITTEN must not be a guess.
+		context = ""
+	}
+	resp := struct {
+		Ready   bool   `json:"ready"`
+		Bitrate int    `json:"bitrate"`
+		Name    string `json:"name"`
+		Track   string `json:"track"`
+		Artist  string `json:"artist"`
+		Cover   string `json:"cover"`
+		Context string `json:"context"` // current playlist/album URI (for saving a Spotify preset)
+		Account string `json:"account"` // current go-librespot login (for the preset)
+		// PremiumRequired is true when the logged-in Spotify account is free/open,
+		// which cannot do the autonomous on-demand playback a preset recall needs
+		// The UI shows a "recall needs Premium" note when set.
+		PremiumRequired bool `json:"premiumRequired"`
+		// LowDisk is true when the box NAND is too full to start go-librespot
+		// (#ST30). The UI shows "box storage full" instead of Spotify silently
+		// appearing unavailable; LowDiskFreeKB is the free space at the last check.
+		LowDisk       bool  `json:"lowDisk"`
+		LowDiskFreeKB int64 `json:"lowDiskFreeKB"`
+		// AudioKeyRefused is true when Spotify has just refused the audio key
+		// for a run of tracks, which the listener experiences as a playlist
+		// racing past without a note playing. The apps show what happened
+		// instead of leaving the silence unexplained. The speaker's own Spotify
+		// entry keeps working on the same account, so the message has to say
+		// that too or it reads as "Spotify is broken".
+		AudioKeyRefused bool `json:"audioKeyRefused"`
+		// CanRecall is whether a Spotify preset key on this speaker could play
+		// at all: a live device session OR a persisted credential. The apps need
+		// it because PremiumRequired cannot answer the question on its own. It is
+		// deliberately conservative and stays false on "unknown", and "unknown"
+		// is exactly a speaker that was never picked in Spotify, where a preset
+		// key is equally unusable. A notice telling such a user to press their
+		// saved key is wrong for the same reason it is wrong on a free account
+		// Absent on an agent older than this, which the apps read as
+		// "cannot tell" and treat as before.
+		CanRecall bool `json:"canRecall"`
+		// Product is what the speaker believes the account plan is: "premium",
+		// "free", "open", or absent when it could not find out. The third state
+		// is the point: premiumRequired false means EITHER a Premium account or
+		// a question that went unanswered, and until this field existed a
+		// diagnostic could not tell those apart. Since the plan is read by the
+		// speaker itself (a token from the engine, then one call to Spotify),
+		// "absent" now also covers a speaker that cannot reach out at all.
+		Product string `json:"product,omitempty"`
+		// Stereo says whether this speaker is half of a stereo pair and what it is
+		// therefore advertising to Spotify. Present so the pair behaviour can be
+		// READ rather than inferred: on its first hardware run there was no way to
+		// tell a working pair advert from a no-op.
+		Stereo StereoStatus `json:"stereo"`
+	}{
+		Ready:           m.Ready(),
+		Bitrate:         m.Bitrate(),
+		Name:            m.DeviceName(),
+		Track:           track,
+		Artist:          artist,
+		Cover:           cover,
+		Context:         context,
+		Account:         m.currentUsername(r.Context()),
+		PremiumRequired: m.PremiumRequired(),
+		CanRecall:       m.CanRecall(r.Context()),
+		Product:         product,
+		LowDisk:         lowDisk,
+		LowDiskFreeKB:   lowDiskFreeKB,
+		AudioKeyRefused: m.AudioKeyRefused(),
+		Stereo:          m.StereoStatusNow(),
+	}
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// ServeOgg streams go-librespot's live Ogg/Vorbis passthrough output to the
+// HTTP client (the box's UPnP fetch) until it disconnects. It registers as
+// the single consumer; a new request replaces any previous one. No header is
+// prepended: the box decodes the raw Ogg directly.
+// Re-attach storm damping. A re-attach closer together than the
+// window counts toward a storm and grows the box-re-point backoff from the base
+// up to the cap; anything more spaced out is treated as a normal switch and
+// clears the backoff.
+const (
+	spotifyStormWindow         = 20 * time.Second
+	spotifyActivateBackoffBase = 5 * time.Second
+	spotifyActivateBackoffMax  = 60 * time.Second
+)
+
+func (m *Manager) ServeOgg(w http.ResponseWriter, r *http.Request) {
+	if !m.Ready() {
+		http.Error(w, "spotify not configured", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "audio/ogg")
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusOK)
+
+	// Replay the current track's cached Ogg header pages first so a box that
+	// joins mid-track has the identification/comment/setup headers it needs
+	// to initialise the decoder; the live pages (forwarded by the drain)
+	// then follow and are decodable even though they start mid-track.
+	m.mu.Lock()
+	hdr := append([]byte(nil), m.headerPages...)
+	m.mu.Unlock()
+	if len(hdr) > 0 {
+		if _, err := w.Write(hdr); err != nil {
+			return
+		}
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+
+	done := make(chan struct{})
+	cw := &closeNotifyWriter{w: w, done: done}
+	// Hand the ResponseWriter back before returning, and wait for any write
+	// the engine goroutine has in flight. Without this the handler can return
+	// while a write is still running, which is a segfault rather than an
+	// error. See the type's comment.
+	defer cw.retire()
+	m.mu.Lock()
+	oldSink, _ := m.sink.(*closeNotifyWriter) // previous consumer, if any
+	reattach := m.sink != nil                 // a consumer was already attached = box re-fetched
+	m.sink = cw
+	sinceLast := time.Duration(0)
+	if !m.lastAttachAt.IsZero() {
+		sinceLast = time.Since(m.lastAttachAt)
+	}
+	m.lastAttachAt = time.Now()
+	// A re-attach STM's own re-push announced (ExpectReattach) is deliberate:
+	// consume the one-shot mark and keep it out of the storm accounting.
+	deliberate := time.Now().Before(m.expectReattachUntil)
+	if deliberate {
+		m.expectReattachUntil = time.Time{}
+	}
+	m.mu.Unlock()
+	// Single-connection invariant: tear down the previous box connection now.
+	// A box stuck in INVALID_SOURCE re-fetches the stream repeatedly; if the old
+	// connections are left open they pile up and the box leaks decode/socket
+	// buffers per connection until it OOMs (garbled audio then reboot, live
+	// 2026-06-10). Closing the old sink makes its ServeOgg return and drop the
+	// stale connection, so the box only ever holds one Ogg stream at a time.
+	if oldSink != nil && oldSink != cw {
+		oldSink.closeConn()
+	}
+	// Surface and damp a re-attach storm (the box re-fetching every few seconds,
+	// the INVALID_SOURCE re-point loop heard as the song restarting). The
+	// single-connection invariant above already prevents the per-connection
+	// buffer pile-up that used to OOM the box; here we also back off STM's own
+	// re-pointing so it stops shoving the box back into the same failing state.
+	// A rapid re-attach grows the backoff (capped); a healthy, spaced-out attach
+	// resets it so normal playlist switches stay responsive.
+	if reattach && !deliberate && sinceLast > 0 && sinceLast < spotifyStormWindow {
+		m.mu.Lock()
+		if m.activateBackoff < spotifyActivateBackoffBase {
+			m.activateBackoff = spotifyActivateBackoffBase
+		} else {
+			m.activateBackoff *= 2
+			if m.activateBackoff > spotifyActivateBackoffMax {
+				m.activateBackoff = spotifyActivateBackoffMax
+			}
+		}
+		backoff := m.activateBackoff
+		if t := time.Now().Add(backoff); t.After(m.suppressActivateUntil) {
+			m.suppressActivateUntil = t
+		}
+		m.mu.Unlock()
+		m.logger.Warn("spotify: rapid Ogg re-attach (INVALID_SOURCE re-point storm); backing off box re-point",
+			"sinceLastMs", sinceLast.Milliseconds(), "backoff", backoff.String())
+	} else if reattach && sinceLast >= spotifyStormWindow {
+		// A spaced-out re-attach is normal (a deliberate playlist switch): the
+		// storm has cleared, so drop the accumulated backoff.
+		m.mu.Lock()
+		m.activateBackoff = 0
+		m.mu.Unlock()
+	}
+	// reattach=true means the box dropped and re-fetched the stream (the prime
+	// suspect for a track appearing to restart): it then gets the cached
+	// granule-0 headers again. Logged so the restart can be correlated.
+	m.mu.Lock()
+	m.sinkAttachedAt, m.sinkBytes, m.sinkPages = time.Now(), 0, 0
+	m.sinkFirstAudioAt, m.sinkLastPageAt = time.Time{}, time.Time{}
+	m.sinkSeams = 0
+	m.mu.Unlock()
+	m.logger.Info("spotify: box attached to Ogg stream", "remote", r.RemoteAddr, "headerBytes", len(hdr), "reattach", reattach)
+	// Buffer-lag baseline (boxlag.go): arm it here, take it in the drain on the
+	// first audio page this box receives. Delivered audio is then counted from
+	// the same instant the box's own RelTime counts from, and the reading taken
+	// there is the zero check - both sides should read about the same, and a
+	// bundle that shows they do not is what tells us how to read the per-track
+	// numbers. Reading it HERE instead would compare a box that has not started
+	// the new transport yet (its RelTime can still be the previous URI's clock)
+	// against a delivered counter that stopped at the previous detach.
+	m.noteStreamAttached()
+
+	// A fresh (non-reattach) attach is a clean recall start, not a storm: clear
+	// any accumulated re-point backoff so the next genuine playlist switch is
+	// handled promptly.
+	if !reattach {
+		m.mu.Lock()
+		m.activateBackoff = 0
+		m.mu.Unlock()
+	}
+
+	// On a FRESH attach (not a re-fetch), the box's own preset self-activation
+	// can reach ServeOgg a beat BEFORE the gabbo press event flags the recall
+	// (race, seen when switching from radio to a Spotify preset). Wait briefly
+	// for the flag so we don't resume the old (mid) track before Play loads the
+	// new shuffled one.
+	if !reattach {
+		for i := 0; i < 10 && !m.recalling(); i++ {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	// The drain pauses go-librespot while no box is attached; resume it so the
+	// live stream flows to this box. Do NOT resume while a recall is driving
+	// playback: Play() loads and resumes the NEW track itself, so a resume here
+	// would only replay the OLD one. This covers both a fresh recall attach and a
+	// same-account preset switch (reattach): the latter used to resume the previous
+	// playlist's track for a few seconds until Play caught up, which the box played
+	// out as audible overlap (ST30 5->4 switch, 2026-07-14). The one exception is a
+	// cross-account recall: SwitchAccount restarted go-librespot and left it paused
+	// in the restart gap, so on the box's re-fetch resume it or it hangs buffering
+	// on a paused stream (observed: preset stuck after playing another account).
+	// One more exception, in the other direction: a REAL pause pressed in the
+	// SPOTIFY APP moments ago, with nothing having started playback since,
+	// makes this fetch the starved box refilling after its buffer ran dry, not
+	// anybody asking for music. Resuming here defeated the pause: the music
+	// restarted on its own seconds after the user paused it, and the resume's
+	// echo window then swallowed their next pause too (Klaus, 2026-08). Leave
+	// the engine paused; a recall (a hardware preset press must still
+	// attach-resume, the class this resume exists for), a Connect play, or
+	// the stamp's expiry lifts the gate, and with no recent pause the
+	// behaviour below is exactly as before. INFO on purpose: this line is the
+	// bundle marker proving the pause was respected.
+	if m.connectPauseStands() && !m.recalling() {
+		m.logger.Info("spotify: box re-fetched the stream right after a Spotify-app pause, leaving the engine paused", "reattach", reattach)
+	} else if !m.recalling() || (reattach && m.recallRestartedRecently()) {
+		rctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		// Resume WITHOUT stamping the own-command echo window: see apiPostQuiet
+		// for why a stamped resume here cost the user their next pause.
+		_ = m.apiPostQuiet(rctx, "/player/resume", "")
+		cancel()
+	}
+
+	select {
+	case <-r.Context().Done():
+	case <-done:
+	}
+	m.mu.Lock()
+	if m.sink == cw {
+		m.sink = nil
+	}
+	m.mu.Unlock()
+	m.mu.Lock()
+	attachedMs := int64(0)
+	if !m.sinkAttachedAt.IsZero() {
+		attachedMs = time.Since(m.sinkAttachedAt).Milliseconds()
+	}
+	firstAudioMs := int64(-1)
+	if !m.sinkFirstAudioAt.IsZero() && !m.sinkAttachedAt.IsZero() {
+		firstAudioMs = m.sinkFirstAudioAt.Sub(m.sinkAttachedAt).Milliseconds()
+	}
+	bytes, pages, seams := m.sinkBytes, m.sinkPages, m.sinkSeams
+	m.mu.Unlock()
+	kbps := int64(0)
+	if attachedMs > 0 {
+		kbps = bytes * 8 / attachedMs
+	}
+	// firstAudioMs = -1 means the box was attached but never received a single
+	// audio page: the silent-stream failure that used to look like success.
+	// seams counts the chain seams (oggchain.go) this attachment carried.
+	m.logger.Info("spotify: box detached from Ogg stream",
+		"attachedMs", attachedMs, "forwardedKB", bytes/1024, "pages", pages,
+		"firstAudioAfterMs", firstAudioMs, "kbps", kbps, "seams", seams)
+	// Stamp the detach so the warm-recall gate can tell "streaming until a
+	// moment ago" (our own URI re-push tears the sink down right before the
+	// engine call) from "long idle" - lastAttachAt cannot: it ages while a
+	// stable sink plays for minutes.
+	m.mu.Lock()
+	m.lastDetachAt = time.Now()
+	pendingBitr := m.bitrPending
+	onDetach := m.onSinkDetach
+	m.mu.Unlock()
+	// Tell the resume watchdog, but only about a drop that is neither ours nor
+	// the user's. Internet radio has had this recovery for a long time; the
+	// Spotify path had none, so a two-second Wi-Fi dropout at half past one in
+	// the morning ended playback until somebody pressed a button (field report
+	// 2026-09-09: the box let go at 01:39:08 and went to standby at 01:57).
+	//
+	// The gate lives here rather than in the callback because every one of
+	// these exclusions is a way to turn a recovery into a recall storm:
+	// recalling covers a preset switch and STM's own re-point, engineHot covers
+	// the deliberate flap around a hardware press, connectPauseStands covers
+	// somebody pausing in the Spotify app, and firstAudioMs < 0 means the box
+	// never received a single audio page, which is a failed start rather than a
+	// drop and has its own handling.
+	if onDetach != nil &&
+		attachedMs >= sinkDetachWorthRecovering.Milliseconds() &&
+		firstAudioMs >= 0 &&
+		!m.recalling() && !m.engineHot() && !m.connectPauseStands() {
+		go onDetach(attachedMs)
+	}
+	// A bitrate change made during playback waits for exactly this moment
+	// Event-driven on purpose: no standing ticker on every speaker
+	// for a change that happens once in a blue moon.
+	if pendingBitr {
+		go m.applyPendingBitrateAfterDetach()
+	}
+}
+
+// errSinkRetired is returned by a writer whose handler has gone. forward()
+// treats any write error as "this box is gone", which is exactly right here.
+var errSinkRetired = errors.New("spotify: the box's stream connection is gone")
+
+// closeNotifyWriter signals done on the first failed write so ServeOgg
+// returns when the box drops the connection.
+//
+// It also owns the lifetime of the underlying http.ResponseWriter. That
+// matters more than it sounds: the pages are written by the ENGINE goroutine,
+// not by the HTTP handler, and net/http hands the response's buffered writer
+// back to a pool and nils its destination the moment the handler returns.
+// A write arriving after that is not an error, it is a segfault, and it takes
+// the whole agent down. On 2026-08-15 16:51:03 a box detached mid-track, the
+// handler returned, the engine wrote one more batch, and the agent died,
+// which stopped the music on all five speakers in the group at once.
+type closeNotifyWriter struct {
+	w    io.Writer
+	done chan struct{}
+	once sync.Once
+
+	// wmu serialises writes against retirement, so a write is either
+	// completely before the handler returns or refused outright. It is held
+	// across the write itself on purpose: retire() has to WAIT for a write in
+	// flight, not merely set a flag it might race with.
+	wmu     sync.Mutex
+	retired bool
+}
+
+func (c *closeNotifyWriter) Write(p []byte) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.retired {
+		return 0, errSinkRetired
+	}
+	n, err := c.w.Write(p)
+	if err != nil {
+		c.once.Do(func() { close(c.done) })
+	}
+	return n, err
+}
+
+// retire gives the http.ResponseWriter back. It blocks until any write in
+// flight has finished and refuses every write after it, so ServeOgg MUST call
+// it before returning: past that point the writer belongs to net/http again
+// and touching it is undefined.
+func (c *closeNotifyWriter) retire() {
+	c.wmu.Lock()
+	c.retired = true
+	c.wmu.Unlock()
+	c.once.Do(func() { close(c.done) })
+}
+
+// closeConn tears the connection down from the manager side, used to enforce
+// the single-connection invariant when a new box attaches. Idempotent.
+func (c *closeNotifyWriter) closeConn() {
+	c.once.Do(func() { close(c.done) })
+}
+
+func (c *closeNotifyWriter) Flush() {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.retired {
+		return
+	}
+	if f, ok := c.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}

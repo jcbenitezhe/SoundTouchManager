@@ -1,0 +1,446 @@
+name: build
+
+# CI for pull requests and pushes to main. Tag-triggered releases are
+# owned by release.yml, which performs the same verification plus
+# attestation and publication.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  # Only a superseded PR push is cancelled. Back-to-back merges to main used
+  # to cancel the earlier main run, which then showed up as a red X on the
+  # commit list for a run nobody meant to abandon.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # go-version is the minor track; setup-go resolves to the latest
+      # patch so govulncheck does not flag stdlib bugs fixed upstream.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      # oggdec (vorbis-tools) is the reference decoder for the Ogg chain-seam
+      # PCM test (internal/spotify TestChainRealVorbisPCM); the test skips
+      # itself where the tool is absent, so this only widens coverage.
+      - name: Install oggdec for the Vorbis seam test
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq vorbis-tools
+
+      - name: go test
+        run: go test ./... -count=1
+
+  # The race detector, scoped to the packages where goroutines actually
+  # share state (stream proxying, webui zone-verify fan-out, marge
+  # emulation, radiobrowser failover). The plain `test` job keeps
+  # covering everything; -race is an order of magnitude slower, so it
+  # only runs where it can find something.
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+      # Scoped to the packages that are green under the detector today.
+      # internal/webui is deliberately NOT here yet: it has pre-existing
+      # test-only seam races (a t.Cleanup restoring a package-level test seam
+      # while the production goroutine it spawned still reads it, e.g.
+      # resume_settle_test.go / watchResume). Clean those up, then add
+      # ./internal/webui/... here. (The zone_verify_test.go counter race is
+      # already fixed.)
+      - name: go test -race
+        run: go test -race -count=1 ./internal/streamproxy/... ./internal/marge/... ./radiobrowser/...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: latest
+          args: --timeout=5m
+
+  # The desktop app is a SECOND Go module (stmanager-app); the root `go vet`
+  # / `go test ./...` above never descends into it, so it shipped unchecked
+  # until now (a live `go vet` IPv6 finding had sat there). It compiles on a
+  # clean checkout because frontend/dist/.gitkeep keeps the //go:embed target
+  # present, so no frontend build is needed just to vet/test/build it.
+  desktop-go:
+    name: Desktop app (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+          cache-dependency-path: desktop-app/go.sum
+
+      # Guard against the desktop-app module's go.mod/go.sum drifting out of tidy
+      # (e.g. a Dependabot bump of the main module that did not update this one):
+      # that made `go vet` fail with "updates to go.mod needed" and turned the
+      # whole workflow red while releases still shipped (2026-07-15). Fail early
+      # with an actionable message instead.
+      - name: go.mod tidy check
+        working-directory: desktop-app
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum; then
+            echo "::error::desktop-app go.mod/go.sum are not tidy. Run 'go mod tidy' in desktop-app and commit the result."
+            exit 1
+          fi
+
+      - name: go vet
+        working-directory: desktop-app
+        run: go vet ./...
+
+      - name: go test
+        working-directory: desktop-app
+        run: go test ./... -count=1
+
+      - name: go build
+        working-directory: desktop-app
+        run: go build ./...
+
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: latest
+          args: --timeout=5m
+          working-directory: desktop-app
+
+      # Frontend bindings drift: adding a bound App method without running
+      # `wails generate module` leaves frontend/wailsjs/ stale, which only
+      # the Vite build (a separate job) ever notices, so it festers. Pin the
+      # wails CLI to the exact version in go.mod and fail if regenerating the
+      # bindings would change anything that is not committed.
+      - name: Check wailsjs bindings are current
+        working-directory: desktop-app
+        run: |
+          WAILS_VER=$(go list -m -f '{{.Version}}' github.com/wailsapp/wails/v2)
+          echo "wails $WAILS_VER"
+          go install github.com/wailsapp/wails/v2/cmd/wails@${WAILS_VER}
+          "$(go env GOPATH)/bin/wails" generate module
+          # core.fileMode=false: `wails generate` writes the bindings with the
+          # executable bit set on Linux, which is a spurious mode-only diff
+          # against the committed 0644 files. We only care about content drift.
+          if ! git -c core.fileMode=false diff --exit-code frontend/wailsjs; then
+            echo "::error::frontend/wailsjs is stale. Run 'wails generate module' in desktop-app and commit the result."
+            exit 1
+          fi
+
+  shellcheck:
+    name: shellcheck (on-box scripts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The USB-stick / on-box scripts are POSIX sh for the speaker's
+      # BusyBox ash. Until now CI did not lint shell at all, so run.sh
+      # (3000+ lines) shipped unchecked. Lint at ERROR severity only:
+      # run.sh is full of intentional BusyBox idioms, so warning/info/
+      # style would be pure noise and a perpetually-red check, but
+      # error-level findings (parse errors, truly broken constructs) are
+      # real bugs worth blocking on. NOTE: shellcheck does NOT catch the
+      # subshell-function-scope class (it treats any file-level function
+      # as globally callable regardless of which `( ) &` subshell calls
+      # it) — that bug class is handled by defining shared helpers at top
+      # level + the runtime scope-guard in run.sh, not here.
+      - name: shellcheck
+        run: |
+          shellcheck --version
+          shellcheck -s sh --severity=error usb-stick/*.sh usb-stick/rc.local setup/run.sh
+
+      # CI's own shell, held to a stricter standard than the on-box scripts.
+      # These run on a GitHub runner with real bash, not the speaker's BusyBox,
+      # so none of the intentional ash idioms apply and the default severity is
+      # appropriate. Added when the release pipeline grew a shell script of its
+      # own (the notarization wait); before that, CI shell lived inline in the
+      # workflows and was linted by nothing.
+      - name: shellcheck (CI scripts)
+        run: shellcheck -s bash .github/scripts/*.sh
+
+      # BusyBox parse gate: shellcheck uses its own parser, which is not the
+      # ash the speaker actually runs. A construct ash rejects (and refuses to
+      # exec, leaving the box dead on boot) can pass shellcheck. Run the real
+      # busybox `sh -n` over every on-box script as a hard syntax gate.
+      - name: busybox ash parse gate
+        run: |
+          sudo apt-get update && sudo apt-get install -y busybox-static
+          for f in usb-stick/*.sh usb-stick/rc.local setup/run.sh; do
+            busybox sh -n "$f" && echo "ok: $f"
+          done
+
+  # Lint the workflow files themselves: expression typos, dangling
+  # needs/outputs references and invalid runner labels surface at PR
+  # time instead of on the next push to main. The embedded shellcheck
+  # pass is disabled (-shellcheck=): inline `run:` shell is not held to
+  # the dedicated shellcheck job's standard, and workflow-syntax errors
+  # are what this job is for. The release job's custom self-hosted runner
+  # label "signing" is declared in .github/actionlint.yaml so it is not
+  # flagged as unknown.
+  actionlint:
+    name: actionlint (workflows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Digest-pinned to match the SHA-pinned actions above.
+      - name: actionlint
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12
+        with:
+          args: -color -shellcheck=
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    # Non-blocking until actions/setup-go's manifest stops lagging
+    # upstream Go patch releases. Findings still appear in the logs;
+    # remove this once setup-go reliably installs the latest 1.25.x.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Scan
+        run: govulncheck ./...
+      # The desktop app is a second Go module (see desktop-go above);
+      # `govulncheck ./...` from the root never descends into it.
+      - name: Scan (desktop-app)
+        working-directory: desktop-app
+        run: govulncheck ./...
+
+  # Vite build for the Wails frontend. Catches broken template
+  # literals, JSON parse errors in i18n bundles and missing imports
+  # at PR time rather than at the next release. The build only
+  # exercises the Vite pipeline; the Wails-Go glue is covered by
+  # release.yml's full desktop builds on tag push.
+  artefacts:
+    name: No build output committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Three go:embed targets are tracked as EMPTY stubs so a clean checkout
+      # compiles, and CI overwrites them with the real binaries in a later job.
+      # A local `make wails-build` fills them and deletes frontend/dist/.gitkeep,
+      # and committing that state puts a 13 MB binary in the history and breaks
+      # `go build` on a fresh clone. Caught by hand three times in one evening
+      # (2026-08-15), which is three times too many.
+      - name: The embed stubs are still stubs
+        run: |
+          set -e
+          fail=0
+          for f in desktop-app/agentbin/stmanager-armv7l desktop-app/agentbin/go-librespot-armv7l sticksetup/embedded/winformat.exe; do
+            if [ ! -f "$f" ]; then
+              echo "::error file=$f::tracked stub is missing"; fail=1; continue
+            fi
+            size=$(wc -c < "$f")
+            if [ "$size" -ne 0 ]; then
+              echo "::error file=$f::this is a tracked EMPTY stub, but it holds $size bytes. Restore it with: git checkout origin/main -- $f"
+              fail=1
+            fi
+          done
+          if [ ! -f desktop-app/frontend/dist/.gitkeep ]; then
+            echo "::error file=desktop-app/frontend/dist/.gitkeep::deleted by a local frontend build, and go:embed needs it. Restore it with: git checkout origin/main -- desktop-app/frontend/dist/.gitkeep"
+            fail=1
+          fi
+          [ "$fail" -eq 0 ] && echo "embed stubs empty, dist/.gitkeep present"
+          exit $fail
+
+  diagrams:
+    name: Mermaid diagrams parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+
+      # A mermaid block GitHub cannot parse renders as a grey error box, and
+      # nothing in the build ever said so. Eight of the fourteen diagrams in
+      # docs/ARCHITECTURE.md were broken at once for months (2026-09-08):
+      # mermaid 11 turned `box` into a sequence-diagram keyword, so
+      # `participant Box as ...` stopped parsing, and a `;` in message or note
+      # text is a parse error as well.
+      - name: Check every mermaid block
+        run: |
+          set -e
+          npm install --no-save --no-audit --no-fund mermaid@11 jsdom
+          mapfile -t files < <(git ls-files '*.md' | xargs grep -l '```mermaid' || true)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no markdown with mermaid blocks"; exit 0
+          fi
+          echo "checking: ${files[*]}"
+          node .github/scripts/check-mermaid.mjs "${files[@]}"
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop-app/frontend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: desktop-app/frontend
+        run: npm ci --no-audit --no-fund
+
+      # A var() pointing at a token that is defined nowhere is not a CSS error:
+      # the declaration is dropped and the element inherits whatever is around
+      # it. Four rules asked for a colour that never existed, and it took a
+      # user on macOS to notice. The rule set is deliberately small,
+      # correctness only, no formatting.
+      # Correctness only, no formatting. On its first run this found a call to
+      # an undefined function in the stereo balance row: it threw every time,
+      # the catch around it swallowed the error, and the row was silently never
+      # shown. Unused bindings are warnings, so the report stays readable
+      # without a mechanical cleanup blocking a PR.
+      - name: Lint frontend
+        working-directory: desktop-app/frontend
+        run: npm run lint
+
+      # The 600+ vitest tests ran nowhere in CI until 2026-09-25: no workflow
+      # invoked vitest, so a red frontend was only ever caught by somebody
+      # running the suite by hand on their own machine. One consequence sat in
+      # the tree for weeks: fwguidelink.test.js sliced source on a bare newline,
+      # which matches under LF and not under CRLF, so it read a different amount
+      # of text depending on the checkout and passed on Windows while failing on
+      # Linux. It runs before the build, because a failing assertion is cheaper
+      # to read than a bundle that builds and behaves wrongly.
+      - name: Test frontend
+        working-directory: desktop-app/frontend
+        run: npm test
+
+      - name: Build frontend
+        working-directory: desktop-app/frontend
+        run: npm run build
+
+      # i18n coverage report. en is the reference (global-audience default);
+      # the script prints per-locale missing/extra keys. Report-only (exit 0)
+      # so an in-progress translation never blocks a PR, but the drift is
+      # visible in the log instead of being discovered by a user.
+      - name: i18n coverage report
+        working-directory: desktop-app/frontend
+        run: node scripts/i18n-coverage.mjs
+
+  build:
+    name: Cross Compile
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm
+            # GOARM=5 (softfloat), not 7: some early SoundTouch CPUs lack
+            # working VFP and a hardware-float binary SIGILLs at os.init and
+            # soft-bricks the box. Must match Makefile/release.yml.
+            goarm: "5"
+            suffix: armv7l
+          - goos: linux
+            goarch: arm64
+            suffix: arm64
+          - goos: linux
+            goarch: amd64
+            suffix: amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "stable"
+          cache: true
+
+      - name: Compute version
+        id: vars
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(git describe --tags --always --dirty)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "dist/stmanager-${{ matrix.suffix }}" \
+            ./cmd/agent
+          sha256sum "dist/stmanager-${{ matrix.suffix }}" \
+            > "dist/stmanager-${{ matrix.suffix }}.sha256"
+
+      - name: Generate model aliases for armv7l
+        if: matrix.suffix == 'armv7l'
+        run: |
+          for model in ST10 ST20 ST30 WaveSoundTouchIV; do
+            cp "dist/stmanager-armv7l" "dist/stmanager-${model}"
+            sha256sum "dist/stmanager-${model}" \
+              > "dist/stmanager-${model}.sha256"
+          done
+          ls -la dist/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: stmanager-${{ matrix.suffix }}
+          path: dist/stmanager-*
+          if-no-files-found: error
+          retention-days: 14

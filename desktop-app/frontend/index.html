@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8"/>
+    <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+    <!-- Defense-in-depth against injected content from the untrusted radio-browser
+         catalogue (station name/tags/favicon). script-src has NO 'unsafe-inline':
+         even if an escaping bug slipped a <script> or on*= handler through, it
+         could not run and reach the Wails Go bindings. style-src keeps
+         'unsafe-inline' (the UI sets inline style="" widely; style injection is
+         not code execution). img-src allows remote station favicons + data: tiles;
+         connect-src allows the app to reach speakers on the LAN over http(s).
+         media-src lets the add-station dialog preview a radio stream on this
+         device; audio cannot run code. blob: is the MediaSource URL hls.js
+         plays HLS stations through where the WebView has no native HLS. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https: http:; media-src 'self' https: http: blob:; connect-src 'self' http: https: ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"/>
+    <title>SoundTouch Manager</title>
+    <link rel="icon" href="/favicon.png" type="image/png"/>
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png"/>
+</head>
+<body>
+<div id="appUpdateBanner" class="app-update-banner hidden"></div>
+<div id="boxWedgeBanner" class="app-update-banner box-wedge-banner hidden"></div>
+<div id="boxIssueBanner" class="app-update-banner box-wedge-banner hidden"></div>
+<div id="speakerUpdateCard" class="speaker-update-card hidden"></div>
+<div id="updateFailureReport" class="failreport hidden"></div>
+<div class="layout">
+  <aside class="donate-side" id="donateSide"></aside>
+  <div id="app"></div>
+</div>
+<script src="./src/main.js" type="module"></script>
+</body>
+</html>

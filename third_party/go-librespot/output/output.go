@@ -1,0 +1,203 @@
+package output
+
+import (
+	"fmt"
+
+	librespot "github.com/devgianlu/go-librespot"
+)
+
+// BackendPipePassthrough is the audio backend that writes the raw encoded
+// (Ogg/Vorbis) stream to a named pipe instead of decoded PCM. It is served
+// by its own driver, separate from the pipe backend; the Reader must
+// implement AudioSourcePassthrough and OutputPipeFormat is ignored.
+const BackendPipePassthrough = "pipe_passthrough"
+
+type Output interface {
+	// Pause pauses the output.
+	Pause() error
+
+	// Resume resumes the output.
+	Resume() error
+
+	// Drop empties the audio buffer without waiting. It must not resume or
+	// restart playback; the caller resumes explicitly when needed.
+	Drop() error
+
+	// DelayMs returns the output device delay in milliseconds.
+	DelayMs() (int64, error)
+
+	// SetVolume sets the volume (0-1).
+	SetVolume(vol float32)
+
+	// Error returns the error that stopped the device (if any).
+	Error() <-chan error
+
+	// Close closes the output.
+	Close() error
+}
+
+type NewOutputOptions struct {
+	Log librespot.Logger
+
+	// Backend is the audio backend to use (also, pulseaudio, etc).
+	Backend string
+
+	// Reader provides data for the output device.
+	//
+	// The format of data is as follows:
+	//
+	//	[data]      = [sample 1] [sample 2] [sample 3] ...
+	//	[sample *]  = [channel 1] [channel 2] ...
+	//	[channel *] = [byte 1] [byte 2] ...
+	//
+	// Byte ordering is little endian.
+	Reader librespot.Float32Reader
+
+	// SampleRate specifies the number of samples that should be played during one second.
+	// Usual numbers are 44100 or 48000. One context has only one sample rate. You cannot play multiple audio
+	// sources with different sample rates at the same time.
+	SampleRate int
+
+	// ChannelCount specifies the number of channels. One channel is mono playback. Two
+	// channels are stereo playback. No other values are supported.
+	ChannelCount int
+
+	// Device specifies the audio device name.
+	//
+	// This feature is support only for the alsa and pulseaudio backend.
+	// The wasapi backend always uses the default playback endpoint.
+	Device string
+	// RuntimeSocket specifies a prefixed with protocol (e.g. `unix:` or `tcp:`) path
+	// to a runtime socket of audio backend.
+	//
+	// This feature is support only for pulseaudio backend.
+	RuntimeSocket string
+
+	// Mixer specifies the audio mixer name.
+	//
+	// This feature is support only for the alsa backend.
+	Mixer string
+	// Control specifies the mixer control name
+	//
+	// This only works in combination with Mixer
+	Control string
+
+	// BufferTimeMicro is the buffer time in microseconds.
+	//
+	// This is only supported on the alsa backend.
+	BufferTimeMicro int
+
+	// PeriodCount is the number of periods to request.
+	//
+	// This is only supported on the alsa backend.
+	PeriodCount int
+
+	// InitialVolume specifies the initial output volume.
+	//
+	// This is supported on the alsa, pipe, audio-toolbox, and wasapi backends. The PulseAudio
+	// backend uses the PulseAudio default volume.
+	InitialVolume float32
+
+	// ExternalVolume specifies, if the volume is controlled outside the app.
+	//
+	// This is only supported on the alsa and pipe backends.
+	// The PulseAudio backend always uses external volume.
+	ExternalVolume bool
+
+	// VolumeUpdate is a channel on which volume updates will be sent back to
+	// Spotify. All updates come through this channel, including those sent by
+	// Spotify.
+	// This must be a buffered channel.
+	VolumeUpdate chan float32
+
+	// OutputPipe is the path to the output pipe.
+	//
+	// This is only supported on the pipe backend.
+	OutputPipe string
+
+	// OutputPipeFormat is the format of the output pipe.
+	// Available formats are: "s16le", "s32le", "f32le". Default is "s16le".
+	//
+	// This is only supported on the pipe backend.
+	OutputPipeFormat string
+
+	// OutputPipeWaitForReader makes the pipe backend wait for a reader to
+	// appear when opening the FIFO, instead of failing if none is present at the
+	// time playback starts. This is useful for readers (e.g. snapcast with
+	// dryout) that only connect to the FIFO when data is expected.
+	//
+	// This is only supported on the pipe backend.
+	OutputPipeWaitForReader bool
+}
+
+func NewOutput(options *NewOutputOptions) (Output, error) {
+	switch options.Backend {
+	case "alsa":
+		out, err := newAlsaOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case "pulseaudio":
+		out, err := newPulseAudioOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case "pipe":
+		out, err := newPipeOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case BackendPipePassthrough:
+		out, err := newPipePassthroughOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case "audio-toolbox":
+		out, err := newAudioToolboxOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case "wasapi":
+		out, err := newWasapiOutput(options)
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	default:
+		return nil, fmt.Errorf("unknown audio backend: %s", options.Backend)
+	}
+}
+
+// Do a non-blocking send on the channel to send a volume update, dropping
+// the stale value if the buffer is full.
+//
+// The channel must be a buffered channel. Unlike the old drain-then-send
+// (which assumed a single caller and could block forever when the daemon's
+// updateVolume raced an output driver for the same one-slot buffer), this
+// loop never blocks: each pass either delivers the value or frees a slot,
+// so concurrent callers converge with the last writer winning — exactly the
+// semantics volume wants.
+func sendVolumeUpdate(ch chan float32, val float32) {
+	if cap(ch) == 0 {
+		panic("channel must be buffered") // sanity check
+	}
+
+	for {
+		select {
+		case ch <- val:
+			return
+		default:
+		}
+
+		// Buffer full: drop the stale value and retry.
+		select {
+		case <-ch:
+		default:
+		}
+	}
+}

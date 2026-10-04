@@ -1,0 +1,540 @@
+package boxws
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+// recHandler records which gabbo events the parser dispatched so tests can
+// assert that marker words in user-supplied text no longer mis-fire.
+type recHandler struct {
+	presets       []int
+	userStops     int
+	powerKeys     int
+	powerWakes    int
+	sourceAux     int
+	enterStandby  int
+	skips         []bool
+	zones         []ZoneState
+	groups        []GroupState
+	boxPresets    [][]BoxPreset
+	sourceRejects int
+	mu            sync.Mutex
+	thumbs        int // guarded by mu (fired from the debounce timer goroutine)
+}
+
+func (h *recHandler) OnSourceRejected(context.Context) { h.sourceRejects++ }
+
+func (h *recHandler) thumbCount() int { h.mu.Lock(); defer h.mu.Unlock(); return h.thumbs }
+
+func (h *recHandler) OnPresetSelected(_ context.Context, slot int, _ string, _ string) {
+	h.presets = append(h.presets, slot)
+}
+func (h *recHandler) OnRemoteSkip(_ context.Context, forward bool) {
+	h.skips = append(h.skips, forward)
+}
+func (h *recHandler) OnUserStop(context.Context)                   { h.userStops++ }
+func (h *recHandler) OnThumbActivity(context.Context)              { h.mu.Lock(); h.thumbs++; h.mu.Unlock() }
+func (h *recHandler) OnPowerKey(context.Context)                   { h.powerKeys++ }
+func (h *recHandler) OnSourceAux(context.Context)                  { h.sourceAux++ }
+func (h *recHandler) OnZoneChanged(_ context.Context, z ZoneState) { h.zones = append(h.zones, z) }
+func (h *recHandler) OnGroupChanged(_ context.Context, g GroupState) {
+	h.groups = append(h.groups, g)
+}
+func (h *recHandler) OnPowerWake(context.Context)    { h.powerWakes++ }
+func (h *recHandler) OnEnterStandby(context.Context) { h.enterStandby++ }
+func (h *recHandler) OnPresetsChanged(_ context.Context, p []BoxPreset) {
+	h.boxPresets = append(h.boxPresets, p)
+}
+
+func newTestClient(h Handler) *Client {
+	return New(slog.New(slog.NewTextHandler(io.Discard, nil)), "ws://127.0.0.1:8080/", h)
+}
+
+// TestHandleMessage_EnterStandbyOnlyFromUPNP covers the hook: STM clears the
+// transport when its own UPnP source drops to STANDBY, but not on a power-off from
+// another source (AUX/Spotify), so it never fights an unrelated standby.
+func TestHandleMessage_EnterStandbyOnlyFromUPNP(t *testing.T) {
+	standbyFrame := `<updates deviceID="x"><nowPlayingUpdated><nowPlaying source="STANDBY">` +
+		`<ContentItem source="STANDBY"/></nowPlaying></nowPlayingUpdated></updates>`
+
+	// UPNP -> STANDBY fires the hook once.
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`))
+	c.handleMessage(context.Background(), []byte(standbyFrame))
+	if h.enterStandby != 1 {
+		t.Fatalf("UPNP->STANDBY must fire OnEnterStandby once, got %d", h.enterStandby)
+	}
+
+	// AUX -> STANDBY must NOT fire it (STM did not drive that source).
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="AUX"/></nowPlayingUpdated></updates>`))
+	c2.handleMessage(context.Background(), []byte(standbyFrame))
+	if h2.enterStandby != 0 {
+		t.Fatalf("AUX->STANDBY must not fire OnEnterStandby, got %d", h2.enterStandby)
+	}
+}
+
+func TestHandleMessage_StopStateInTitleDoesNotFireUserStop(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// A station whose name literally contains STOP_STATE, but playback is
+	// actively PLAY_STATE. The old whole-frame match fired OnUserStop here.
+	frame := `<updates deviceID="x"><nowPlayingUpdated><nowPlaying source="UPNP">` +
+		`<ContentItem source="UPNP" location="http://a"><itemName>STOP_STATE FM</itemName></ContentItem>` +
+		`<playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if h.userStops != 0 {
+		t.Fatalf("STOP_STATE in title must not fire OnUserStop, got %d", h.userStops)
+	}
+}
+
+func TestHandleMessage_RealStopStateFiresUserStop(t *testing.T) {
+	for _, frame := range []string{
+		`<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`,
+		`<updates><nowPlayingUpdated><nowPlaying source="UPNP" playStatus="STOP_STATE"/></nowPlayingUpdated></updates>`,
+	} {
+		h := &recHandler{}
+		c := newTestClient(h)
+		c.handleMessage(context.Background(), []byte(frame))
+		if h.userStops != 1 {
+			t.Fatalf("real STOP_STATE must fire OnUserStop once, got %d for %q", h.userStops, frame)
+		}
+	}
+}
+
+// A STOP_STATE the box emits while tearing its own UPNP source down (a preset
+// switch, or an involuntary drop that flaps through INVALID_SOURCE) must NOT be
+// read as a deliberate user stop: doing so latched a phantom user-stop that
+// suppressed the drop recovery and the recall retry, so the preset buttons died
+// after a few minutes and a re-press did not fix them (#ST30 2026-07-11).
+func TestHandleMessage_TeardownStopStateIsNotUserStop(t *testing.T) {
+	stop := `<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+
+	// (a) STOP_STATE right after a hardware preset press = the switch teardown.
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><nowSelectionUpdated><preset id="2">`+
+		`<ContentItem source="UPNP" location="http://127.0.0.1:8888/stream/2"><itemName>1LIVE</itemName></ContentItem>`+
+		`</preset></nowSelectionUpdated></updates>`))
+	c.handleMessage(context.Background(), []byte(stop))
+	if h.userStops != 0 {
+		t.Fatalf("STOP_STATE right after a preset press must not fire OnUserStop, got %d", h.userStops)
+	}
+
+	// (b) STOP_STATE shortly after an INVALID_SOURCE flap = an involuntary drop.
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="INVALID_SOURCE"/></nowPlayingUpdated></updates>`))
+	c2.handleMessage(context.Background(), []byte(stop))
+	if h2.userStops != 0 {
+		t.Fatalf("STOP_STATE after an INVALID_SOURCE flap must not fire OnUserStop, got %d", h2.userStops)
+	}
+
+	// (c) STOP_STATE whose own frame reports source=INVALID_SOURCE.
+	h3 := &recHandler{}
+	c3 := newTestClient(h3)
+	c3.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="INVALID_SOURCE"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`))
+	if h3.userStops != 0 {
+		t.Fatalf("STOP_STATE with source=INVALID_SOURCE must not fire OnUserStop, got %d", h3.userStops)
+	}
+
+	// (d) The spontaneous-off oscillation: the box flips UPNP->STANDBY->UPNP
+	// and emits a STOP_STATE on the way back up whose OWN source reads UPNP (so
+	// the INVALID_SOURCE/STANDBY frame checks miss it). It must still be read as
+	// the bounce teardown, not a user stop - otherwise the latched user-stop
+	// defeats the exemption on the next leg and the box goes silent until a
+	// power pull (bundle 17, three sm2 boxes on v0.9.15).
+	h4 := &recHandler{}
+	c4 := newTestClient(h4)
+	c4.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`))
+	c4.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="STANDBY"><ContentItem source="STANDBY"/></nowPlaying></nowPlayingUpdated></updates>`))
+	c4.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`))
+	if h4.userStops != 0 {
+		t.Fatalf("STOP_STATE riding a UPNP<->STANDBY bounce must not fire OnUserStop, got %d", h4.userStops)
+	}
+}
+
+// A STOP_STATE the box emits in reaction to one of STM's OWN transport
+// commands (the wrong-state repair's Stop+ClearURI, a verify re-push's
+// SetURI+Play) must not be read as a deliberate user stop: on a slow box the
+// repair's Stop landed outside the press window and the phantom stop aborted
+// the very verify the repair belonged to (post-v0.9.16). A fresh physical
+// key press vetoes the excusal: the firmware accompanies real key presses with
+// a userActivityUpdate, which STM's SOAP commands never cause.
+func TestHandleMessage_OwnTransportCommandStopStateIsNotUserStop(t *testing.T) {
+	stop := `<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+
+	// (a) STOP_STATE right after STM's own SOAP command: excused.
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.NoteOwnTransportCommand()
+	c.handleMessage(context.Background(), []byte(stop))
+	if h.userStops != 0 {
+		t.Fatalf("STOP_STATE right after STM's own transport command must not fire OnUserStop, got %d", h.userStops)
+	}
+
+	// (b) A fresh key press alongside it means the user really pressed stop on
+	// the remote/box: the veto keeps the real stop honoured.
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.NoteOwnTransportCommand()
+	c2.handleMessage(context.Background(), []byte(`<userActivityUpdate deviceID="x"/>`))
+	c2.handleMessage(context.Background(), []byte(stop))
+	if h2.userStops != 1 {
+		t.Fatalf("a key press next to the STOP_STATE means a real user stop even inside the own-command window, got %d", h2.userStops)
+	}
+
+	// (c) An own-command older than the window does not excuse a stop.
+	h3 := &recHandler{}
+	c3 := newTestClient(h3)
+	c3.mu.Lock()
+	c3.lastOwnCmdAt = time.Now().Add(-10 * time.Second)
+	c3.mu.Unlock()
+	c3.handleMessage(context.Background(), []byte(stop))
+	if h3.userStops != 1 {
+		t.Fatalf("an own-command outside the window must not excuse a stop, got %d", h3.userStops)
+	}
+}
+
+func TestHandleMessage_PresetRecall(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	frame := `<updates><nowSelectionUpdated><preset id="3">` +
+		`<ContentItem source="UPNP" location="http://x"><itemName>NDR Info</itemName></ContentItem>` +
+		`</preset></nowSelectionUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if len(h.presets) != 1 || h.presets[0] != 3 {
+		t.Fatalf("expected preset slot 3, got %v", h.presets)
+	}
+}
+
+func TestHandleMessage_PresetsUpdatedCapturesForeignSource(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// The box reports its own preset list; STM must capture foreign sources
+	// (Deezer) with their full ContentItem so it can show/preserve/recall them
+	// (Option C). One Deezer playlist preset plus one radio preset.
+	frame := `<updates><presetsUpdated><presets>` +
+		`<preset id="3"><ContentItem source="DEEZER" type="playlist" location="123456789" sourceAccount="1456373802"><itemName>My Flow</itemName></ContentItem></preset>` +
+		`<preset id="1"><ContentItem source="LOCAL_INTERNET_RADIO" type="stationurl" location="http://wdr2.mp3" sourceAccount=""><itemName>WDR 2</itemName></ContentItem></preset>` +
+		`</presets></presetsUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if len(h.boxPresets) != 1 || len(h.boxPresets[0]) != 2 {
+		t.Fatalf("expected one OnPresetsChanged with 2 presets, got %v", h.boxPresets)
+	}
+	var deezer *BoxPreset
+	for i := range h.boxPresets[0] {
+		if h.boxPresets[0][i].Slot == 3 {
+			deezer = &h.boxPresets[0][i]
+		}
+	}
+	if deezer == nil {
+		t.Fatalf("slot 3 (Deezer) not captured: %+v", h.boxPresets[0])
+		return
+	}
+	if deezer.Source != "DEEZER" || deezer.Type != "playlist" || deezer.Location != "123456789" ||
+		deezer.SourceAccount != "1456373802" || deezer.Name != "My Flow" {
+		t.Fatalf("Deezer preset fields wrong: %+v", *deezer)
+	}
+}
+
+func TestHandleMessage_DoNotResumeIsRespected(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// A standby wake / source teardown the box marks DO_NOT_RESUME must NOT make
+	// STM resume playback (boxes playing on their own; AirPlay not stopping).
+	frame := `<updates><nowSelectionUpdated><preset id="0">` +
+		`<ContentItem source="INVALID_SOURCE" type="DO_NOT_RESUME" location="http://x">` +
+		`<itemName>x</itemName></ContentItem></preset></nowSelectionUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if len(h.presets) != 0 {
+		t.Fatalf("DO_NOT_RESUME must not play a preset, got %v", h.presets)
+	}
+}
+
+func TestHandleMessage_FrameTypeWordInTitleNotMisclassified(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// A nowPlaying frame whose title contains the literal "volumeUpdated".
+	// Typed dispatch keys on the element, not the text, so this is handled as
+	// nowPlaying (no user-stop, no crash) rather than a volume event.
+	frame := `<updates><nowPlayingUpdated><nowPlaying source="UPNP">` +
+		`<ContentItem source="UPNP" location="http://a"><itemName>volumeUpdated Live</itemName></ContentItem>` +
+		`<playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if h.userStops != 0 || len(h.presets) != 0 {
+		t.Fatalf("unexpected dispatch: stops=%d presets=%v", h.userStops, h.presets)
+	}
+}
+
+func TestHandleMessage_ZoneUpdatedParsed(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// A box-formed stereo pair / zone (Klaus): previously this fell through
+	// as an "unrecognized frame"; it must now parse into a typed ZoneState.
+	frame := `<updates><zoneUpdated><zone master="B0D5CCC4D6CB" senderIPAddress="192.0.2.38" senderIsMaster="true">` +
+		`<member ipaddress="192.0.2.39" role="right">B0D5CCC4D7AA</member></zone></zoneUpdated></updates>`
+	c.handleMessage(context.Background(), []byte(frame))
+	if len(h.zones) != 1 {
+		t.Fatalf("expected one zone event, got %d", len(h.zones))
+	}
+	z := h.zones[0]
+	if z.Master != "B0D5CCC4D6CB" || !z.SenderIsMaster || len(z.Members) != 1 {
+		t.Fatalf("zone parsed wrong: %+v", z)
+	}
+	if z.Members[0].DeviceID != "B0D5CCC4D7AA" || z.Members[0].IP != "192.0.2.39" || z.Members[0].Role != "right" {
+		t.Fatalf("member parsed wrong: %+v", z.Members[0])
+	}
+}
+
+func TestHandleMessage_ZoneDissolvedParsed(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><zoneUpdated><zone /></zoneUpdated></updates>`))
+	if len(h.zones) != 1 || h.zones[0].Master != "" {
+		t.Fatalf("empty zone must fire one ZoneState with empty Master, got %+v", h.zones)
+	}
+}
+
+// TestHandleMessage_PowerWake guards the power-on signal the resume binds to.
+// Verified live on a Portable/taigan (2026-06-13): the box sends NO
+// powerStateUpdated; a real power press surfaces as a DO_NOT_RESUME selection
+// restore. So BOTH a powerStateUpdated (firmware that sends it) AND the
+// DO_NOT_RESUME restore must fire OnPowerWake, while a power-OFF (STANDBY) fires
+// the OnPowerKey webhook and never OnPowerWake. The self-wake vs user-press
+// distinction is made downstream by zone membership, not here, because the two
+// are identical on the wire.
+func TestHandleMessage_PowerWake(t *testing.T) {
+	// powerStateUpdated not STANDBY -> OnPowerWake (for firmware that sends it).
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><powerStateUpdated>POWER_ON</powerStateUpdated></updates>`))
+	if h.powerWakes != 1 || h.powerKeys != 0 {
+		t.Fatalf("powerState ON must fire OnPowerWake once, not OnPowerKey: wakes=%d keys=%d", h.powerWakes, h.powerKeys)
+	}
+
+	// Power-OFF (STANDBY) -> OnPowerKey, never OnPowerWake.
+	h = &recHandler{}
+	c = newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><powerStateUpdated>STANDBY</powerStateUpdated></updates>`))
+	if h.powerKeys != 1 || h.powerWakes != 0 {
+		t.Fatalf("standby must fire OnPowerKey once, not OnPowerWake: keys=%d wakes=%d", h.powerKeys, h.powerWakes)
+	}
+
+	// The DO_NOT_RESUME selection restore (the only power-on signal on SoundTouch
+	// firmware) must fire OnPowerWake, and must NOT be mistaken for a preset.
+	h = &recHandler{}
+	c = newTestClient(h)
+	c.handleMessage(context.Background(), []byte(
+		`<updates><nowSelectionUpdated><preset id="0">`+
+			`<ContentItem source="INVALID_SOURCE" type="DO_NOT_RESUME"/>`+
+			`</preset></nowSelectionUpdated></updates>`))
+	if h.powerWakes != 1 || len(h.presets) != 0 {
+		t.Fatalf("DO_NOT_RESUME restore must fire OnPowerWake only: wakes=%d presets=%v", h.powerWakes, h.presets)
+	}
+}
+
+func TestRootLocalName(t *testing.T) {
+	cases := map[string]string{
+		`<userActivityUpdate deviceID="x" />`:              "userActivityUpdate",
+		`<updates><volumeUpdated/></updates>`:              "updates",
+		`<?xml version="1.0"?><errorUpdate></errorUpdate>`: "errorUpdate",
+		``:        "",
+		`not xml`: "",
+	}
+	for in, want := range cases {
+		if got := rootLocalName(in); got != want {
+			t.Errorf("rootLocalName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestHandleMessage_BareUserActivityFiresThumb(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	// A bare-root <userActivityUpdate/> (not wrapped in <updates>) must still be
+	// recognised as a lone thumb ping, not dropped as an unrecognized frame.
+	c.handleMessage(context.Background(), []byte(`<userActivityUpdate deviceID="x" />`))
+	// noteUserActivity fires OnThumbActivity after a short settle window.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && h.thumbCount() == 0 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if h.thumbCount() != 1 {
+		t.Fatalf("bare userActivityUpdate must fire one thumb, got %d", h.thumbCount())
+	}
+}
+
+// TestHandleMessage_UserActivityLoggedAtInfo guards the diagnostic: every
+// incoming userActivity frame must be recorded at INFO (deduped) so a bundle
+// shows whether the thumb key emits a frame at all, independent of whether the
+// heuristic fires. A second frame inside the dedup window must NOT add a second
+// "frame received" line, so a volume ramp cannot churn the NAND log.
+func TestHandleMessage_UserActivityLoggedAtInfo(t *testing.T) {
+	var buf bytes.Buffer
+	h := &recHandler{}
+	c := New(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})),
+		"ws://127.0.0.1:8080/", h)
+
+	c.handleMessage(context.Background(), []byte(`<userActivityUpdate deviceID="x" />`))
+	c.handleMessage(context.Background(), []byte(`<userActivityUpdate deviceID="x" />`))
+
+	got := buf.String()
+	if n := strings.Count(got, "user-activity frame received"); n != 1 {
+		t.Fatalf("want exactly one deduped 'frame received' INFO line, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "userActivityUpdate") {
+		t.Fatalf("the raw frame must be captured in the log, got:\n%s", got)
+	}
+}
+
+func TestHandleMessage_QplaySkip(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><errorUpdate>QPLAY_SKIP_NEXT_FAILED</errorUpdate></updates>`))
+	c.handleMessage(context.Background(), []byte(`<updates><errorUpdate>QPLAY_SKIP_PREV_FAILED</errorUpdate></updates>`))
+	if len(h.skips) != 2 || h.skips[0] != true || h.skips[1] != false {
+		t.Fatalf("expected [next, prev] skips, got %v", h.skips)
+	}
+}
+
+// TestHandleMessage_EnterStandbyViaInvalidSourceFlap: on taigan/spotty/lisa
+// firmware the box's give-up after a failed self-activation reaches STANDBY
+// through INVALID_SOURCE (UPNP -> INVALID_SOURCE -> STANDBY), never directly
+// from UPNP. The prev==UPNP gate made that route bypass the entire standby
+// machinery (no classification, no clear, no recovery) while the box
+// switched itself off - every observed standby entry in the 2026-07-22 field
+// bundles took this route. The flap must fire OnEnterStandby; an AUX power-off
+// (no recent UPNP) still must not.
+func TestHandleMessage_EnterStandbyViaInvalidSourceFlap(t *testing.T) {
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`))
+	c.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="INVALID_SOURCE"/></nowPlayingUpdated></updates>`))
+	c.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="STANDBY"><ContentItem source="STANDBY"/></nowPlaying></nowPlayingUpdated></updates>`))
+	if h.enterStandby != 1 {
+		t.Fatalf("UPNP->INVALID_SOURCE->STANDBY must fire OnEnterStandby once, got %d", h.enterStandby)
+	}
+
+	// AUX -> INVALID_SOURCE -> STANDBY: STM's source was never active, the
+	// standby machinery must stay out of it.
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="AUX"/></nowPlayingUpdated></updates>`))
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="INVALID_SOURCE"/></nowPlayingUpdated></updates>`))
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="STANDBY"><ContentItem source="STANDBY"/></nowPlaying></nowPlayingUpdated></updates>`))
+	if h2.enterStandby != 0 {
+		t.Fatalf("a standby entry with no recent UPNP activity must not fire OnEnterStandby, got %d", h2.enterStandby)
+	}
+}
+
+// TestHandleMessage_KeylessOwnCommandWindowIsTight: firmware that has never
+// emitted a userActivityUpdate gives the key veto no signal, so the full 3s
+// own-command window would excuse EVERY stop within 3s of any of STM's SOAP
+// commands - and during a struggling recall STM pushes on a ~5s cadence, so a
+// deliberate remote stop was near-guaranteed to be swallowed and the re-push
+// overrode it. On keyless firmware only the immediate echo of our own command
+// (the tight window) is excused; a stop a second and a half later must latch.
+func TestHandleMessage_KeylessOwnCommandWindowIsTight(t *testing.T) {
+	stop := `<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>STOP_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+
+	// (a) Keyless firmware, own command 1.5s ago (inside the old 3s window,
+	// outside the tight keyless window): a real remote stop, must latch.
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.mu.Lock()
+	c.lastOwnCmdAt = time.Now().Add(-1500 * time.Millisecond)
+	c.mu.Unlock()
+	c.handleMessage(context.Background(), []byte(stop))
+	if h.userStops != 1 {
+		t.Fatalf("keyless firmware: a stop 1.5s after our own command is the user's, got %d OnUserStop", h.userStops)
+	}
+
+	// (b) Keyless firmware, immediate echo of our own command: still excused.
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.NoteOwnTransportCommand()
+	c2.handleMessage(context.Background(), []byte(stop))
+	if h2.userStops != 0 {
+		t.Fatalf("keyless firmware: the immediate echo of our own command must stay excused, got %d", h2.userStops)
+	}
+
+	// (c) Key-emitting firmware (a key was seen earlier, not adjacent): the
+	// full window with the key veto keeps working as before.
+	h3 := &recHandler{}
+	c3 := newTestClient(h3)
+	c3.thumbMu.Lock()
+	c3.lastUserActivityAt = time.Now().Add(-10 * time.Second)
+	c3.thumbMu.Unlock()
+	c3.mu.Lock()
+	c3.lastOwnCmdAt = time.Now().Add(-1500 * time.Millisecond)
+	c3.mu.Unlock()
+	c3.handleMessage(context.Background(), []byte(stop))
+	if h3.userStops != 0 {
+		t.Fatalf("keyed firmware: a stop 1.5s after our own command with no adjacent key stays excused, got %d", h3.userStops)
+	}
+}
+
+// TestHandleMessage_EnterStandbyAfterLongInvalidSourceDwell covers the box
+// give-up route with a long dwell: UPNP -> INVALID_SOURCE, the box then SITS
+// in INVALID_SOURCE well past the 5s flap window (the state the sys-power
+// nudge exists for), and only then enters STANDBY (typically because the user
+// gave up and pressed power). That entry must still run the standby
+// classification: with the rolling window alone it bypassed the entire
+// machinery, nothing latched, and the recall verify's wake powered the
+// just-switched-off box back on.
+func TestHandleMessage_EnterStandbyAfterLongInvalidSourceDwell(t *testing.T) {
+	standbyFrame := `<updates deviceID="x"><nowPlayingUpdated><nowPlaying source="STANDBY">` +
+		`<ContentItem source="STANDBY"/></nowPlaying></nowPlayingUpdated></updates>`
+	upnpFrame := `<updates><nowPlayingUpdated><nowPlaying source="UPNP"><playStatus>PLAY_STATE</playStatus></nowPlaying></nowPlayingUpdated></updates>`
+	invalidFrame := `<updates><nowPlayingUpdated><nowPlaying source="INVALID_SOURCE"/></nowPlayingUpdated></updates>`
+
+	// UPNP -> INVALID_SOURCE -> (long dwell) -> STANDBY fires the hook.
+	h := &recHandler{}
+	c := newTestClient(h)
+	c.handleMessage(context.Background(), []byte(upnpFrame))
+	c.handleMessage(context.Background(), []byte(invalidFrame))
+	c.mu.Lock()
+	c.lastUpnpActiveAt = time.Now().Add(-16 * time.Second) // dwell far past upnpFlapWindow
+	c.mu.Unlock()
+	c.handleMessage(context.Background(), []byte(standbyFrame))
+	if h.enterStandby != 1 {
+		t.Fatalf("a STANDBY entry ending a UPNP-driven INVALID_SOURCE episode must fire OnEnterStandby, got %d", h.enterStandby)
+	}
+
+	// Counter-leg: an INVALID_SOURCE episode NOT entered from UPNP (foreign
+	// source trouble) must still not fire it.
+	h2 := &recHandler{}
+	c2 := newTestClient(h2)
+	c2.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="AUX"/></nowPlayingUpdated></updates>`))
+	c2.handleMessage(context.Background(), []byte(invalidFrame))
+	c2.handleMessage(context.Background(), []byte(standbyFrame))
+	if h2.enterStandby != 0 {
+		t.Fatalf("an INVALID_SOURCE episode not entered from UPNP must not fire OnEnterStandby, got %d", h2.enterStandby)
+	}
+
+	// Recovery clears the episode: UPNP -> INVALID_SOURCE -> UPNP (healthy
+	// again) -> AUX -> (aged stamps) -> STANDBY is a foreign power-off.
+	h3 := &recHandler{}
+	c3 := newTestClient(h3)
+	c3.handleMessage(context.Background(), []byte(upnpFrame))
+	c3.handleMessage(context.Background(), []byte(invalidFrame))
+	c3.handleMessage(context.Background(), []byte(upnpFrame))
+	c3.handleMessage(context.Background(), []byte(`<updates><nowPlayingUpdated><nowPlaying source="AUX"/></nowPlayingUpdated></updates>`))
+	c3.mu.Lock()
+	c3.lastUpnpActiveAt = time.Now().Add(-16 * time.Second)
+	c3.mu.Unlock()
+	c3.handleMessage(context.Background(), []byte(standbyFrame))
+	if h3.enterStandby != 0 {
+		t.Fatalf("a recovered episode followed by a foreign-source power-off must not fire OnEnterStandby, got %d", h3.enterStandby)
+	}
+}

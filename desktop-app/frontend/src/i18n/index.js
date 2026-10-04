@@ -1,0 +1,162 @@
+// i18n: minimal vanilla translation layer. No external library.
+//
+// Bundles are plain JSON keyed by flat dotted paths (e.g.
+// "settings.title"). Lookup falls back to English if the active
+// locale lacks a key, and finally to the raw key so missing strings
+// are visible during development.
+//
+// Active locale is persisted in localStorage under "locale". On first
+// load it is derived from navigator.language with a hard fallback to
+// English: the app ships worldwide, English is the safe default.
+//
+// Adding a new language: drop a bundle file under bundles/, register
+// it in BUNDLES below. Bundles are statically imported so Vite ships
+// them as part of the main chunk; for the 50 to 100 strings STM has,
+// the size cost is negligible compared to lazy-loading complexity.
+
+import en from './bundles/en.json';
+import de from './bundles/de.json';
+import fr from './bundles/fr.json';
+import es from './bundles/es.json';
+import ja from './bundles/ja.json';
+import uk from './bundles/uk.json';
+import nl from './bundles/nl.json';
+import pl from './bundles/pl.json';
+import lt from './bundles/lt.json';
+import lv from './bundles/lv.json';
+import tr from './bundles/tr.json';
+import ar from './bundles/ar.json';
+import zhHant from './bundles/zh-Hant.json';
+
+// Each bundle covers the full UI chrome; missing keys fall back to
+// English. The large country/genre/lang reference tables are not
+// duplicated into fr/es/ja/uk, so those entries fall back to English
+// via tLookup (radio metadata only). Note: Ukrainian is the app UI
+// language; the Bose box sysLanguage enum has no Ukrainian, so a UA box
+// display falls back to English (deliberately NOT Russian). See
+// project_bose_language_enum.
+const BUNDLES = { en, de, fr, es, ja, uk, nl, pl, lt, lv, tr, ar, 'zh-Hant': zhHant };
+
+// RTL_LOCALES drive the document text direction. Arabic is right-to-left; every
+// other shipped locale is left-to-right. applyDirection mirrors the whole UI by
+// setting <html dir>, which flips flexbox rows, text alignment and logical
+// margins for free, and sets <html lang> for correct shaping/hyphenation.
+const RTL_LOCALES = new Set(['ar']);
+
+function applyDirection(code) {
+  try {
+    const el = typeof document !== 'undefined' && document.documentElement;
+    if (!el) return;
+    el.dir = RTL_LOCALES.has(code) ? 'rtl' : 'ltr';
+    el.lang = code;
+  } catch (_) {
+    // no document (SSR/test): nothing to mirror.
+  }
+}
+
+// The language picker renders in this order: alphabetical by each
+// language's own endonym (Deutsch, English, ..., Latviešu, Lietuvių,
+// ..., Türkçe, Українська, 日本語). localeCompare's default Unicode
+// collation puts Latin first, then Cyrillic, then CJK, which matches.
+export const AVAILABLE_LOCALES = Object.freeze(
+  Object.keys(BUNDLES)
+    .map((code) => ({ code, label: BUNDLES[code]['locale.label'] || code }))
+    .sort((a, b) => a.label.localeCompare(b.label)),
+);
+
+// REGION_LOCALES maps a full navigator.language to a bundle whose code is not
+// just the language part. Chinese is the case that needs it: the bundle is
+// zh-Hant (Traditional, as written in Taiwan and Hong Kong), and the plain
+// "cut at the dash" lookup below turns zh-TW into "zh", which matches no
+// bundle at all, so a Taiwanese user would have silently landed on English.
+// Simplified is deliberately NOT aliased here: zh-CN is a different script and
+// gets English until someone contributes zh-Hans.
+const REGION_LOCALES = Object.freeze({
+  'zh-tw': 'zh-Hant',
+  'zh-hk': 'zh-Hant',
+  'zh-mo': 'zh-Hant',
+  'zh-hant': 'zh-Hant',
+});
+
+const LS_KEY = 'locale';
+const FALLBACK = 'en';
+
+function detectInitialLocale() {
+  try {
+    const stored = localStorage.getItem(LS_KEY);
+    if (stored && BUNDLES[stored]) return stored;
+  } catch (_) {
+    // localStorage may be unavailable (private mode, sandbox); fall
+    // through to navigator detection.
+  }
+  const nav = (typeof navigator !== 'undefined' && navigator.language) || '';
+  const region = REGION_LOCALES[nav.toLowerCase()];
+  if (region && BUNDLES[region]) return region;
+  const short = nav.toLowerCase().split('-')[0];
+  if (short && BUNDLES[short]) return short;
+  return FALLBACK;
+}
+
+let currentLocale = detectInitialLocale();
+applyDirection(currentLocale); // mirror the UI on first paint when the stored/detected locale is RTL
+const listeners = new Set();
+
+export function getLocale() {
+  return currentLocale;
+}
+
+export function setLocale(code) {
+  if (!BUNDLES[code]) return false;
+  if (code === currentLocale) return true;
+  currentLocale = code;
+  applyDirection(code); // flip <html dir>/lang so switching to/from Arabic mirrors the UI
+  try {
+    localStorage.setItem(LS_KEY, code);
+  } catch (_) {
+    // ignore
+  }
+  for (const fn of listeners) {
+    try {
+      fn(code);
+    } catch (_) {
+      // listener errors must not break locale switching
+    }
+  }
+  return true;
+}
+
+// onLocaleChange registers a callback fired after setLocale succeeds.
+// Returns an unsubscribe function. View modules use it to rerender
+// when the user picks a different language.
+export function onLocaleChange(fn) {
+  listeners.add(fn);
+  return () => listeners.delete(fn);
+}
+
+// t(key, params) returns the translated string. params are interpolated
+// as {{name}} placeholders. Missing keys fall back through English to
+// the raw key so they show up obviously in the UI.
+export function t(key, params) {
+  let v = BUNDLES[currentLocale] && BUNDLES[currentLocale][key];
+  if (v == null) v = BUNDLES[FALLBACK] && BUNDLES[FALLBACK][key];
+  if (v == null) return key;
+  if (params && typeof v === 'string') {
+    return v.replace(/\{\{(\w+)\}\}/g, (_, name) =>
+      params[name] != null ? String(params[name]) : '',
+    );
+  }
+  return v;
+}
+
+// tLookup returns a nested table from the active bundle, e.g.
+// tLookup('country', 'germany') -> "Deutschland" or "Germany".
+// Tables live under prefixed keys (country.germany, genre.rock, ...).
+// Missing entries fall back to English then return undefined so callers
+// can decide on their own fallback (e.g. the raw radio-browser tag).
+export function tLookup(prefix, key) {
+  if (!key) return undefined;
+  const k = `${prefix}.${String(key).toLowerCase()}`;
+  let v = BUNDLES[currentLocale] && BUNDLES[currentLocale][k];
+  if (v == null) v = BUNDLES[FALLBACK] && BUNDLES[FALLBACK][k];
+  return v;
+}

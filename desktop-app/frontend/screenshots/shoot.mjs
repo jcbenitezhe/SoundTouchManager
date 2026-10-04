@@ -1,0 +1,438 @@
+// Automated per-language screenshot harness for the STM desktop app.
+//
+// The desktop UI is a plain Vite frontend that talks to the Go backend via
+// window.go.main.App.* and window.runtime. Here we render that frontend in a
+// real (headless) Chromium with those bindings MOCKED to return deterministic
+// demo data, set the UI language via the localStorage "locale" key, drive each
+// screen, and capture it. No speaker, no Wails, no network needed.
+//
+// Output: docs/screenshots/<lang>/<view>.png for every language x view.
+//
+// Run: npm run screenshots   (builds the frontend, then shoots)
+
+import { chromium } from 'playwright';
+import { spawn } from 'node:child_process';
+import { mkdir } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const FRONTEND = path.resolve(__dirname, '..');                       // desktop-app/frontend
+// SHOOT_MOBILE=1 renders the Android app instead: a phone viewport with the
+// stm-mobile class set, written to SHOOT_OUT (a scratch folder by default) so
+// the published desktop screenshots are left alone.
+const MOBILE = process.env.SHOOT_MOBILE === '1';
+const OUT = process.env.SHOOT_OUT
+  ? path.resolve(process.env.SHOOT_OUT)
+  : MOBILE
+    ? path.resolve(FRONTEND, 'screenshots/out-mobile')
+    : path.resolve(FRONTEND, '../../docs/screenshots');               // repo/docs/screenshots
+const VIEWPORT = MOBILE ? { width: 412, height: 915 } : { width: 1100, height: 780 };
+const PORT = 4178;
+const BASE = `http://127.0.0.1:${PORT}/`;
+
+// All shipped UI locales. Override with SHOOT_LANGS=ar,de (comma-separated) to
+// re-shoot only some languages without regenerating the whole set.
+const ALL_LANGS = ['en', 'de', 'fr', 'es', 'ja', 'uk', 'nl', 'pl', 'lt', 'lv', 'tr', 'ar', 'zh-Hant'];
+const LANGS = (process.env.SHOOT_LANGS && process.env.SHOOT_LANGS.trim())
+  ? process.env.SHOOT_LANGS.split(',').map((s) => s.trim()).filter(Boolean)
+  : ALL_LANGS;
+// app-logs is a cropped shot of the settings tail with the "Save diagnostic
+// logs" footer link highlighted; the website FAQ uses it to show where the
+// log lives. Override with SHOOT_VIEWS=app-logs to re-shoot a subset.
+const ALL_VIEWS = ['app-library', 'app-listen', 'app-search', 'app-tunein', 'app-settings1', 'app-settings2', 'app-settings3', 'app-stick-step1', 'app-stick-step2', 'app-logs'];
+const VIEWS = (process.env.SHOOT_VIEWS && process.env.SHOOT_VIEWS.trim())
+  ? process.env.SHOOT_VIEWS.split(',').map((s) => s.trim()).filter(Boolean)
+  : ALL_VIEWS;
+
+// ---- demo data -------------------------------------------------------------
+// A tiny inline SVG cover so screenshots have artwork without any network.
+const cover = (letter, bg) =>
+  'data:image/svg+xml;utf8,' +
+  encodeURIComponent(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="160" height="160"><rect width="160" height="160" rx="14" fill="${bg}"/><text x="80" y="104" font-family="Segoe UI,Arial,sans-serif" font-size="78" font-weight="700" fill="#ffffff" text-anchor="middle">${letter}</text></svg>`,
+  );
+
+const BOX = {
+  name: 'Living Room',
+  host: 'demobox.local',
+  port: 8888,
+  deviceID: 'A1B2C3D4E5F6',
+  friendlyName: 'Living Room',
+  model: 'SoundTouch 20',
+  version: 'v1.0.0',
+  build: '2026-10-02',
+  serialNumber: '',
+  kind: 'STM',
+  portVerified: true,
+};
+
+const PRESETS = [
+  { slot: 1, name: 'BBC Radio 1', stream_url: 'http://demobox.local:8888/stream/1', type: 'radio', art: cover('B', '#c4302b'), bitrate: 128 },
+  { slot: 2, name: 'Best Of Rock.FM', stream_url: 'http://demobox.local:8888/stream/2', type: 'radio', art: cover('R', '#1b2636'), bitrate: 256 },
+  { slot: 3, name: 'NPR News', stream_url: 'http://demobox.local:8888/stream/3', type: 'radio', art: cover('N', '#2a6f97'), bitrate: 128 },
+  { slot: 4, name: 'Jazz24', stream_url: 'http://demobox.local:8888/stream/4', type: 'radio', art: cover('J', '#7b2cbf'), bitrate: 320 },
+  { slot: 5, name: 'Radio Paradise', stream_url: 'http://demobox.local:8888/stream/5', type: 'radio', art: cover('P', '#e07a00'), bitrate: 320 },
+  { slot: 6, name: 'FIP', stream_url: 'http://demobox.local:8888/stream/6', type: 'radio', art: cover('F', '#d62246'), bitrate: 192 },
+];
+
+const SETTINGS = {
+  info: { deviceID: 'A1B2C3D4E5F6', name: 'Living Room', type: 'SoundTouch 20' },
+  volume: { actual: 32, muted: false },
+  bass: { actual: 0, default: 0, min: -9, max: 9, available: true },
+  network: { interfaces: [{ type: 'WIFI', state: 'NETWORK_WIFI_CONNECTED', ssid: 'HomeWiFi', ipAddress: '192.0.2.50', signal: 'GOOD', frequencyKHz: 2412000 }] },
+  sources: [{ source: 'AUX', status: 'READY' }, { source: 'BLUETOOTH', status: 'READY' }],
+};
+
+const STATUS_PLAYING =
+  '<?xml version="1.0" encoding="UTF-8"?>' +
+  '<nowPlaying deviceID="A1B2C3D4E5F6" source="INTERNET_RADIO">' +
+  '<ContentItem source="INTERNET_RADIO" location="http://demobox.local:8888/stream/2" isPresetable="true">' +
+  '<itemName>Best Of Rock.FM</itemName></ContentItem>' +
+  '<art artImageStatus="IMAGE_PRESENT">' + cover('R', '#1b2636') + '</art>' +
+  '<playStatus>PLAY_STATE</playStatus></nowPlaying>';
+
+const STATUS_IDLE =
+  '<?xml version="1.0" encoding="UTF-8"?>' +
+  '<nowPlaying deviceID="A1B2C3D4E5F6" source="STANDBY">' +
+  '<ContentItem source="STANDBY"></ContentItem><playStatus></playStatus></nowPlaying>';
+
+const DRIVES = [
+  { path: 'E:\\', label: 'USB DISK', totalBytes: 31043616768, freeBytes: 30500000000, filesystem: 'FAT32', removable: true, hasStick: false, description: 'Verbatim STORE N GO (29 GB)' },
+];
+
+const WIFI = [
+  { ssid: 'HomeWiFi', hasPass: true, source: 'system' },
+  { ssid: 'Guest-Net', hasPass: false, source: 'system' },
+];
+
+const APPINFO = {
+  version: 'v1.0.0',
+  build: '2026-10-02',
+  author: 'Juan Carlos Benitez (jcbenitezhe)',
+  githubUrl: 'https://github.com/jcbenitezhe/SoundTouchManager',
+  websiteUrl: 'https://github.com/jcbenitezhe/SoundTouchManager',
+  donateUrl: 'https://github.com/sponsors/jcbenitezhe',
+  donateSlogan: 'Support SoundTouch Manager',
+  updateManifestUrl: '',
+};
+
+const STATIONS = [
+  { name: 'Best Of Rock.FM', url: 'http://example.com/rock', url_resolved: 'http://example.com/rock', stationuuid: 's1', countrycode: 'DE', bitrate: 256, votes: 4210, clicktrend: 12, clickcount: 90000, codec: 'MP3', tags: 'rock,alternative', favicon: cover('R', '#1b2636'), lastcheckok: 1 },
+  { name: 'BBC Radio 1', url: 'http://example.com/bbc1', url_resolved: 'http://example.com/bbc1', stationuuid: 's2', countrycode: 'GB', bitrate: 128, votes: 3890, clicktrend: 8, clickcount: 120000, codec: 'MP3', tags: 'pop,charts', favicon: cover('B', '#c4302b'), lastcheckok: 1 },
+  { name: 'Radio Paradise', url: 'http://example.com/rp', url_resolved: 'http://example.com/rp', stationuuid: 's3', countrycode: 'US', bitrate: 320, votes: 3550, clicktrend: 20, clickcount: 80000, codec: 'MP3', tags: 'eclectic,rock', favicon: cover('P', '#e07a00'), lastcheckok: 1 },
+  { name: 'Jazz24', url: 'http://example.com/jazz24', url_resolved: 'http://example.com/jazz24', stationuuid: 's4', countrycode: 'US', bitrate: 320, votes: 2980, clicktrend: 5, clickcount: 60000, codec: 'AAC', tags: 'jazz', favicon: cover('J', '#7b2cbf'), lastcheckok: 1 },
+  { name: 'FIP', url: 'http://example.com/fip', url_resolved: 'http://example.com/fip', stationuuid: 's5', countrycode: 'FR', bitrate: 192, votes: 2710, clicktrend: 9, clickcount: 55000, codec: 'MP3', tags: 'eclectic', favicon: cover('F', '#d62246'), lastcheckok: 1 },
+  { name: 'NPR News', url: 'http://example.com/npr', url_resolved: 'http://example.com/npr', stationuuid: 's6', countrycode: 'US', bitrate: 128, votes: 2540, clicktrend: 3, clickcount: 70000, codec: 'MP3', tags: 'news,talk', favicon: cover('N', '#2a6f97'), lastcheckok: 1 },
+  { name: 'KEXP', url: 'http://example.com/kexp', url_resolved: 'http://example.com/kexp', stationuuid: 's7', countrycode: 'US', bitrate: 256, votes: 2300, clicktrend: 7, clickcount: 50000, codec: 'MP3', tags: 'indie,alternative', favicon: cover('K', '#0a9396'), lastcheckok: 1 },
+  { name: 'Classic FM', url: 'http://example.com/classic', url_resolved: 'http://example.com/classic', stationuuid: 's8', countrycode: 'GB', bitrate: 128, votes: 2100, clicktrend: 4, clickcount: 48000, codec: 'MP3', tags: 'classical', favicon: cover('C', '#5f0f40'), lastcheckok: 1 },
+];
+
+const LANGUAGES = [
+  { name: 'english', stationcount: 12000 },
+  { name: 'german', stationcount: 4200 },
+  { name: 'french', stationcount: 2600 },
+  { name: 'spanish', stationcount: 3100 },
+  { name: 'japanese', stationcount: 900 },
+  { name: 'ukrainian', stationcount: 300 },
+  { name: 'dutch', stationcount: 700 },
+];
+
+const MEDIA_SERVERS = [
+  { udn: 'uuid:demo-mediaserver', friendlyName: 'Living Room NAS', manufacturer: 'Demo', modelName: 'Media Server', iconURL: '', address: '192.0.2.60' },
+];
+const LIBRARY_PAGE = {
+  containers: [
+    { id: 'c1', title: 'Music', childCount: 6 },
+    { id: 'c2', title: 'Pictures', childCount: 2 },
+    { id: 'c3', title: 'Videos', childCount: 2 },
+    { id: 'c4', title: 'Internet Radio', childCount: 0 },
+    { id: 'c5', title: 'Podcasts', childCount: 0 },
+    { id: 'c6', title: 'File Index', childCount: 1 },
+  ],
+  items: [],
+  totalMatches: 6,
+  returned: 6,
+};
+
+const TUNEIN_ROOT = {
+  title: 'TuneIn',
+  items: ['Local Radio', 'Music', 'Talk', 'Sports', 'By Location', 'By Language', 'Podcasts']
+    .map((text, i) => ({ kind: 'link', text, ref: 'demo-' + i })),
+};
+const TUNEIN_SEARCH = {
+  title: 'Search',
+  items: [
+    { kind: 'station', text: 'Jazz24', subtext: 'World Class Jazz', guideId: 's100001', image: cover('J', '#7b2cbf'), bitrate: 128 },
+    { kind: 'station', text: 'Smooth Jazz 24/7', subtext: 'Keeping the smooth jazz flowing', guideId: 's100002', image: cover('S', '#e07a00'), bitrate: 128 },
+    { kind: 'station', text: 'Jazz Radio Classic', subtext: 'Standards around the clock', guideId: 's100003', image: cover('C', '#2a6f97'), bitrate: 96 },
+    { kind: 'show', text: 'Jazz Night', subtext: 'Live sets and interviews', ref: 'demo-show', image: cover('N', '#0a9396') },
+    { kind: 'station', text: 'Late Night Jazz', subtext: 'Mellow jazz for the evening', guideId: 's100004', image: cover('L', '#5f0f40'), bitrate: 64 },
+  ],
+};
+
+const DEMO = { box: BOX, presets: PRESETS, settings: SETTINGS, statusPlaying: STATUS_PLAYING, statusIdle: STATUS_IDLE, drives: DRIVES, wifi: WIFI, appInfo: APPINFO, stations: STATIONS, languages: LANGUAGES, mediaServers: MEDIA_SERVERS, libraryPage: LIBRARY_PAGE, tuneinRoot: TUNEIN_ROOT, tuneinSearch: TUNEIN_SEARCH };
+
+// ---- the in-page mock (runs before the app's own scripts) ------------------
+function installMocks({ locale, view, demo }) {
+  try {
+    localStorage.setItem('locale', locale);
+    localStorage.setItem('cachedBoxes', JSON.stringify([demo.box]));
+    localStorage.setItem('lastBoxDeviceID', demo.box.deviceID);
+    localStorage.setItem('searchCountry', '');
+  } catch (e) {}
+
+  const P = (v) => Promise.resolve(v);
+  // app-listen shows the lively now-playing state (matches the README hero);
+  // every other view boots idle/standby.
+  const status = view === 'app-listen' ? demo.statusPlaying : demo.statusIdle;
+
+  const App = {
+    AppInfo: () => P(demo.appInfo),
+    AppVersion: () => P(demo.appInfo.version),
+    CheckAppUpdate: () => P({}),
+    DiscoverBoxes: () => P([demo.box]),
+    BoxSettings: () => P(demo.settings),
+    BoxAgentVersion: () => P({ version: demo.appInfo.version, build: demo.appInfo.build }),
+    // Phone-control QR card: a real demo QR (encodes http://demobox.local:8888/)
+    // so the "Control this speaker on your phone" card renders in screenshots.
+    PhoneQR: () => P('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAPAAAADwAQMAAAAEm3vRAAAABlBMVEX///8AAABVwtN+AAABRklEQVR42uyXsbHDIBBEV0PgkBIoRaVJpakUSlBIwLB/7jCWma8ff3NmAw/ScwI6du8wNTX14XJUgRkPMgL1OY6Pk/xu+vYMcd0pz94C9uSxoegJyL4XMhnC+mlj4P5luLj8qN/bDK6FvDDL4q86HxA/refa960zjYebFvHUiHW/Dw1z2CUEOYeiq7gSS3ZdloyLtXwLJCR51JQ8YQD7iJXyMgFBce5C0ibWXkeORS6wYBb3foHHxfCM2Hh1PeXdcsfFehvFcNq+1YROGMCnWs+iGRk0VbqosYqT10JmbpYrK28BI9Q+td5Vyh87Rx4UN9VRkdz7Qh4XXzOwFqg24Pl3n2oPP/tzyZLXsXTt3LD4NSIn1M6O2RKu40Y4NkqqMH4Lloo+m+XSBK6FrFhWtILbiKzhL/uGu3Gm8fDU1NS/6ScAAP//khi29LPtOrwAAAAASUVORK5CYII='),
+    GetPresets: () => P(demo.presets),
+    Status: () => P(status),
+    StreamBitrate: () => P(256),
+    ListDrives: () => P(demo.drives),
+    StickVersion: () => P(''),
+    StickConfigs: () => P({ wlanSSID: '', wlanPass: '', region: '', name: '', locale: '' }),
+    ListWiFiProfiles: () => P(demo.wifi),
+    TryWiFiPassword: () => P(''),
+    CurrentWiFi: () => P('HomeWiFi'),
+    SuggestBoxLanguage: () => P(3),
+    GetBoxLanguage: () => P('3'),
+    GetClockDisplay: () => P('true'),
+    GetClockFormat24: () => P(true),
+    GetAirplayOpt: () => P({ enabled: true }),
+    ListMediaServers: () => P(demo.mediaServers),
+    BrowseLibrary: () => P(demo.libraryPage),
+    // Radio search moved app-side (Wails bindings, no longer /api/radio), so the
+    // search view drives these instead of the routed HTTP endpoints below.
+    RadioSearch: () => P(demo.stations),
+    RadioSearchDetailed: () => P({ stations: demo.stations, relaxed: false }),
+    RadioLanguages: () => P(demo.languages),
+    RadioTags: () => P([]),
+    RadioClick: () => P(undefined),
+    RadioVote: () => P(undefined),
+    ResolveStationLogo: () => P(''),
+    PlayURL: () => P(undefined),
+    TuneInBrowse: () => P(demo.tuneinRoot),
+    TuneInSearch: () => P(demo.tuneinSearch),
+    SetAppLocale: () => P(undefined),
+    LogClientError: () => P(undefined),
+  };
+  // Any unmocked binding resolves to null so nothing throws.
+  window.go = { main: { App: new Proxy(App, { get(t, p) { return p in t ? t[p] : () => Promise.resolve(null); } }) } };
+
+  const rt = {
+    EventsOn: () => () => {}, EventsOnce: () => () => {}, EventsOff: () => {}, EventsEmit: () => {},
+    LogPrint: () => {}, LogTrace: () => {}, LogDebug: () => {}, LogInfo: () => {}, LogWarning: () => {}, LogError: () => {}, LogFatal: () => {},
+    BrowserOpenURL: () => {}, WindowReload: () => {}, WindowReloadApp: () => {}, Quit: () => {},
+    WindowSetTitle: () => {}, WindowShow: () => {}, WindowHide: () => {},
+    ClipboardSetText: () => Promise.resolve(true), ClipboardGetText: () => Promise.resolve(''),
+    Environment: () => Promise.resolve({ buildType: 'production', platform: 'windows', arch: 'amd64' }),
+  };
+  window.runtime = new Proxy(rt, { get(t, p) { return p in t ? t[p] : () => {}; } });
+}
+
+// ---- mock the agent HTTP endpoints the frontend fetch()es ------------------
+async function routeAgent(route) {
+  const url = route.request().url();
+  const json = (body) => route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+  if (url.includes('/api/radio/search') || url.includes('/api/radio/top')) return json(DEMO.stations);
+  if (url.includes('/api/radio/languages')) return json(DEMO.languages);
+  if (url.includes('/api/radio/tags')) return json([]);
+  if (url.includes('/api/region')) return json({ countryCode: 'US', country: 'United States' });
+  if (url.includes('/api/agent/version')) return json({ version: DEMO.appInfo.version, build: DEMO.appInfo.build });
+  if (url.includes('/api/box/settings')) return json(DEMO.settings);
+  if (url.includes('/api/stick/status')) return json({});
+  if (url.includes('/api/debug/state')) return json({});
+  return json([]); // safe default for any other /api/* call
+}
+
+// ---- per-view driving ------------------------------------------------------
+async function drive(page, view) {
+  // The phone build hides the tab strip; its home-screen tiles carry the same
+  // data-view, so a tab click becomes a tile click.
+  const click = async (sel) => {
+    const el = await page.$(MOBILE ? sel.replace('.tab-btn', '.m-tile') : sel);
+    if (el) await el.click();
+  };
+  const scrollY = (y) => page.evaluate((yy) => window.scrollTo(0, yy), y);
+  const scrollIntoView = (sel) => page.evaluate((s) => { const e = document.querySelector(s); if (e) e.scrollIntoView({ block: 'start' }); }, sel);
+  if (MOBILE && (view === 'app-listen' || view === 'app-search')) {
+    await page.waitForSelector('#mHome .m-tile', { timeout: 9000 });
+    await click('.tab-btn[data-view="box"]');
+  }
+  if (view === 'app-home') {
+    await page.waitForSelector('#mHome .m-tile', { timeout: 9000 });
+  } else if (view === 'app-listen') {
+    await page.waitForSelector('#presets .preset-body, #presets .preset-hint', { timeout: 9000 });
+    await scrollY(0);
+  } else if (view === 'app-search') {
+    await page.waitForSelector('#topBtn', { timeout: 9000 });
+    await click('#topBtn');
+    await page.waitForSelector('#searchResults .result-row', { timeout: 9000 });
+    await scrollIntoView('#searchQ');
+  } else if (view === 'app-tunein') {
+    await click('.tab-btn[data-view="tunein"]');
+    await page.waitForSelector('#view-tunein:not(.hidden) #tuneinQuery', { timeout: 9000 });
+    await page.fill('#tuneinQuery', 'jazz');
+    await page.evaluate(() => document.getElementById('tuneinSearchForm').requestSubmit());
+    await page.waitForSelector('#tuneinList .tunein-play', { timeout: 9000 });
+    await scrollY(0);
+  } else if (view === 'app-library') {
+    await click('.tab-btn[data-view="library"]');
+    await page.waitForSelector('#view-library:not(.hidden) .library-row-folder', { timeout: 9000 });
+    await scrollY(0);
+  } else if (view.startsWith('app-settings')) {
+    await click('.tab-btn[data-view="settings"]');
+    await page.waitForSelector('#view-settings:not(.hidden) .settings-section', { timeout: 9000 });
+    // The settings list is now folded into collapsible groups (Basics open,
+    // the rest collapsed), so the three shots show: 1) the tidy overview with
+    // the phone-control card, 2) a couple of groups expanded, 3) everything
+    // expanded scrolled to the advanced/actions tail.
+    await page.waitForSelector('#view-settings .settings-group', { timeout: 9000 });
+    if (view === 'app-settings1') {
+      await scrollY(0);
+    } else if (view === 'app-settings2') {
+      await page.evaluate(() => {
+        const g = document.querySelectorAll('#view-settings .settings-group');
+        [g[1], g[2]].forEach((d) => { if (d) d.open = true; }); // Sound & display + Network
+        if (g[1]) g[1].scrollIntoView({ block: 'start' });       // scroll the expanded groups into view
+      });
+      await page.waitForTimeout(250);
+    } else {
+      await page.evaluate(() => {
+        document.querySelectorAll('#view-settings .settings-group').forEach((d) => { d.open = true; });
+      });
+      await page.waitForTimeout(250);
+      await scrollY(100000);
+    }
+  } else if (view === 'app-logs') {
+    // Settings tail with the footer link that saves the diagnostic logs,
+    // ringed so the eye lands on it. Groups stay collapsed: the point is
+    // the footer, not the settings.
+    await click('.tab-btn[data-view="settings"]');
+    await page.waitForSelector('#view-settings:not(.hidden) .settings-section', { timeout: 9000 });
+    await page.waitForSelector('#footerSaveLogs', { timeout: 9000 });
+    await scrollY(100000);
+    await page.evaluate(() => {
+      const a = document.getElementById('footerSaveLogs');
+      a.style.outline = '3px solid #f59e0b';
+      a.style.outlineOffset = '6px';
+      a.style.borderRadius = '4px';
+      a.style.fontWeight = '700';
+    });
+  } else if (view === 'app-stick-step1') {
+    // The network install leads; the USB stick route sits folded below it.
+    await click('.tab-btn[data-view="setup"]');
+    await page.waitForSelector('#view-setup:not(.hidden) #setupTargetSection', { timeout: 9000 });
+    await page.evaluate(() => { const d = document.getElementById('setupStickDetails'); if (d) d.open = true; });
+    await page.waitForSelector('#drivesList .drive-row', { timeout: 9000 });
+    await scrollY(0);
+  } else if (view === 'app-stick-step2') {
+    await click('.tab-btn[data-view="setup"]');
+    await page.waitForSelector('#view-setup:not(.hidden) #setupTargetSection', { timeout: 9000 });
+    await page.evaluate(() => { const d = document.getElementById('setupStickDetails'); if (d) d.open = true; });
+    await page.waitForSelector('#drivesList .drive-row', { timeout: 9000 });
+    await click('#drivesList .drive-row');
+    await page.waitForSelector('#nameSection:not(.hidden)', { timeout: 9000 });
+    await scrollIntoView('#nameSection');
+  }
+  await page.waitForTimeout(450); // let transitions / art settle
+}
+
+// ---- build + vite preview server -------------------------------------------
+// We build/serve with the parent frontend's own vite (resolved via npx in
+// cwd=FRONTEND), so this harness's only dependency is playwright. That keeps
+// playwright out of the app's package.json and therefore out of every CI /
+// wails build (it would otherwise download ~130 MB of browsers on install).
+function buildFrontend() {
+  const bin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, ['vite', 'build'], { cwd: FRONTEND, stdio: 'ignore', shell: process.platform === 'win32' });
+    p.on('exit', (code) => (code === 0 ? resolve() : reject(new Error('vite build exited ' + code))));
+    p.on('error', reject);
+  });
+}
+
+function startServer() {
+  const bin = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+  const srv = spawn(bin, ['vite', 'preview', '--host', '127.0.0.1', '--port', String(PORT), '--strictPort'], { cwd: FRONTEND, stdio: 'ignore', shell: process.platform === 'win32' });
+  return srv;
+}
+async function waitForServer() {
+  for (let i = 0; i < 60; i++) {
+    try { const r = await fetch(BASE); if (r.ok) return; } catch (e) {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  throw new Error('vite preview did not come up on ' + BASE);
+}
+
+// ---- main ------------------------------------------------------------------
+await buildFrontend();
+const server = startServer();
+let browser;
+try {
+  await waitForServer();
+  browser = await chromium.launch({ headless: true });
+  let ok = 0, fail = 0;
+  for (const lang of LANGS) {
+    await mkdir(path.join(OUT, lang), { recursive: true });
+    const ctx = await browser.newContext({ viewport: VIEWPORT, deviceScaleFactor: 2, isMobile: MOBILE, hasTouch: MOBILE });
+    for (const view of VIEWS) {
+      const page = await ctx.newPage();
+      page.on('pageerror', (e) => console.warn(`  [${lang}/${view}] pageerror:`, e.message));
+      await page.addInitScript(installMocks, { locale: lang, view, demo: DEMO });
+      if (MOBILE) {
+        await page.addInitScript(() => { window.STMAndroid = { openURL() {} }; });
+      }
+      await page.route('**/api/**', routeAgent);
+      try {
+        await page.goto(BASE, { waitUntil: 'domcontentloaded' });
+        await drive(page, view);
+        if (MOBILE) {
+          // Anything wider than the phone screen, innermost first: the layout
+          // bug is usually the leaf, not every ancestor it pushes wide.
+          const wide = await page.evaluate(() => {
+            const vw = document.documentElement.clientWidth;
+            const hits = [];
+            for (const el of document.querySelectorAll('body *')) {
+              const r = el.getBoundingClientRect();
+              if (!r.width || r.right <= vw + 1 || el.closest('.hidden,[hidden]')) continue;
+              if ([...el.children].some((c) => c.getBoundingClientRect().right > vw + 1)) continue;
+              hits.push(`${el.tagName.toLowerCase()}${el.id ? '#' + el.id : ''}${el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : ''} right=${Math.round(r.right)} parent=${el.parentElement?.id || el.parentElement?.className || ''}`);
+            }
+            return hits.slice(0, 20);
+          });
+          if (wide.length) console.log(`  [${lang}/${view}] wider than the screen:\n    ` + wide.join('\n    '));
+        }
+        const out = path.join(OUT, lang, view + '.png');
+        // app-logs keeps only the lower part of the window: the footer is
+        // what matters, and a full-height shot would dwarf it.
+        const clip = view === 'app-logs' && !MOBILE ? { x: 0, y: 780 - 300, width: 1100, height: 300 } : undefined;
+        await page.screenshot({ path: out, clip });
+        console.log(`ok  ${lang}/${view}`);
+        ok++;
+      } catch (e) {
+        console.error(`FAIL ${lang}/${view}: ${e.message}`);
+        fail++;
+      }
+      await page.close();
+    }
+    await ctx.close();
+  }
+  console.log(`\nDone: ${ok} ok, ${fail} failed -> ${OUT}`);
+  if (fail) process.exitCode = 1;
+} finally {
+  if (browser) await browser.close();
+  server.kill();
+}

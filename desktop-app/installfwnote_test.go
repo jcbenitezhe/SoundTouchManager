@@ -1,0 +1,92 @@
+package main
+
+import (
+	"os"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// PrimetimeFluff's SoundTouch 20. An scm/spotty box on firmware 14.0.15
+// from 2015 took the whole install, the app answered "install: OK", and the
+// speaker then boot-looped into recovery and was unusable. The app had read
+// "outdated=true" off that speaker minutes earlier and said nothing, because
+// the firmware note was only ever appended to messages that report a FAILURE.
+//
+// The one case where the warning matters most is the one where the install
+// appears to have worked.
+func TestASuccessfulInstallStillNamesAnOutdatedFirmware(t *testing.T) {
+	src := readInstallSrc(t)
+	body := installStrBody(t, src)
+
+	// Every message this function ends on has to carry the note. Anything
+	// assigning a plain string literal to res.Message is one that does not.
+	bare := regexp.MustCompile(`res\.Message = "`)
+	if locs := bare.FindAllStringIndex(body, -1); len(locs) > 0 {
+		var shown []string
+		for _, l := range locs {
+			end := l[1] + 70
+			if end > len(body) {
+				end = len(body)
+			}
+			shown = append(shown, body[l[0]:end])
+		}
+		t.Errorf("%d message(s) in InstallSTMOnBox skip the firmware note:\n  %s",
+			len(shown), strings.Join(shown, "\n  "))
+	}
+}
+
+// The note itself must stay empty for a speaker on current firmware, or every
+// successful install grows a paragraph nobody needs.
+func TestTheNoteIsEmptyForACurrentSpeaker(t *testing.T) {
+	src := readInstallSrc(t)
+	if !strings.Contains(src, `fwNote := ""`) {
+		t.Error("the firmware note no longer starts empty; a current speaker would get the outdated warning")
+	}
+	i := strings.Index(src, `fwNote = " The speaker firmware is "`)
+	if i < 0 {
+		t.Fatal("the firmware note text is gone; if it moved, move this test with it")
+	}
+	// It is only filled behind the outdated check. Anchored on the guard itself
+	// rather than on a byte window before the assignment: the window was 900
+	// bytes and a comment growing above the line was enough to push the guard out
+	// of it and fail a test about something else entirely.
+	guard := strings.Index(src, `if fw.Outdated && fw.Short != ""`)
+	if guard < 0 {
+		t.Fatal("the outdated guard is gone; the note would reach a current speaker")
+	}
+	if guard > i {
+		t.Error("the note is filled before the firmware is checked for being outdated")
+	}
+}
+
+func readInstallSrc(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("install_stm.go")
+	if err != nil {
+		t.Fatalf("read install_stm.go: %v", err)
+	}
+	return string(b)
+}
+
+// installStrBody is the InstallSTM function alone. RepairInstallViaSSH lives in
+// the same file, reads no firmware of its own, and is deliberately not covered.
+func installStrBody(t *testing.T, src string) string {
+	t.Helper()
+	i := strings.Index(src, "func (a *App) InstallSTMOnBox(")
+	if i < 0 {
+		t.Fatal("InstallSTMOnBox is gone; if it moved, move this test with it")
+	}
+	rest := src[i:]
+	if j := strings.Index(rest, "\nfunc (a *App) boxHasResidualMargeUUID"); j > 0 {
+		return rest[:j]
+	}
+	return rest
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}

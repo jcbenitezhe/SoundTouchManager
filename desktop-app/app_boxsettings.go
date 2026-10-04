@@ -1,0 +1,378 @@
+package main
+
+// This file was split out of app.go (wave-1 move-only refactor):
+// box settings via the stick agent: name, volume, bass, source, and webhooks.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+)
+
+// BoxSettings fetches name/volume/bass/network/sources of the box via the stick.
+func (a *App) BoxSettings(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/box/settings", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetBoxName changes the display name of the Bose box.
+func (a *App) SetBoxName(host string, port int, name string) error {
+	return a.boxPut(host, port, "/api/box/name", map[string]string{"name": name})
+}
+
+// SetBoxVolume sets the volume (0-100).
+func (a *App) SetBoxVolume(host string, port int, value int) error {
+	return a.boxPut(host, port, "/api/box/volume", map[string]int{"value": value})
+}
+
+// SetBoxBass sets the bass value (range per box, ST10 e.g. -9..0).
+func (a *App) SetBoxBass(host string, port int, value int) error {
+	return a.boxPut(host, port, "/api/box/bass", map[string]int{"value": value})
+}
+
+// BoxSpeakerLevels reads the front-center and rear-surround levels of a home
+// theater system -> {supported, frontCenter:{value,min,max,step,available},
+// rearSurrounds:{...}}.
+//
+// supported=false is the normal answer on an ordinary speaker and is NOT an
+// error: only a soundbar or console with separately driven speakers has these.
+// Asked for by a SoundTouch 300 owner whose Virtually Invisible 300 surrounds
+// could only be turned up together with the bar (mail 2026-09-25); the bar has
+// had the knob all along, STM just never asked for it.
+func (a *App) BoxSpeakerLevels(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/box/levels", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetBoxSpeakerLevel writes ONE level, "frontCenter" or "rearSurrounds". Only
+// the named one is sent, so a level changed meanwhile on the Bose remote is
+// not overwritten by a stale value still on screen here.
+func (a *App) SetBoxSpeakerLevel(host string, port int, level string, value int) error {
+	return a.boxPut(host, port, "/api/box/levels", map[string]any{"level": level, "value": value})
+}
+
+// SelectBoxSource switches the box to one of its own sources ("AUX", "LOCAL",
+// "PRODUCT", "BLUETOOTH", "STANDBY", ...). The Stick Agent translates that into
+// the matching /select or /key call to the Bose REST API, and refuses anything
+// the speaker itself does not report.
+//
+// AUX and LOCAL are the same analogue input under the two names the firmware
+// uses for it, and they are NOT interchangeable on the wire: the caller passes
+// whichever one the speaker itself reports.
+//
+// account is the source's sourceAccount, and it travels because on several
+// models the source name alone does not identify the socket: an SA-5 reports
+// three line inputs as three AUX entries differing only in the account,
+// and a soundbar's HDMI sockets all arrive as PRODUCT with the socket name in
+// the account. Empty for a source with only one account.
+func (a *App) SelectBoxSource(host string, port int, source, account string) error {
+	return a.boxPut(host, port, "/api/box/source", map[string]string{
+		"source":        source,
+		"sourceAccount": account,
+	})
+}
+
+// readHTTPError turns a failed box response into an error carrying the status
+// code and a bounded slice of the body. One canonical place for the read limit
+// and message format, used at every status>=400 / non-200 site.
+func readHTTPError(resp *http.Response) error {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	return fmt.Errorf("status %d: %s", resp.StatusCode, string(b))
+}
+
+func (a *App) boxPut(host string, port int, path string, body any) error {
+	// Routed through boxDo so the small settings PUTs (volume, bass,
+	// name, source, wlan) get the same transparent :8888<->:17008 port
+	// fallback as every other agent call: if the box record carries the
+	// wrong/stale port, the first attempt fails fast (connection refused)
+	// and the alternate is tried and cached, instead of the PUT erroring
+	// out on a dead port.
+	b, _ := json.Marshal(body)
+	resp, err := a.boxDo(host, port, http.MethodPut, path, "application/json", string(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return readHTTPError(resp)
+	}
+	return nil
+}
+
+// --- Webhook config (remote thumbs key -> a user-defined HTTP request) ----
+//
+// The remote's thumbs-up and thumbs-down keys surface on the box only as a
+// generic activity ping with no up/down identity, so they share ONE trigger
+// (suited to a smart-home on/off toggle). These call STM's /api/webhooks
+// endpoints on the agent.
+
+// GetWebhooks reads the agent's webhook config (shape: {"thumb":{...}}).
+func (a *App) GetWebhooks(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/webhooks", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetWebhooks stores the thumbs-trigger HTTP request on the agent.
+func (a *App) SetWebhooks(host string, port int, enabled bool, method, url, body, contentType string) error {
+	cfg := map[string]any{
+		"thumb": map[string]any{
+			"enabled":      enabled,
+			"method":       method,
+			"url":          url,
+			"body":         body,
+			"content_type": contentType,
+		},
+	}
+	return a.boxPut(host, port, "/api/webhooks", cfg)
+}
+
+// SaveWebhookConfig replaces the agent's FULL webhook config (thumb + the
+// per-remote-key buttons preset1..preset6, aux, power). The PUT replaces the
+// whole config on the agent, so the frontend sends the complete object it built
+// from GetWebhooks; saving only one field would wipe the others.
+func (a *App) SaveWebhookConfig(host string, port int, cfg map[string]any) error {
+	return a.boxPut(host, port, "/api/webhooks", cfg)
+}
+
+// --- Group keys: a saved group on a thumbs key of one remote -------
+//
+// The document (templates + key bindings) lives on the speaker whose remote
+// is pressed, because that speaker is the only one that sees the press. Both
+// calls address exactly that speaker; the app never merges documents across
+// speakers.
+
+// GetGroupKeys reads the speaker's group-key document (GET /api/groupkeys)
+// -> {templates: [...], bindings: {thumbsUp: name, thumbsDown: name}}.
+func (a *App) GetGroupKeys(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/groupkeys", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SaveGroupKeys replaces the speaker's whole group-key document (PUT
+// /api/groupkeys). The agent validates it and answers with the reason when it
+// refuses, which is surfaced verbatim.
+func (a *App) SaveGroupKeys(host string, port int, doc map[string]any) error {
+	a.logger.Info("group keys: saving", "host", host,
+		"templates", len(anySlice(doc["templates"])), "bindings", len(anyMap(doc["bindings"])))
+	return a.boxPut(host, port, "/api/groupkeys", doc)
+}
+
+// anySlice and anyMap read a JSON-shaped value defensively for logging.
+func anySlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+func anyMap(v any) map[string]any {
+	m, _ := v.(map[string]any)
+	return m
+}
+
+// TestWebhook fires the given request immediately so the user can verify their
+// URL from the app without pressing a key on the box. Returns {ok, status}.
+func (a *App) TestWebhook(host string, port int, method, url, body, contentType string) (map[string]any, error) {
+	action := map[string]any{
+		"enabled":      true,
+		"method":       method,
+		"url":          url,
+		"body":         body,
+		"content_type": contentType,
+	}
+	b, _ := json.Marshal(action)
+	resp, err := a.boxDo(host, port, http.MethodPost, "/api/webhooks/test", "application/json", string(b))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// TestWebhookAction fires an arbitrary configured action (http/udp/wol) once for
+// the test button, without pressing a key on the box. actionJSON is the full
+// webhook Action the frontend built (type + its fields), so the UDP/WoL test
+// works the same as the HTTP one. Returns {ok, status}.
+func (a *App) TestWebhookAction(host string, port int, actionJSON string) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodPost, "/api/webhooks/test", "application/json", actionJSON)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// --- Foreign influence: what other tools did to this speaker -------------
+//
+// The safe-haven view. Users try several tools and keep trying them, and
+// afterwards nobody can tell which one caused which effect; STM is the only
+// thing in that picture that can look at the speaker and say so.
+//
+// The case that made it necessary touched no file at all: the ST Remote Pro
+// iOS app pointed five speakers at its own cloud at runtime on 2026-09-26, and
+// every file-based check reported them clean.
+
+// BoxForeignInfluence lists what other tools have done to this speaker, each
+// row carrying an honest verdict on whether STM can take it back.
+func (a *App) BoxForeignInfluence(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/box/foreign-influence", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// UndoForeignFinding undoes exactly ONE row. One at a time on purpose: a single
+// "clean everything" button that quietly skips the half it cannot do is the
+// mistake this area keeps making, and the answer always carries what is still
+// left so the app can never claim more than happened.
+func (a *App) UndoForeignFinding(host string, port int, id string) (map[string]any, error) {
+	body, _ := json.Marshal(map[string]string{"id": id})
+	resp, err := a.boxDo(host, port, http.MethodPost, "/api/box/foreign-influence",
+		"application/json", string(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	a.logger.Info("foreign influence: undo", "host", host, "id", id,
+		"status", out["status"], "remaining", out["remaining"])
+	return out, nil
+}
+
+// --- Start volume: the level a speaker returns to after a rest -----------
+//
+// Asked for on 2026-09-26 by an owner whose Portable and ST20 do not keep
+// their level over a power cycle. Off by default and applied only on the
+// automatic resume, never on a play the user started.
+
+// GetStartVolume reads the per-box start level -> {supported, volume}.
+// volume 0 means off, which is the default.
+func (a *App) GetStartVolume(host string, port int) (map[string]any, error) {
+	resp, err := a.boxDo(host, port, http.MethodGet, "/api/box/start-volume", "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, readHTTPError(resp)
+	}
+	var out map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// SetStartVolume stores the per-box start level. 0 turns it off.
+func (a *App) SetStartVolume(host string, port int, volume int) error {
+	body, _ := json.Marshal(map[string]int{"volume": volume})
+	resp, err := a.boxDo(host, port, http.MethodPost, "/api/box/start-volume",
+		"application/json", string(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return readHTTPError(resp)
+	}
+	a.logger.Info("start volume set", "host", host, "volume", volume)
+	return nil
+}
+
+// PushFavorites stores the starred stations on ONE speaker, so every phone
+// that opens that speaker's page sees the same list.
+//
+// The stars used to live only in this app's own storage on one PC, which is
+// why a user asked on 2026-09-26 where to find them on his phone. Nowhere was
+// the honest answer.
+//
+// The agent ignores an unchanged list rather than writing it again, so calling
+// this on every discovery cycle costs nothing on the speaker's flash.
+func (a *App) PushFavorites(host string, port int, favoritesJSON string) error {
+	body := strings.TrimSpace(favoritesJSON)
+	if body == "" {
+		body = "[]"
+	}
+	resp, err := a.boxDo(host, port, http.MethodPut, "/api/favorites", "application/json", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return readHTTPError(resp)
+	}
+	return nil
+}

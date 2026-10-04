@@ -1,0 +1,317 @@
+// Uninstall STM: SSH into the speaker, remove the STM install entirely,
+// reset the Bose-side state to factory OOB, and reboot into vanilla
+// Bose. This is the real "back to stock" path. It differs from
+// TrueFactoryReset, which deliberately KEEPS STM installed and only
+// wipes the Bose network/account state so the box can be re-onboarded
+// with the Bose iOS app while STM stays in place.
+//
+// CRITICAL safeguard: refuse if the STM USB stick is still inserted.
+// Bose's SD/USB entry point re-runs the stick's run.sh on the next
+// boot, which would reinstall STM right after we removed it. The user
+// must pull the stick first.
+
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// UninstallSTMResult is the JSON-serialisable outcome of an uninstall
+// attempt. StickPresent=true means we aborted because the stick was
+// still in the speaker (the frontend shows the pull-the-stick hint).
+type UninstallSTMResult struct {
+	Step         string   `json:"step"`
+	OK           bool     `json:"ok"`
+	StickPresent bool     `json:"stickPresent"`
+	Message      string   `json:"message"`
+	Log          string   `json:"log"`
+	RemovedFiles []string `json:"removedFiles"`
+}
+
+// UninstallSTM removes STM from the speaker and returns it to vanilla
+// Bose factory state, then reboots. SSH must be available (passwordless
+// root via the STM install or an inserted stick's remote_services
+// marker — but see the stick safeguard below).
+//
+// Removes:
+//   - /mnt/nv/stmanager (the whole STM install: agent, certs, presets,
+//     run-override.sh, wlan-creds)
+//   - /mnt/nv/rc.local (the NAND override entry point, so Bose boots
+//     its own stack with no STM hook)
+//
+// Deliberately does NOT touch the Bose network/account state: the box keeps
+// its Wi-Fi, name and language so it stays on the LAN and discoverable after
+// the reboot - an uninstall must never knock the speaker off Wi-Fi into the
+// Bose setup AP. Only the STM marge redirect in /etc/hosts is dropped (a tmpfs
+// bind-mount, cleared by the reboot regardless). A full network/account wipe
+// is TrueFactoryReset's job, not this.
+//
+// After the reboot the speaker is a normal (cloudless) Bose device with no STM,
+// still on Wi-Fi, ready to be re-onboarded with the Bose app or to have STM
+// reinstalled.
+// uninstallScript is the whole uninstall, run as one script on the speaker.
+// Package level so a test can assert what it reports; the Go side cannot tell
+// "removed nothing because it failed" from "removed nothing because there was
+// nothing there" unless the script says which.
+const uninstallScript = `set -u
+if [ -e /media/sda1/run.sh ] || [ -e /media/sda1/stmanager-armv7l ] || [ -e /media/sda1/stmanager ]; then
+  echo "STM_UNINSTALL_ABORT_STICK_PRESENT"
+  exit 0
+fi
+REMOVED=""
+# Stop the running agent so it cannot rewrite anything mid-uninstall.
+pkill -TERM stmanager-armv7l 2>/dev/null
+sleep 1
+pkill -KILL stmanager-armv7l 2>/dev/null
+# Remove the STM install + the NAND override entry point.
+if [ -d /mnt/nv/stmanager ]; then rm -rf /mnt/nv/stmanager && REMOVED="$REMOVED /mnt/nv/stmanager"; fi
+if [ -f /mnt/nv/rc.local ]; then rm -f /mnt/nv/rc.local && REMOVED="$REMOVED /mnt/nv/rc.local"; fi
+# STM/go-librespot traces that live OUTSIDE /mnt/nv/stmanager, so the rm -rf above
+# leaves them behind: go-librespot's Spotify oauth dump (can be multi-MB) and a
+# stranded SSH-repair install-staging dir. Uninstall is "back to stock", so drop
+# every trace, not just the install dir.
+if [ -f /mnt/nv/sp-oauth.out ]; then rm -f /mnt/nv/sp-oauth.out && REMOVED="$REMOVED /mnt/nv/sp-oauth.out"; fi
+if [ -d /mnt/nv/stmanager-install ]; then rm -rf /mnt/nv/stmanager-install && REMOVED="$REMOVED /mnt/nv/stmanager-install"; fi
+# STM Remove deliberately does NOT touch the Bose network/account state.
+# Wiping NetworkProfiles.xml (as this used to, for a "factory OOB" reset) drops
+# the box off Wi-Fi into the Bose setup AP, so it vanishes from the LAN - that
+# must never happen on an uninstall. The box keeps its Wi-Fi, name and language
+# and simply becomes a normal (cloudless) Bose speaker again, still on the LAN
+# and discoverable, so STM can be reinstalled. A full network/account wipe is
+# TrueFactoryReset's job, not this.
+# Drop the STM marge redirect from /etc/hosts. It is a tmpfs bind-mount,
+# so unbind it now; a reboot clears it regardless.
+umount /etc/hosts 2>/dev/null || true
+sync
+if [ -z "$REMOVED" ] && [ ! -d /mnt/nv/stmanager ] && [ ! -f /mnt/nv/rc.local ]; then echo "STM_UNINSTALL_ALREADY_CLEAN"; fi
+echo "STM_UNINSTALL_REMOVED:$REMOVED"
+`
+
+func (a *App) UninstallSTM(host string) UninstallSTMResult {
+	res := UninstallSTMResult{Step: "start"}
+	if host == "" {
+		res.Message = "host is required"
+		return res
+	}
+	a.logger.Info("uninstall_stm: starting", "host", host)
+	// From here on no engine delivery may land on this speaker (see
+	// App.uninstalling). The mark stays after a successful removal; a failed
+	// attempt lifts it again so a later update can still complete the engine.
+	a.uninstalling.Store(host, struct{}{})
+	defer func() {
+		if !res.OK {
+			a.uninstalling.Delete(host)
+		}
+	}()
+
+	// Step 1: SSH handshake.
+	res.Step = "ssh-handshake"
+	hello, helloErr := sshHandshake(host, 4)
+	if helloErr != nil || !strings.Contains(hello, "STM_SSH_OK") {
+		// A hardened STM box keeps SSH CLOSED after the stick is pulled: since
+		// v0.8.1 sshd follows the remote_services / enable-ssh marker, so a box
+		// that was installed from a stick and then had the stick removed answers
+		// nothing on :22 even though STM is installed and running. That made
+		// "STM Remove" fail for every such box (user report).
+		//
+		// PRIMARY fix: the STM agent is still running here and is root on the box,
+		// so ask IT to open SSH (touch the marker + start sshd). No stick, no
+		// reboot, no :17000 marge-injection - which fights STM's own autopair on an
+		// already-installed box and is unreliable there (that is exactly the path
+		// that left a box marge-checking a dead host in testing).
+		if a.enableSSHViaAgent(host) {
+			hello, helloErr = sshHandshake(host, 4)
+		}
+	}
+	if helloErr != nil || !strings.Contains(hello, "STM_SSH_OK") {
+		// Fast path: a box STM already removed is back to stock and
+		// answers the Bose API on :8090 with NEITHER STM agent port open (:8888 sm2,
+		// :17008 BCO). Recognise that here, BEFORE the :17000 stick-free unlock
+		// below, so pressing Remove again on an already-stock speaker returns at
+		// once. Without this the second Remove ran the whole unlock-then-SSH dance
+		// first and took as long as a real removal (shorty310, 2026-09-03).
+		if tcpReachable(host, 8090, 2*time.Second) &&
+			!tcpReachable(host, 8888, 1500*time.Millisecond) &&
+			!tcpReachable(host, 17008, 1500*time.Millisecond) {
+			a.purgeSpeakerState(host, "")
+			a.markHostStock(host)
+			res.Step = "already-stock"
+			res.OK = true
+			res.Message = "STM is already removed from this speaker. It is back to a stock Bose speaker, " +
+				"so there was nothing to remove and nothing else is needed."
+			a.logger.Info("uninstall_stm: speaker is already stock, nothing to remove (fast path)", "host", host)
+			return res
+		}
+		// FALLBACK: the STM agent was not reachable (e.g. a wedged box). Try the
+		// stick-free :17000 unlock like the installer, and restore stock cloud URLs
+		// on EVERY exit so a failed attempt never leaves the box dialing the unlock
+		// URL (the review-caught gap the install path already guards).
+		if tcpReachable(host, 17000, 2*time.Second) {
+			a.logger.Info("uninstall_stm: STM agent unreachable; trying the :17000 stick-free unlock", "host", host)
+			opened, _ := a.enableSSHViaTelnet(host, "")
+			if !opened {
+				opened, _ = a.enableSSHViaTelnetBootstrap(host, "")
+			}
+			if opened {
+				if rerr := a.resetBoseURLsViaTelnet(host); rerr != nil {
+					a.logger.Warn("uninstall_stm: could not restore stock boseurls after the :17000 unlock", "host", host, "err", rerr)
+				}
+				hello, helloErr = sshHandshake(host, 4)
+			} else {
+				a.restoreStockBoseURLsAndReboot(host)
+			}
+		}
+	}
+	if helloErr != nil || !strings.Contains(hello, "STM_SSH_OK") {
+		// a box that STM already fully removed has rebooted back to stock, so
+		// there is no STM agent left to open SSH and a stock box keeps :22 closed.
+		// Pressing Remove a second time then failed HERE with the raw "exit status
+		// 255" SSH error, when the honest answer is that STM is already gone. Tell
+		// that case apart from a genuinely unreachable or wedged box: a live stock
+		// speaker still answers the Bose API on :8090 while NEITHER STM agent port
+		// (:8888 sm2, :17008 BCO) is open. A wedged STM box keeps its agent port
+		// open, so it never reaches this branch; a powered-off box answers nothing,
+		// so it keeps the reachability error rather than a false "already removed".
+		boseUp := tcpReachable(host, 8090, 2*time.Second)
+		stmAgentUp := tcpReachable(host, 8888, 1500*time.Millisecond) || tcpReachable(host, 17008, 1500*time.Millisecond)
+		if boseUp && !stmAgentUp {
+			a.purgeSpeakerState(host, "")
+			a.markHostStock(host)
+			res.Step = "already-stock"
+			res.OK = true
+			res.Message = "STM is already removed from this speaker. It is back to a stock Bose speaker, " +
+				"so there was nothing to remove and nothing else is needed."
+			a.logger.Info("uninstall_stm: speaker is already stock, nothing to remove", "host", host)
+			return res
+		}
+		res.Log = hello
+		res.Message = "Could not open install access (SSH) to the speaker to remove STM: " + classifySSHError(hello, helloErr)
+		return res
+	}
+
+	// Keep the speaker's preset keys on this PC before the script below
+	// deletes the store together with the STM folder: a reinstall
+	// started with an empty store while the firmware still showed the old
+	// six keys, and nothing brought them back. The deviceID is resolved
+	// here, BEFORE purgeSpeakerState drops that memory further down. See
+	// preset_stash.go; the next install from this app puts the keys back.
+	stashed := a.stashPresetsBeforeUninstall(host, 0, a.deviceIDForHost(host))
+
+	// Step 2: the whole uninstall runs as one script. It self-aborts up
+	// front if the stick is still inserted (run.sh / the agent binary on
+	// /media/sda1), so we never remove STM only to have Bose reinstall it
+	// from the stick on the next boot.
+	res.Step = "uninstall"
+	script := uninstallScript
+	out, err := boxSSHOutput(host, script, 40*time.Second)
+	res.Log = out
+	if err != nil {
+		res.Message = "uninstall failed: " + classifySSHError(out, err)
+		return res
+	}
+	if strings.Contains(out, "STM_UNINSTALL_ABORT_STICK_PRESENT") {
+		res.StickPresent = true
+		res.Step = "stick-present"
+		res.Message = "The USB stick is still in the speaker. Pull it out first, " +
+			"otherwise the speaker reinstalls STM from the stick on the next reboot. " +
+			"Remove the stick and try again."
+		a.logger.Info("uninstall_stm: aborted, stick still inserted", "host", host)
+		return res
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "STM_UNINSTALL_REMOVED:") {
+			res.RemovedFiles = append(res.RemovedFiles, strings.Fields(strings.TrimPrefix(line, "STM_UNINSTALL_REMOVED:"))...)
+		}
+	}
+	// Nothing removed is only a failure when there was something to remove.
+	// Running Remove on a speaker that is ALREADY clean is the most ordinary
+	// thing in the world: a user who saw no confirmation the first time presses
+	// it again. That produced a red error, and worse, this early return skipped
+	// everything below it. So the app went on remembering a stock speaker as an
+	// STM one (see forgetSTMDeviceByHost) and the reboot that closes root SSH
+	// never ran.
+	//
+	// A reporter walked straight into it on 2026-08-23 and then asked the exact
+	// question the bug produces: why did one speaker flip to "READY FOR STM" by
+	// itself while the other needed the app restarted. The first came off in one
+	// go, the second was the second attempt.
+	alreadyClean := strings.Contains(out, "STM_UNINSTALL_ALREADY_CLEAN")
+	if len(res.RemovedFiles) == 0 && !alreadyClean {
+		res.Message = "uninstall returned no removed-file list — script may have failed silently. See log."
+		return res
+	}
+	if alreadyClean {
+		a.logger.Info("uninstall_stm: speaker was already clean, nothing to remove", "host", host)
+	} else {
+		a.logger.Info("uninstall_stm: removed", "host", host, "removedCount", len(res.RemovedFiles))
+	}
+
+	// The box is going back to stock: rewrite its cached record as the stock
+	// speaker it now is and drop its confirmed-STM identity memory. Merely
+	// forgetting the record (the old behaviour) let the next discovery bring
+	// the box back as STM with its old agent version, because the box's stock
+	// :8090 kept answering and a presence-only sighting keeps a cached STM
+	// record alive; the Listen to music card then showed "v0.9.74" on a
+	// speaker with no STM on it (2026-09-06 report).
+	a.purgeSpeakerState(host, "")
+	a.markHostStock(host)
+
+	// Step 3: reboot into vanilla Bose. Connection drops mid-command;
+	// fire-and-forget so the drop is not treated as a failure.
+	res.Step = "reboot"
+	_ = boxReboot(host)
+
+	res.Step = "done"
+	res.OK = true
+	if alreadyClean {
+		res.Message = "This speaker already had no STM on it, so there was nothing to remove. " +
+			"It is rebooting into factory Bose state; wait about 60 s. To bring STM back, " +
+			"install it again from this app."
+		a.logger.Info("uninstall_stm: done, speaker was already clean", "host", host)
+		return res
+	}
+	res.Message = fmt.Sprintf("STM removed (%d entries) and the speaker is rebooting into "+
+		"factory Bose state. Wait ~60 s. The speaker no longer runs STM; onboard it again "+
+		"with the Bose iOS app, or re-insert a prepared STM stick to bring STM back.",
+		len(res.RemovedFiles))
+	if stashed > 0 {
+		res.Message += fmt.Sprintf(" Its %d preset keys were kept on this PC and go back onto the speaker "+
+			"the next time STM is installed on it from this app.", stashed)
+	}
+	a.logger.Info("uninstall_stm: done", "host", host, "removedCount", len(res.RemovedFiles))
+	return res
+}
+
+// enableSSHViaAgent asks the still-running STM agent to open root SSH: the agent
+// is root on the box, so POST /api/agent/enable-ssh makes it touch the
+// remote_services marker and start sshd (see internal/webui handleAgentEnableSSH).
+// This is the clean way to open SSH on a box that already runs STM - no stick, no
+// reboot, and none of the :17000 marge-injection that is unreliable against STM's
+// own autopair. Returns true once :22 accepts a connection. Best-effort: false if
+// the agent is not reachable or SSH does not come up in time.
+func (a *App) enableSSHViaAgent(host string) bool {
+	bi, ok := probeSTM(a.appCtx(), host)
+	if !ok {
+		return false
+	}
+	a.logger.Info("uninstall_stm: SSH closed but the STM agent is reachable; asking it to open SSH", "host", host, "port", bi.Port)
+	resp, err := a.boxDo(host, bi.Port, http.MethodPost, "/api/agent/enable-ssh", "", "")
+	if err != nil {
+		a.logger.Warn("uninstall_stm: agent enable-ssh request failed", "host", host, "err", err)
+		return false
+	}
+	_ = resp.Body.Close()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if tcpReachable(host, 22, 2*time.Second) {
+			a.logger.Info("uninstall_stm: the STM agent opened SSH", "host", host)
+			return true
+		}
+		time.Sleep(2 * time.Second)
+	}
+	a.logger.Info("uninstall_stm: agent enable-ssh did not open :22 within budget", "host", host)
+	return false
+}

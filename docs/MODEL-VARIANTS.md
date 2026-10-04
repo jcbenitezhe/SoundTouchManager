@@ -1,0 +1,247 @@
+# Hardware variant matrix
+
+Per-variant fingerprint of every Bose SoundTouch box STM has been
+observed running on. New rows land here as soon as a diagnostic
+bundle (`box-N.json` inside the desktop app's "Save diagnostic logs"
+zip, plus its `setup.log`) brings a previously unseen combination of
+`moduleType`, Bose firmware version, or component layout.
+
+No reporter identifiers (names, handles, real LAN IPs, MAC hashes,
+serial hashes) appear in this file. Each row is anonymised hardware
+fact only.
+
+For the user-facing "which release asset do I download" mapping, see
+[`MODELS.md`](MODELS.md).
+
+## Reference: last official Bose firmware per model
+
+The final firmware Bose shipped before the cloud shutdown on 2026-02. Anything older than this means the speaker missed at least one published update and may behave differently from samples captured here.
+
+| Model | Latest Bose `softwareVersion` (SCM) | Build date |
+| --- | --- | --- |
+| SoundTouch 10 | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | **2022-08-04** |
+| SoundTouch 20 | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | **2022-08-04** |
+| SoundTouch 30 | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | **2022-08-04** |
+| SoundTouch Portable | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | **2022-08-04** |
+
+## SoundTouch 20
+
+| `moduleType` | SCM `softwareVersion` | Build year | Latest official? | `variant` | `variantMode` | Components present | WLAN interfaces | `countryCode` / `regionCode` samples |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `spotty` | `normal` | SCM, PackagedProduct | `wlan0`, `wlan1` | `GB` / `GB` |
+| `scm` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `spotty` | `normal` | SCM, PackagedProduct, **Lightswitch**, **SMSC** | varies (ethernet-only observed) | `EU` / `` (empty) |
+| `sm2` | `27.0.3.46298.4608935` | pre-2022 | **no (outdated)** | `spotty` | (unknown) | (unknown - box offline in every bundle) | (unknown) | (unknown) |
+
+- Row 3 (2026-07-22 mail bundle): the first live SM2-ST20 on a firmware
+  OLDER than the final 2022 build - the installer's `install_stm` log
+  flagged it `outdated=true`. The box flapped offline in ~1-minute cycles
+  (established-TCP resets on `:8888` and `:17008`, SSH dead), so every
+  diagnostic export came back without on-box data and components/WLAN
+  remain unobserved. Treat reports from 27.0.3 boxes with care: this
+  firmware predates every behavior sample in this matrix, and the network
+  instability itself is unexplained (candidate confound: the old firmware).
+
+### Critical differences (what actually changes STM's code path)
+
+1. **`moduleType=sm2` vs `scm`** — wireless module generation. Same `type="SoundTouch 20"` label hides the split. Check this first.
+2. **WLAN interface presence varies on `scm`** — a `scm` box can boot with **no `wlan0`/`wlan1` at all** (only `eth0 lo usb0`). Every WLAN-provisioning approach on the stick is wasted effort against such a box; STM must fall back to ethernet-only mode. `sm2` boxes consistently expose both `wlan0` and `wlan1`.
+3. **Extra components on `scm`** — `Lightswitch` (LED ring / touch panel, empty serial) and `SMSC` (Microchip SMSC2014 USB-Ethernet bridge IC with its own firmware string `I<imageDate>; B<buildDate> <buildCode> <imageID>`, image 2014-10-20, build 2013-06-11). STM does not talk to either directly today, but their presence is the cleanest indicator of the older hardware revision.
+4. **`regionCode` may be empty on EU `scm` samples** — Bose did not populate the field on newer EU shipments. Any STM code path that reads `regionCode` must fall back to `countryCode`, and ultimately to STM's own `region.txt`.
+5. **`margeAccountUUID` populated vs empty** — populated means the box has at least once been paired against a marge endpoint (Bose's, or STM's stub). Empty means jungfräulich / post-factory-reset / never reached the pair flow.
+6. **`margeURL` state** — `https://streaming.bose.com` is the Bose factory default; STM's autopair flow rewrites it to `http://no-streaming.bose.com` via `setMargeAccount` + the marge stub's `adddeviceresponse`. The field is a reliable post-install truth-check for "did pairing actually land".
+
+### Common to both ST20 variants
+
+- Bose `/etc/version`: `201507061523`
+- Kernel: `Linux spotty 3.14.43+ Wed Oct 25 21:06:53 EDT 2017 armv7l`
+- `MemTotal`: ~122 MB (`122 484 kB`)
+- Last Bose firmware build epoch: 2022-08-04 (the final SoundTouch firmware before Bose cloud shutdown on 2026-02)
+- `networkInfo` emits two entries (SCM + SMSC) with separate MACs but the same Layer-3 IP. The speaker bridges internally; STM sees one address per box.
+- Root `/etc` is read-only (ubifs `ro,relatime`); `/mnt/nv` is read-write (ubifs `rw,relatime`); `/tmp` is tmpfs.
+
+
+### Variant-specific notes
+
+**`sm2`** — newer wireless module.
+- `wlan0` and `wlan1` always present in the kernel interface list.
+
+**`scm`** — older SMSC2014-based hardware.
+- SMSC component has its own `softwareVersion` of the form `I<imageDate>; B<buildDate> <buildCode> <imageID>`, e.g. `I2014102015199423; B201306111041 081008C 15199423`. The "SMSC" name refers to the Microchip SMSC2014 USB-to-Ethernet bridge IC. Image date 2014-10-20, build date 2013-06-11.
+- The `Lightswitch` component is also present with an empty serial; this is the touch-panel / LED-ring controller.
+- WLAN interface presence is **not** guaranteed. At least one observed scm box exposes `eth0 lo usb0` only and no `wlan0`/`wlan1` at all, locking the speaker into ethernet-only mode.
+
+## SoundTouch 10
+
+| `moduleType` | SCM `softwareVersion` | Build year | Latest official? | `variant` | `variantMode` | Components present | `networkInfo` entries | WLAN interfaces | `countryCode` / `regionCode` samples |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `rhino` | `normal` | SCM, PackagedProduct | 1 (SCM only) | `wlan0`, `wlan1` | `GB` / `GB` |
+| `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `rhino` | `normal` | SCM, PackagedProduct | **2 (SCM + SMSC)** | `wlan0`, `wlan1` | `GB` / `GB` |
+
+- Kernel: `Linux rhino 3.14.43+ Wed Oct 25 21:06:53 EDT 2017 armv7l` (same kernel as ST20/ST30).
+- Row 1: reference target, confirmed box-1 (2026-06-10). Permissive chipset: STM's `:8888` is reached directly once the iptables INPUT ACCEPT rule opens it; `is_series_one=0`, no REDIRECT needed.
+
+### Critical difference: the SMSC-bridge `rhino` (2026-06-17 mail bundle)
+
+Row 2 is a SoundTouch 10 that is **byte-for-byte identical** to the reference `rhino` in `moduleType` (`sm2`), `variant` (`rhino`), components (`SCM, PackagedProduct`) **and** WLAN interfaces (`wlan0` + `wlan1`). The **only** distinguishing fingerprint is a **second `networkInfo` entry with `type="SMSC"`** (the Microchip SMSC2014 USB-Ethernet bridge, same IC as the older `scm` ST20).
+
+That bridge whitelists external TCP to Bose-binary-bound listeners only, so the symptom is:
+
+- the agent binds `:8888` fine (`webui: ListenTCP succeeded`),
+- but the box's **own self-probe to its LAN IP fails** (`self-probe: connect failed target=webui addr=<lanip>:8888`), and the desktop app cannot reach `:8888` either, so the box never classifies as STM (`stmHits` short by one).
+
+Because `moduleType=sm2` (not `scm`) and a `wlan0` interface exists, **neither** `detect_series_one` **nor** `BCO_MODE` fired, so pre-v0.8.1 the `:17008` PREROUTING REDIRECT was skipped and the box was unreachable. **Fixed v0.8.1:** `run.sh` now also sets `REDIRECT_ELIGIBLE` when `/info` contains the `SMSC` marker, installing the harmless, additive `:17008 -> :8888` REDIRECT so the desktop app finds the box on `:17008`. The narrow `IS_SERIES_ONE` gate (which also controls the boot-hang-prone LD_PRELOAD shim) is deliberately **not** widened.
+
+> Lesson for the matrix: `moduleType` + `variant` + `components` + WLAN topology can all be identical between a permissive box and a chipset-whitelisted one. The presence of the **`SMSC` networkInfo entry** is the reliable discriminator for "chipset blocks STM's own ports, needs the REDIRECT". Likely also explains a `sm2` box that drops out of a multi-room group because its `:8888` is unreachable.
+
+## SoundTouch 30
+
+Confirmed from a diagnostic bundle (2026-06-10, box-0):
+
+| `moduleType` | SCM `softwareVersion` | Build year | Latest official? | `variant` | `variantMode` | Components present | WLAN interfaces | `countryCode` / `regionCode` samples |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `mojo` | `normal` | SCM, PackagedProduct | `wlan0`, `wlan1` | `GB` / `GB` |
+| `scm` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `mojo` | `normal` | (per boseInfoXml; SMSC-class chassis) | (unrecorded) | (unrecorded) |
+
+- Kernel: `Linux mojo 3.14.43+ Wed Oct 25 21:06:53 EDT 2017 armv7l` (same kernel as ST10/ST20).
+- Row 1 (`sm2`): `is_series_one=0`: like the ST10 (`rhino`), this ST30 (`mojo`) is **not** chipset-whitelisted. STM's `:8888` is reached directly once the iptables INPUT ACCEPT rule opens it; the LD_PRELOAD SoftwareUpdate shim is unnecessary and is skipped for `sm2` chassis (the `.so` cannot even load on `mojo`). See `usb-stick/run.sh` `shim_stage_wrapper`.
+- Row 2 (`scm`, 2026-07-22 mail bundle): the ST30 ALSO ships as an `scm`
+  chassis - the agent installed the `:17008 -> :8888` PREROUTING REDIRECT
+  on it (rule packet counters confirmed live traffic), i.e. this variant
+  takes the whitelisted-chassis path like the `scm` ST20 and the Portable.
+  The architecture sketch's "ST30 = sm2, reached directly" grouping holds
+  only for row 1; always check `moduleType` before assuming the port path.
+
+## SoundTouch Portable
+
+Confirmed from a 2026-07-22 mail bundle:
+
+| `moduleType` | SCM `softwareVersion` | Build year | Latest official? | `variant` | `variantMode` | `countryCode` samples |
+| --- | --- | --- | --- | --- | --- | --- |
+| `scm` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | 2022 | **yes** | `taigan` | `normal` | `US` |
+
+- Whitelisted chassis: reached via the `:17008 -> :8888` REDIRECT, matching
+  the long-standing `taigan` handling in `usb-stick/run.sh`.
+- This also settles the reference table above: the Portable's final Bose
+  firmware is the same 2022-08-04 `27.0.6.46330.5043500` build as the other
+  models.
+
+## Wave SoundTouch (Series III and IV)
+
+Observed live in a 2026-07-04 diagnostic bundle: `moduleType=sm2`,
+`variant=lisa`, `variantMode=NoAP`, SCM firmware 27.0.6.46330.5043500 (the
+same final build as every supported model) plus a `PackagedProduct`
+component (04.04.08) and an SCM + SMSC dual-MAC `networkInfo`. This
+supersedes the earlier "likely different CPU" assumption: the module IS an
+`sm2`, so the ARMv7l GOARM=5 agent binary executes. The stick-free
+`:17000` network install (v0.9.0+) is the validated first-install route:
+the maintainer and two independent users installed end to end
+(2026-07-09 and 2026-07-11), with presets, NAS/DLNA playback, and ST20
+grouping working, and the IR remote's preset keys 1-6 recalling STM
+presets under the SoundTouch source. The Wave never reads a USB stick at
+boot, so the network install is the only path. See the `lisa` table below.
+
+A second Wave fingerprint (2026-07-22 mail bundle) reports
+`moduleType=scm`, `variant=lisa`, `variantMode=normal`, the same final SCM
+firmware 27.0.6.46330.5043500, `PackagedProduct` 04.04.08 and an SCM +
+SMSC dual `networkInfo` - i.e. the Wave, like the ST20 and ST30, exists in
+both an `sm2` and an `scm` chassis generation. The `scm` Wave takes the
+`:17008` REDIRECT path.
+
+Generations seen so far: the reports are Wave **Series IV** units,
+and a Wave **Series III** owner reported a successful install and preset
+storage (its playback issue was the box-side preset
+refusal family, not a chassis incompatibility). Both generations present
+the same `lisa` fingerprint to STM, which is why the model table lists
+"Series III and IV" and the agent makes no distinction between them.
+
+## Lifestyle (SoundTouch console)
+
+Two variants observed. STM is confirmed RUNNING on both (2026-08-03):
+
+| `type` | `moduleType` | SCM `softwareVersion` | `variant` | Components present | `networkInfo` entries | `countryCode` / `regionCode` |
+| --- | --- | --- | --- | --- | --- | --- |
+| `Lifestyle` | `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | `bardeen` | SCM, PackagedProduct (`1.16.7.5043495`) | 2 (SCM + SMSC) | `GB` / `GB` |
+| `Lifestyle` | `scm` | `27.0.6.46330.5043500` | `lisa` | SCM, PackagedProduct, Lightswitch, SMSC | 2 (SCM + SMSC) | (mixed) |
+
+- The bundle also showed a stale `margeURL` pointing at a LAN host that no
+  longer exists (a previous STM/mod install on another machine), with an
+  empty `margeAccountUUID` - a setup probe against such a console should
+  expect leftover cloud config from earlier experiments.
+- STM runs on both variants. Confirmed 2026-08-03 from v0.9.28 diagnostics of
+  two independent owners (`lisa` and `bardeen`), each with the agent up, the
+  engine present and presets registered, plus a third owner reporting a
+  Lifestyle 535 with a SoundTouch 20 Series II adapter working. An earlier
+  answer that Lifestyle consoles and adapters were unsupported was wrong and
+  has been corrected in `docs/MODELS.md`.
+
+## SoundTouch Wireless Link Adapter
+
+One variant observed, both units in the same fleet. STM is confirmed RUNNING
+(2026-08-08):
+
+| `type` | `moduleType` | SCM `softwareVersion` | `variant` | `variantMode` | Components present | `networkInfo` entries | `countryCode` / `regionCode` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `SoundTouch Wireless Link Adapter` | `sm2` | `27.0.6.46330.5043500 epdbuild.trunk.hepdswbld04.2022-08-04T11:20:29` | `binky` | `normal` | SCM, PackagedProduct | 2 (SCM + SMSC) | `GB` / `GB` |
+
+- `binky` is a variant codename this project had not seen before 2026-08-08.
+  It is on the LATEST official firmware, so nothing here needs the outdated
+  path.
+- Two `networkInfo` entries (SCM + SMSC) while `moduleType` is `sm2`: the same
+  shape as the `bardeen` Lifestyle console, NOT the `scm` chassis. Both units
+  answered on `:8888` directly, with `:17008` never needed, so it takes the
+  sm2 code path despite carrying an SMSC interface. Do not assume the SMSC
+  entry alone implies the `:17008` REDIRECT.
+- The adapter has no speaker of its own. From STM it is an ordinary SoundTouch
+  speaker: agent up, `boxHealth: ok`, Spotify engine present, and both units
+  joined a native multiroom group as followers under a SoundTouch Portable
+  master, each verified individually.
+
+## How to read a new bundle
+
+The relevant fields are inside each `box-N.json` under `boseInfoXml`. Decode the XML and extract:
+
+- `<type>` — Bose model name
+- `<moduleType>` — hardware revision (`sm2`, `scm`, ...)
+- `<variant>` and `<variantMode>` — Bose-internal variant markers
+- `<components>` list — component categories and each component's `<softwareVersion>` and `<serialNumber>` (anonymised)
+- `<networkInfo>` block count — SCM-only vs. SCM + SMSC
+- `<countryCode>` and `<regionCode>`
+- `<margeURL>` — `streaming.bose.com` (no STM redirect active) or `no-streaming.bose.com` (STM `internal/hosts` hijack landed)
+
+When the agent is up on `:8888`, the matching `setup.log` (in `debugState.setup_log`, or via the SSH fallback in `pullSSHFallback`) carries:
+
+- `interfaces:` line listing kernel-visible NICs
+- `kernel:` line with full `uname -a`
+- `meminfo:` line for `MemTotal`
+- `bose /etc/version:` line for the deep Bose build stamp
+- `bose /etc/Variant:` line for the Bose variant marker (often blank if the file is unreadable; populated on intact boxes)
+- `writable:` lines for `/etc`, `/mnt/nv`, `/tmp`, `/media/sda1`
+
+## The `lisa` variant (SA-4, Wave SoundTouch, CineMate)
+
+Seen in the 2026-06-28 triage bundles (SA-4, plus a Wave SoundTouch)
+and installed end to end since:
+
+| `moduleType` | `variant` | `type` | Components | First-install state |
+| --- | --- | --- | --- | --- |
+| `scm` | `lisa` | `SoundTouch SA-4` | SCM, PackagedProduct, **Lightswitch**, **SMSC** | **validated** — a user network-installed STM end to end 2026-07-09. The stick was never an option (it does not read USB at boot); the stick-free `:17000` network install is the path. |
+| `scm` | `lisa` | `Wave SoundTouch` | SCM, PackagedProduct, Lightswitch, SMSC | **validated** — the agent runs via the `:17008` REDIRECT like the `scm` ST20; stick-free network install confirmed end to end (2026-07-09 and 2026-07-11). |
+| `sm2` | `lisa` | `Wave SoundTouch` | SCM, PackagedProduct, SMSC | **validated** — seen 2026-07-04 (`variantMode=NoAP`): the Wave ships on BOTH module types. Stick-free network install confirmed end to end (2026-07-09 and 2026-07-11: presets, NAS/DLNA playback, ST20 grouping). |
+| `sm2` | `burns` | `SoundTouch SA-5` | SCM, PackagedProduct, SMSC | **validated** — an owner runs STM v0.9.25 end to end (2026-08-01): network install, app + phone-remote control and Now Playing. Known gap: the SA-5 reports three AUX inputs where STM models one. |
+| `sm2` | `lisa` | `Cinemate` (CineMate 120) | SCM, PackagedProduct `01.07.00` | **validated with a full diagnostic** — `variantMode=NoAP`, firmware 27.0.6, network install 2026-09-10 and OTA to v0.9.79 the next day, both clean; four presets registered natively and the Spotify engine present (bundle 2026-09-12). This one runs on **Ethernet**, the first STM box on a cable rather than Wi-Fi: see the note under the table. |
+| `sm2` | `lisa` | `CineMate 520` | SCM, PackagedProduct | **validated** — a user network-installed STM end to end 2026-07-09. The CineMate 130 is separately user-confirmed (v0.9.27, 2026-08-01; full fingerprint pending from the diagnostics — reports its TV/AUX input as source `LOCAL`). The CineMate 220 is user-confirmed working (2026-08-23, Spotify over LAN; fingerprint pending). The SoundTouch 520 carries this same `sm2`/`lisa` fingerprint (diagnostic, 2026-08-23). |
+
+**A wired box is a normal box, and STM now knows it.** The adapters and
+consoles in this family have an Ethernet port and owners use it. On such a box
+`wlan0` sits unassociated for good reason, and until v0.9.80 the Wi-Fi boot
+guard read that as a radio that had failed to come up: it power-cycled the chip
+over SDIO and waited out its recheck budget, roughly three and a half minutes of
+every boot spent to reach a stand-down. The guard now looks at the default route
+first and leaves the radio alone while a cable is carrying the box. Pull the
+cable and it works exactly as before.
+
+The Wave, SA-4, and CineMate 520 are now **Working** (docs/MODELS.md); the untested-model UI warning was removed in v0.9.2. The SA-5 (`burns`) is now also user-confirmed (2026-08-01). Note: in a diagnostic a stock `scm/lisa` box shows `reachable8888=true` because that field probes **:17008**, where Bose's own SoftwareUpdate answers; the authoritative "STM present" signal is the `stmDetected` field, not `reachable8888`.
+
+## Why this matters for STM
+
+Code paths that diverge between hardware revisions (WLAN provisioning, USB-Ethernet bridge handling, watchdog behaviour, TLS bundle generation, hosts-file bind-mount) sit on top of these facts. New failure reports get their root cause matched against this matrix before we start speculating; if a row is missing we ask for a diagnostic before promising a fix.

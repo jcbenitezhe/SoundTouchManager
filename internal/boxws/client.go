@@ -1,0 +1,893 @@
+// Connection lifecycle: the Client struct, its constructor, the reconnect
+// loop, the WebSocket keepalive, and the small state accessors it exposes.
+
+package boxws
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/jcbenitezhe/SoundTouchManager/internal/boxwrites"
+)
+
+// Client holds the connection to the box.
+type Client struct {
+	logger  *slog.Logger
+	url     string
+	handler Handler
+
+	// lastSignal is the most recent Wi-Fi signal class the box reported
+	// over the gabbo stream (GOOD_SIGNAL / MARGINAL_SIGNAL / ...). On BCO
+	// speakers (Portable, scm ST20) /networkInfo exposes no signal, so
+	// the settings UI uses this instead. Guarded; read via LastWifiSignal.
+	// lastSignalAt: connectionState frames fire on connection TRANSITIONS,
+	// i.e. mostly at boot while the link is still settling, and then never
+	// again in steady state. Without an expiry, a low boot-time reading
+	// stuck for the whole uptime and a Portable one meter from the router
+	// showed "marginal signal" all day.
+	mu           sync.Mutex
+	lastSignal   string
+	lastSignalAt time.Time
+	// lastLang / lastLangAt time the most recent languageUpdated frame so a
+	// second frame with a DIFFERENT value arriving within languageRevertWindow
+	// is flagged as a firmware-side revert (Wave: user saves German=2, box
+	// broadcasts 2 then 3 within 200 ms and the setting is back on English).
+	lastLang   string
+	lastLangAt time.Time
+	// err1036Times is a sliding window of recent 1036 rejections; when the box
+	// answers essentially every recall with 1036 (the storm state that today
+	// only a power-cycle or soft reboot clears), one bounded WARN marks the
+	// storm so bundles can correlate it with the boot clock and marge trail.
+	err1036Times   []time.Time
+	lastStormLogAt time.Time
+	// suppress1036Until stands the storm COUNTER down while STM is itself
+	// provoking the rejections it would otherwise count (see
+	// Suppress1036Until). Guarded by mu.
+	suppress1036Until time.Time
+	// lastAcctModeLogAt gates the acctModeUpdated INFO line so a flapping box
+	// cannot spam the NAND ring (the frame's cadence on 27.0.6 is unknown; it
+	// has never appeared in a field bundle). Guarded by mu.
+	lastAcctModeLogAt time.Time
+	// setupAPEpisodes counts how often the firmware raised its own setup
+	// access point on this connection. Per-connection, not per box:
+	// the authoritative count is the one the webui keeps (boxsetup.go), this
+	// one only numbers the log lines.
+	setupAPEpisodes int
+	// lastSetupAPRaisedAt / lastSetupAPDownAt gate the setupAPUpdated log line
+	// and the hook, the same way lastAcctModeLogAt gates its own. The frame's
+	// cadence on 27.0.6 is unmeasured and the firmware re-raises setup every
+	// couple of minutes for a quarter of an hour, so an ungated frame is a
+	// NAND log storm and a stream of hook calls.
+	//
+	// One clock PER POLARITY, because a shared one starves the half that
+	// matters: the firmware lowers the AP at T and raises it again at T+40 s,
+	// and with a single clock that raise falls inside the gap the "down" frame
+	// just consumed - no log line, no hook, no episode, for the transition
+	// that carries the warning. Guarded by mu.
+	lastSetupAPRaisedAt time.Time
+	lastSetupAPDownAt   time.Time
+	// boxErrors is a small ring of the errors the BOX reported, newest last.
+	// The log already carries each one, but a bundle then needs someone to
+	// find them by eye among thousands of lines, and the code alone does not
+	// say what the box was doing at the time. A hardware preset press that
+	// dies on 4502 BMX_JSON_PARSE_ERROR is the case in point:
+	// the speaker activated a native radio preset, failed to parse whatever
+	// came back, and dropped to INVALID_SOURCE, and answering "what did it
+	// fetch, and had it ever fetched the service registry?" from the log was
+	// impossible. Pairing each error with the location the box was acting on
+	// makes the next bundle say it directly.
+	boxErrors []BoxErrorNote
+	// lastSelectionLoc / lastSelectionAt are the location and moment of the
+	// last preset the box selected, used to attribute an error to a press.
+	lastSelectionLoc string
+	lastSelectionAt  time.Time
+	// prevEndedIdle marks that the previous WS session ended in a plain idle
+	// read timeout, so the next "connected" phase marker logs at Debug instead
+	// of churning the NAND log. Only touched from the Run loop goroutine.
+	prevEndedIdle bool
+	// connected is true while runOnce holds a live socket. Read by Connected
+	// so a consumer with a second origin for a bus signal (cmd/agent's syslog
+	// ring) can tell whether the bus's own report may still arrive. Guarded
+	// by mu.
+	connected bool
+	// lastSource tracks the most recent active source seen on a now-selection /
+	// now-playing frame, so the aux webhook fires once on the transition to AUX
+	// rather than repeatedly while AUX stays the active source.
+	lastSource string
+	// sourcePlaying is whether the last now-playing frame showed a streaming
+	// source that was actually playing (PLAY_STATE / BUFFERING_STATE). The
+	// default-group trigger fires on the false->true edge of this, not on a
+	// bare source change: a rebooted speaker flips STANDBY -> LOCAL_INTERNET_RADIO
+	// in STOP_STATE while its presets are re-registered, and that flip woke a
+	// whole permanent group at 3 in the morning (2026-09-06).
+	sourcePlaying bool
+
+	// unknownFrames counts the frame shapes STM does not handle, keyed by the
+	// element name, so the first of each shape can be logged in full and the
+	// repeats only counted. unknownSummaryAt times the periodic roll-up.
+	// Guarded by mu.
+	unknownFrames    map[string]int
+	unknownSummaryAt time.Time
+
+	// lastInvalidSourceAt / lastPresetPressAt time the box's own UPnP-source
+	// teardown. On scm/mojo firmware (ST30) a preset switch AND an involuntary
+	// stream drop both tear STM's UPNP source down through INVALID_SOURCE and
+	// emit a transient STOP_STATE nowPlaying frame. Treating that STOP_STATE as a
+	// deliberate user stop latched lastUserStop, which then suppressed BOTH the
+	// box-side-drop recovery (maybeRePush: a radio stream stayed dead after a few
+	// minutes) and the recall verify retry (verifyPlayURL: a re-press never
+	// recovered a SetURI that raced the wake) - the preset buttons looked broken
+	// (#ST30 "button 2 dies after a few minutes, re-press does not fix it",
+	// 2026-07-11). These stamps let the STOP_STATE handler tell that teardown
+	// apart from a genuine stop. Guarded by mu.
+	lastInvalidSourceAt time.Time
+	lastPresetPressAt   time.Time
+
+	// lastSkipFailAt is when the box last reported that its OWN skip on a UPnP
+	// source failed (QPLAY_SKIP_*_FAILED). That failure is followed by the
+	// firmware tearing the source down, and the teardown restore is
+	// indistinguishable on the wire from a standby wake, so the dispatcher
+	// consults this stamp before it reports a wake (see skipWakeWindow).
+	// Guarded by mu, like the teardown stamps above.
+	lastSkipFailAt time.Time
+
+	// lastOwnCmdAt is when STM itself last issued a transport-mutating SOAP
+	// command (SetURI/Play/Pause/Stop), stamped via NoteOwnTransportCommand from
+	// the upnp renderer's OnTransportCommand hook. The box answers a SOAP Stop
+	// (and a SetURI flip of an active transport) with a nowPlaying STOP_STATE
+	// that looks exactly like the user pressing stop; the v0.9.16 wrong-state
+	// repair (Stop+ClearURI ~1.5 s into a recall, after the press window
+	// expired) therefore latched a phantom user stop that aborted its OWN
+	// verify loop and stood every recovery down (post-v0.9.16: "remote
+	// useless"). stopStateIsTeardown reads this stamp to excuse such an echo -
+	// unless a fresh physical key press accompanied it, which means the user
+	// really did stop. Guarded by mu.
+	lastOwnCmdAt time.Time
+
+	// lastUpnpActiveAt is when STM's own source (UPNP) last stopped being the
+	// active source. The firmware's give-up after a failed self-activation
+	// reaches STANDBY through INVALID_SOURCE (UPNP -> INVALID_SOURCE ->
+	// STANDBY), and the prev==UPNP gate alone made that route bypass the
+	// standby handling entirely. Guarded by mu.
+	lastUpnpActiveAt time.Time
+
+	// lastNativeActiveAt is when the box last stopped being on a native radio
+	// station. Used to tell a station the box ABANDONED (it reaches
+	// INVALID_SOURCE shortly after) from the normal teardown of a preset
+	// change (which returns to the native source within a few hundred ms).
+	// Guarded by mu.
+	lastNativeActiveAt time.Time
+
+	// nativeStartedAt is when the box last ENTERED the native radio source.
+	// lastNativeActiveAt records when it left, which cannot tell how long the
+	// station actually lasted; this can. A speaker that drops the station it
+	// started a second ago has abandoned it, whoever it hands over to.
+	// Guarded by mu.
+	nativeStartedAt time.Time
+
+	// upnpEpisode is true while the box sits in the INVALID_SOURCE (or
+	// subsequent STANDBY) state it entered FROM STM's UPNP source. The
+	// rolling upnpFlapWindow only covers the fast give-up flap; a struggling
+	// box can dwell in INVALID_SOURCE for 16+ seconds (the state the
+	// sys-power nudge exists for), and a user power press at the end of that
+	// dwell produced INVALID_SOURCE->STANDBY with the window long expired -
+	// so no standby classification ran, nothing latched, and the recall
+	// verify's wake actively powered the just-switched-off box back on
+	// Set on UPNP->INVALID_SOURCE, cleared when the source becomes
+	// anything other than INVALID_SOURCE/STANDBY. Guarded by mu.
+	upnpEpisode bool
+
+	// lastStandbyFlapAt times the box's own UPNP<->STANDBY oscillation on a
+	// spontaneous firmware source power-off. That drop is not a single
+	// transition: the box flips UPNP->STANDBY->UPNP within ~100 ms, and the
+	// STANDBY->UPNP leg carries a nowPlaying STOP_STATE whose source attribute
+	// reads UPNP (not INVALID_SOURCE/STANDBY), so stopStateIsTeardown missed it
+	// and fired OnUserStop. That latched a user-stop that then defeated the
+	// spontaneous-off exemption on the NEXT leg of the same oscillation, so
+	// tore the transport down and every recovery path stood down until a power
+	// pull (bundle 17, three sm2 boxes on v0.9.15). Stamping every flap to OR
+	// from STANDBY lets the STOP_STATE handler recognise the bounce. Guarded by mu.
+	lastStandbyFlapAt time.Time
+
+	// Thumb-trigger heuristic state. The remote thumbs keys surface only as a
+	// generic <userActivityUpdate/>; we treat a "lone" one (no volume / now
+	// playing / preset event around it) as a thumb press and fire
+	// OnThumbActivity once, debounced. See noteExplainedActivity / noteUserActivity.
+	thumbMu        sync.Mutex
+	thumbPending   *time.Timer
+	thumbExplained time.Time
+	thumbLastFire  time.Time
+	// lastUserActivityLog debounces the INFO log of an incoming userActivity
+	// frame so a volume ramp (which also emits userActivity) cannot churn the
+	// NAND log, while an isolated thumb press is still recorded. See
+	// noteUserActivity.
+	lastUserActivityLog time.Time
+	// lastUserActivityAt is when the box last emitted ANY userActivityUpdate
+	// frame (box buttons and IR remote keys alike; the firmware sends it as a
+	// generic ping alongside the concrete event). The webui's standby handler
+	// reads it (via LastUserActivity) to tell a physical power-off, which is
+	// accompanied by such a frame, from the firmware spontaneously powering
+	// off STM's UPnP source with no user input at all. Guarded by thumbMu.
+	lastUserActivityAt time.Time
+
+	// onLoginError fires when the box rejects a source because it considers
+	// itself not signed into an account (errorUpdate value 1036
+	// UNABLE_TO_PROCESS_NOT_LOGGED_IN, seen on the SoundTouch 300). The agent
+	// wires this to a forced re-login plus a signal that stands the recall retry
+	// down, so STM does not thrash a box that keeps rejecting the UPnP source
+	// (repeated re-pushes flap the source and can wedge the box). Rate-limited
+	// via lastLoginErrFire.
+	// sendMu guards the APPLICATION writes on the live socket, and sendConn is
+	// that socket, or nil while the client sits between reconnects. boxws was a
+	// pure listener until 2026-09-10, so this is the first writer besides the
+	// keepalive; see send.go for why one is needed at all. gorilla/websocket
+	// allows a single concurrent writer and documents WriteControl (the
+	// keepalive's ping) as safe alongside it, so this mutex only has to
+	// serialise the application writers against each other.
+	sendMu   sync.Mutex
+	sendConn *websocket.Conn
+	// reqID numbers the requests STM sends. The firmware echoes the number back
+	// on its answer frame. Nothing correlates on it yet, but Bose's own client
+	// counts up per request, and a repeated ID is the kind of thing a firmware
+	// is entitled to treat as a duplicate.
+	reqID uint64
+
+	loginErrMu   sync.Mutex
+	onLoginError func()
+	// onSourcesChanged fires when the box announces a changed source list.
+	// Guarded by loginErrMu, like onLoginError.
+	onSourcesChanged func()
+	// onNativeDropped fires when the box abandons a native radio station it had
+	// just accepted. Guarded by loginErrMu.
+	onNativeDropped  func()
+	lastLoginErrFire time.Time
+}
+
+// loginErrDedup rate-limits the not-logged-in callback so a box that emits the
+// error repeatedly triggers at most one re-login attempt per window.
+const loginErrDedup = 20 * time.Second
+
+// SetOnLoginError registers a callback fired when the box rejects a source with
+// a not-logged-in error. Rate-limited internally; the callback runs in its own
+// goroutine so the read loop is never blocked.
+func (c *Client) SetOnLoginError(fn func()) {
+	c.loginErrMu.Lock()
+	c.onLoginError = fn
+	c.loginErrMu.Unlock()
+}
+
+// SetOnSourcesChanged registers a callback fired when the box announces that its
+// source list changed (<sourcesUpdated/>).
+//
+// This is the box telling us the exact moment its registered sources became
+// different, and it matters for preset form: whether a preset can be stored as
+// a native radio station depends on the radio source being registered, and that
+// registration completes a few seconds AFTER the agent's own startup check runs.
+// Without this signal the agent keeps a stale "not available" answer until its
+// cache expires and writes UPnP presets in the meantime. The callback runs in
+// its own goroutine so the read loop is never blocked.
+func (c *Client) SetOnSourcesChanged(fn func()) {
+	c.loginErrMu.Lock()
+	c.onSourcesChanged = fn
+	c.loginErrMu.Unlock()
+}
+
+// SetOnNativeDropped registers a callback fired when the box leaves a native
+// radio station on its own, i.e. it accepted the station and then abandoned it.
+// The agent counts these to decide whether this speaker can keep native presets
+// at all. Runs in its own goroutine so the read loop is never blocked.
+func (c *Client) SetOnNativeDropped(fn func()) {
+	c.loginErrMu.Lock()
+	c.onNativeDropped = fn
+	c.loginErrMu.Unlock()
+}
+
+// ownPresetWriteWindow is how long after an AddPreset sweep a source flap is
+// read as STM's own footprint rather than as the speaker failing.
+//
+// The sweep writes six slots and takes several seconds; the firmware activates
+// UPNP on the FIRST write, so the flap lands at the start and the sweep is
+// still running long after. Measured on an ST20 (2026-08-22): re-sync at
+// 20:55:32.422, source gone 101 ms later, last slot confirmed at 20:55:38.293.
+const ownPresetWriteWindow = 15 * time.Second
+
+// nativeDropIsOurOwnWrite reports whether a native station that just vanished
+// was taken down by STM's own preset write.
+//
+// The native-drop watchdog latches native presets OFF after enough strikes, and
+// a strike is meant to mean "this speaker cannot hold a native station". A
+// preset sweep produces the identical frame sequence, so a speaker that was
+// working perfectly collected strikes for a fault that was ours. The field case
+// recorded a station as lasting 188 ms, 101 ms after our own re-sync line.
+func (c *Client) nativeDropIsOurOwnWrite() bool {
+	return boxwrites.WroteWithin("addpreset", ownPresetWriteWindow)
+}
+
+func (c *Client) fireNativeDropped() {
+	c.loginErrMu.Lock()
+	fn := c.onNativeDropped
+	c.loginErrMu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
+
+// fireSourcesChanged invokes the sources-changed callback, if one is registered.
+func (c *Client) fireSourcesChanged() {
+	c.loginErrMu.Lock()
+	fn := c.onSourcesChanged
+	c.loginErrMu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
+
+// fireLoginError invokes the registered not-logged-in callback, at most once per
+// loginErrDedup window.
+func (c *Client) fireLoginError() {
+	c.loginErrMu.Lock()
+	fn := c.onLoginError
+	if fn == nil || (!c.lastLoginErrFire.IsZero() && time.Since(c.lastLoginErrFire) < loginErrDedup) {
+		c.loginErrMu.Unlock()
+		return
+	}
+	c.lastLoginErrFire = time.Now()
+	c.loginErrMu.Unlock()
+	go fn()
+}
+
+// wsKeepaliveInterval is how often STM sends a WebSocket ping control frame to
+// hold the gabbo connection open. The Bose WS server reaps an idle connection
+// after ~10 min; without traffic STM reconnected on a stuck ~10.5 min cadence
+// and missed the box's preset/now-selection frames in every gap (observed
+// 205x over 2.5 days in a diagnostic bundle). A ping every ~4 min keeps the
+// socket alive well under that window. STM stays read-only at the gabbo
+// application layer: a protocol ping needs no gabbo request semantics and the
+// server answers it with a pong.
+const wsKeepaliveInterval = 4 * time.Minute
+
+// wsReadDeadline bounds how long the reader waits without ANY life sign (data
+// frame or pong). Two keepalive intervals plus slack: two consecutive lost
+// pings mean the peer is genuinely gone.
+const wsReadDeadline = 2*wsKeepaliveInterval + 3*time.Minute
+
+// wsWriteTimeout bounds a single ping write so a half-dead socket cannot wedge
+// the keepalive goroutine; a failed/blocked write closes the conn and the read
+// loop returns, triggering a clean reconnect.
+const wsWriteTimeout = 10 * time.Second
+
+// upnpRecentlyLocked reports whether STM's own source (UPNP) was the active
+// one just before a source change, directly or through the firmware's
+// UPNP -> INVALID_SOURCE -> STANDBY give-up route. prev is the source before
+// the change. Caller holds c.mu.
+func (c *Client) upnpRecentlyLocked(prev string) bool {
+	return prev == "UPNP" ||
+		(!c.lastUpnpActiveAt.IsZero() && time.Since(c.lastUpnpActiveAt) < upnpFlapWindow) ||
+		c.upnpEpisode
+}
+
+// UPnPActiveRecently reports whether STM's own source is, or moments ago
+// was, the box's active source as far as the gabbo stream has told. It is
+// the same gate the dispatcher applies before it reports a standby entry as
+// STM's playback being powered off, so a standby read from the syslog ring
+// (see cmd/agent) reaches the same handler under the same condition.
+func (c *Client) UPnPActiveRecently() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.upnpRecentlyLocked(c.lastSource)
+}
+
+// Connected reports whether the gabbo WebSocket is up right now. While it
+// is, the bus's own report of a transition (with the userActivityUpdate that
+// accompanies a physical power press) is still expected; between its idle
+// recycles it is not, and the syslog ring is the only origin left.
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connected
+}
+
+// setConnected records the socket coming up or going down.
+func (c *Client) setConnected(up bool) {
+	c.mu.Lock()
+	c.connected = up
+	c.mu.Unlock()
+}
+
+// LastWifiSignal returns the most recent Wi-Fi signal class seen on the
+// gabbo stream, or "" if none observed yet.
+func (c *Client) LastWifiSignal() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Expire stale readings: better an honest "not reported" in the UI than
+	// a boot-time class presented as current (see lastSignalAt above).
+	if c.lastSignal == "" || time.Since(c.lastSignalAt) > wifiSignalTTL {
+		return ""
+	}
+	return c.lastSignal
+}
+
+// wifiSignalTTL bounds how long a gabbo-reported signal class counts as
+// current. connectionState frames only fire on transitions, so anything
+// older describes a long-gone moment (usually the boot association).
+const wifiSignalTTL = 15 * time.Minute
+
+// languageRevertWindow is how close together two languageUpdated frames with
+// different values must be to count as a firmware-side revert rather than two
+// independent user changes. The live Wave captures show 38-183 ms; 2 s leaves
+// margin without misreading a user changing their mind.
+const languageRevertWindow = 2 * time.Second
+
+// noteLanguageUpdated logs sysLanguage transitions and flags the Wave revert
+// pattern: a fresh value overwritten by a different one within
+// languageRevertWindow. The WARN carries both values and the gap so a bundle
+// can be correlated (by millisecond timestamp) with the marge request trail in
+// debug/state and with any app-side save, answering WHO wrote the second value.
+func (c *Client) noteLanguageUpdated(v string) {
+	now := time.Now()
+	c.mu.Lock()
+	prev, prevAt := c.lastLang, c.lastLangAt
+	c.lastLang, c.lastLangAt = v, now
+	c.mu.Unlock()
+	if prev != "" && prev != v && now.Sub(prevAt) < languageRevertWindow {
+		c.logger.Warn("box ws: sysLanguage overwritten right after a change (firmware-side revert; correlate with marge_recent_requests and any app save at this timestamp)",
+			"from", prev, "to", v, "afterMs", now.Sub(prevAt).Milliseconds())
+		return
+	}
+	c.logger.Info("box ws: languageUpdated", "sysLanguage", v, "prev", prev)
+}
+
+// acctModeLogEvery bounds the acctModeUpdated INFO line. The frame's cadence
+// on 27.0.6 is unknown because it has never been seen in a field bundle, so
+// the gate is insurance against a flapping box turning a diagnostic timestamp
+// into NAND churn.
+const acctModeLogEvery = 5 * time.Minute
+
+// noteAcctModeUpdated records that the box announced a change of its cloud
+// account association (acctModeUpdated, in either wire form). Stated plainly:
+// no field bundle has ever shown this frame on 27.0.6 and it may never fire.
+// It exists so that IF it does, the association flip behind a 1036 storm gets
+// its own timestamp to correlate with clock_status and the marge trail, the
+// way the storm WARN already tells bundle readers to (the install pins
+// acctMode=local, so a later frame is a direct flip marker). INFO on purpose:
+// rare by construction, and being visible in a bundle is the whole point.
+func (c *Client) noteAcctModeUpdated() {
+	now := time.Now()
+	c.mu.Lock()
+	if !c.lastAcctModeLogAt.IsZero() && now.Sub(c.lastAcctModeLogAt) < acctModeLogEvery {
+		c.mu.Unlock()
+		return
+	}
+	c.lastAcctModeLogAt = now
+	c.mu.Unlock()
+	c.logger.Info("box ws: box account association changed")
+}
+
+// setupAPLogEvery is the minimum gap between two setupAPUpdated reactions. One
+// a minute is fast enough to catch the start of an episode and slow enough
+// that a firmware flapping the AP cannot turn the NAND ring into a log storm.
+const setupAPLogEvery = time.Minute
+
+// noteSetupAP handles the firmware's <setupAPUpdated> frame: its own setup
+// access point going up or down.
+//
+// "up" is the point of it. While that AP is up the speaker is not on the home
+// Wi-Fi, so everything the desktop app sees is silence, and the install wait
+// that runs at exactly that moment reports a successful install as a failure.
+// The agent runs ON the speaker, so it is the only side that ever learns this.
+//
+// The handler hook is optional (same shape as OnSourcePlaying): a handler that
+// does not implement it simply gets the log line.
+//
+// Rate limited to one line and one hook call per setupAPLogEvery, for the same
+// reason noteAcctModeUpdated is: the frame's cadence on 27.0.6 has never been
+// measured, and the firmware is documented right here as re-raising setup
+// every couple of minutes for a quarter of an hour. Ungated, every frame would
+// Warn into the NAND-mirrored ring and fire the hook again.
+//
+// The two polarities have their OWN clock. Sharing one lets an "AP down" frame
+// spend the minute that the "AP up" frame forty seconds later needs, and it is
+// the up frame that carries the warning.
+func (c *Client) noteSetupAP(ctx context.Context, body string) {
+	raised := strings.EqualFold(strings.TrimSpace(body), "true")
+	now := time.Now()
+	c.mu.Lock()
+	last := &c.lastSetupAPDownAt
+	if raised {
+		last = &c.lastSetupAPRaisedAt
+	}
+	if !last.IsZero() && now.Sub(*last) < setupAPLogEvery {
+		c.mu.Unlock()
+		return
+	}
+	*last = now
+	if raised {
+		c.setupAPEpisodes++
+	}
+	episode := c.setupAPEpisodes
+	source := c.lastSource
+	c.mu.Unlock()
+	if !raised {
+		c.logger.Info("box ws: the firmware took its setup access point down again",
+			"episode", episode, "source", source)
+		return
+	}
+	c.logger.Warn("box ws: the firmware raised its setup access point (the speaker is about to drop off the LAN)",
+		"episode", episode, "source", source)
+	if h, ok := c.handler.(interface{ OnSetupAPRaised(context.Context) }); ok {
+		h.OnSetupAPRaised(ctx)
+	}
+}
+
+// storm1036Threshold / storm1036Window / storm1036LogEvery bound the 1036-storm
+// marker: at least storm1036Threshold rejections inside storm1036Window, logged
+// at most once per storm1036LogEvery so a day-long storm (observed on a mojo
+// ST30: every press 1036, all day) does not churn the NAND log.
+const (
+	storm1036Threshold = 6
+	storm1036Window    = 10 * time.Minute
+	storm1036LogEvery  = 30 * time.Minute
+)
+
+// note1036 feeds the storm detector. The WARN is diagnostic only (no behavior
+// hangs off it): it timestamps the storm START so bundles can correlate it
+// with the boot clock state (plug-pull RTC loss poisons the firmware,
+// Finding 4), TLS handshake failures on marge-tls, and the marge trail.
+// BoxErrorNote is one error the box reported over its WebSocket, kept with
+// the preset location the box was acting on so a bundle can tell a failure
+// that followed a preset press apart from one that came out of nowhere.
+type BoxErrorNote struct {
+	When   string `json:"when"`
+	Value  string `json:"value"`
+	Name   string `json:"name"`
+	Detail string `json:"detail,omitempty"`
+	// ActingOn is the location of the last preset the box selected before this
+	// error, empty when the error did not follow a selection.
+	ActingOn string `json:"actingOn,omitempty"`
+	// SinceSelectionMs is how long after that selection the error arrived.
+	SinceSelectionMs int64 `json:"sinceSelectionMs,omitempty"`
+}
+
+// maxBoxErrors bounds the ring. These are rare on a healthy speaker and the
+// interesting ones cluster around a single press, so a short tail is enough
+// and cannot grow the debug payload without limit on a box that storms.
+const maxBoxErrors = 12
+
+// noteBoxError records a box-reported error next to what the box was doing.
+func (c *Client) noteBoxError(value, name, detail string) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := BoxErrorNote{
+		When:   now.Format(time.RFC3339Nano),
+		Value:  value,
+		Name:   name,
+		Detail: detail,
+	}
+	if !c.lastSelectionAt.IsZero() {
+		n.ActingOn = c.lastSelectionLoc
+		n.SinceSelectionMs = now.Sub(c.lastSelectionAt).Milliseconds()
+	}
+	c.boxErrors = append(c.boxErrors, n)
+	if len(c.boxErrors) > maxBoxErrors {
+		c.boxErrors = c.boxErrors[len(c.boxErrors)-maxBoxErrors:]
+	}
+}
+
+// BoxErrors returns a copy of the recorded box errors, oldest first.
+func (c *Client) BoxErrors() []BoxErrorNote {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]BoxErrorNote(nil), c.boxErrors...)
+}
+
+// skipWakeWindow is how close a failed native skip must be for the
+// DO_NOT_RESUME restore that follows it to be read as that skip's source
+// teardown rather than as a power-on wake.
+//
+// The two events are one firmware sequence: the QPLAY_SKIP_*_FAILED error, the
+// source drop, and the restore of the selection arrive within a second of each
+// other. Five seconds is generous enough to cover a box that is slow to give up
+// (an INVALID_SOURCE dwell of a few seconds is normal, see upnpEpisode) while
+// staying far below the time it takes a person to press skip and then power.
+const skipWakeWindow = 5 * time.Second
+
+// noteSkipFailure records that the box just failed its own skip. Same shape as
+// noteExplainedActivity: a bare stamp written where the frame is recognised,
+// read at the decision it has to inform. See lastSkipFailAt.
+func (c *Client) noteSkipFailure() {
+	c.mu.Lock()
+	c.lastSkipFailAt = time.Now()
+	c.mu.Unlock()
+}
+
+// sinceSkipFailure reports how long ago the box failed its own skip and whether
+// that was inside skipWakeWindow. A box that has never failed a skip reports
+// recent=false, never a zero-age match.
+func (c *Client) sinceSkipFailure() (age time.Duration, recent bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lastSkipFailAt.IsZero() {
+		return 0, false
+	}
+	age = time.Since(c.lastSkipFailAt)
+	return age, age < skipWakeWindow
+}
+
+// NoteSelection records the preset location the box just selected, so an error
+// arriving milliseconds later can be attributed to it.
+func (c *Client) NoteSelection(loc string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastSelectionLoc = loc
+	c.lastSelectionAt = time.Now()
+}
+
+// Suppress1036Until stands the 1036 STORM COUNTER down until t. A later t wins;
+// an earlier one never shortens a window that is already armed.
+//
+// The storm marker is there to catch a box that rejects essentially every
+// recall on its own, which is a real state with a real remedy (a soft reboot).
+// What it cannot do is tell those rejections apart from the ones STM PROVOKES.
+// A power-on makes the firmware resume the speaker's own last station, that
+// self-resume fails against a source the box does not consider itself logged
+// into, and each failure was counted like a symptom. A user who formed and
+// dissolved a group a few times collected six of them inside ten minutes and
+// got a red banner claiming the speaker refuses every station - about a speaker
+// that was fine and healed by itself (field, 2026-09-07).
+//
+// Only the COUNT is suppressed. The per-frame WARN and the boxErrors entry are
+// written before this is ever consulted, so a diagnostic bundle still carries
+// every single rejection and loses nothing.
+func (c *Client) Suppress1036Until(t time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t.After(c.suppress1036Until) {
+		c.suppress1036Until = t
+	}
+}
+
+func (c *Client) note1036() {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// STM asked for this one: it is not evidence about the box. Returning
+	// before the window is even touched keeps a provoked rejection from
+	// counting AND from ageing a genuine one out of the sliding window.
+	if now.Before(c.suppress1036Until) {
+		return
+	}
+	keep := c.err1036Times[:0]
+	for _, t := range c.err1036Times {
+		if now.Sub(t) < storm1036Window {
+			keep = append(keep, t)
+		}
+	}
+	c.err1036Times = append(keep, now)
+	if len(c.err1036Times) < storm1036Threshold || now.Sub(c.lastStormLogAt) < storm1036LogEvery {
+		return
+	}
+	c.lastStormLogAt = now
+	c.logger.Warn("box ws: 1036 storm - the box rejects essentially every recall (check clock_status and marge-tls handshake errors in this bundle; a soft reboot has cleared this state in the field)",
+		"count", len(c.err1036Times), "windowMin", int(storm1036Window.Minutes()))
+}
+
+// Storm1036 reports whether the box is currently rejecting essentially every
+// recall, and since when. Same window and threshold as the log marker above.
+//
+// Until now the storm was diagnostic only, visible in a bundle after the fact.
+// But it is the one state where the user's own remedy is actively harmful: the
+// advice that spreads between users is to pull the plug, and a plug pull resets
+// the box's clock to 2015 and poisons the whole next boot, while a SOFT reboot
+// clears the state (Finding 4, reproduced twice on-site). Reporting it lets
+// the app say so at the moment it matters instead of after the damage.
+//
+// The "since" is the OLDEST rejection still inside the window, i.e. how long the
+// box has been in this state as far as we can still see.
+func (c *Client) Storm1036() (active bool, count int, since time.Time) {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var oldest time.Time
+	n := 0
+	for _, t := range c.err1036Times {
+		if now.Sub(t) >= storm1036Window {
+			continue
+		}
+		n++
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	return n >= storm1036Threshold, n, oldest
+}
+
+// LastUserActivity returns when the box last reported a userActivityUpdate
+// frame (any physical key on the box or the IR remote), or the zero time if
+// none has been seen since the agent started. The webui's standby handler uses
+// it to tell a user power-off from the firmware spontaneously powering off
+// STM's UPnP source: a real key press is accompanied by such a frame,
+// a spontaneous drop is not.
+func (c *Client) LastUserActivity() time.Time {
+	c.thumbMu.Lock()
+	defer c.thumbMu.Unlock()
+	return c.lastUserActivityAt
+}
+
+// New creates a Client. url example: "ws://127.0.0.1:8080/".
+func New(logger *slog.Logger, url string, handler Handler) *Client {
+	return &Client{logger: logger, url: url, handler: handler}
+}
+
+// Run blocks and reconnects automatically when the connection drops. Stop via
+// ctx cancel.
+//
+// The box does not send its own keepalive frames; STM pings the socket itself
+// (wsKeepaliveInterval) so a long idle period no longer tears the connection
+// down. A reconnect resyncs the box state via the OnConnected hook. When
+// nothing happens for a long time that is normal - no WARN spam for it.
+func (c *Client) Run(ctx context.Context) {
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		start := time.Now()
+		err := c.runOnce(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		// A session that lived a while was a healthy connection: reset the
+		// backoff so the NEXT reattach is fast again. Without this the backoff
+		// initialized once, hit its 8 s cap during the first outage and stayed
+		// there for the whole agent lifetime, adding a flat 8 s to every
+		// reconnect forever (part of the fixed 674.5 s self-timeout cadence in
+		// the 2026-07-26 field bundle).
+		if time.Since(start) > time.Minute {
+			backoff = time.Second
+		}
+		if err != nil {
+			// A read timeout is normal when the box is not active; the
+			// reconnect runs cleanly. Other errors are interesting though.
+			if strings.Contains(err.Error(), "i/o timeout") {
+				c.logger.Debug("box websocket idle reconnect", "retry_in", backoff)
+				c.prevEndedIdle = true
+			} else {
+				c.logger.Warn("box websocket connection lost", "err", err, "retry_in", backoff)
+				c.prevEndedIdle = false
+			}
+		} else {
+			c.prevEndedIdle = false
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		// Cap kept low (8s, not 30s) so STM reattaches quickly after the box
+		// wakes from a deep/overnight standby. The lost first press after such a
+		// standby is recovered by the OnConnected hook below, but a short
+		// reconnect window shrinks how long the box shows "service unavailable"
+		// before STM takes over.
+		if backoff < 8*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+func (c *Client) runOnce(ctx context.Context) error {
+	dialer := *websocket.DefaultDialer
+	dialer.Subprotocols = []string{"gabbo"}
+	dialer.HandshakeTimeout = 10 * time.Second
+
+	conn, _, err := dialer.DialContext(ctx, c.url, http.Header{})
+	if err != nil {
+		return fmt.Errorf("dial: %w", err)
+	}
+	defer conn.Close()
+	c.setConnected(true)
+	defer c.setConnected(false)
+
+	// Make this socket the one Send writes on, for as long as it lives. A send
+	// arriving after this returns finds nil and fails cleanly rather than
+	// writing into a closed connection.
+	c.setSendConn(conn)
+	defer c.setSendConn(nil)
+
+	// Phase marker at WARN so a reconnect after standby/resume is visible in
+	// the diagnostic bundle without raising log level. A reconnect after a
+	// plain idle self-timeout logs at Debug instead: that churn (a full WARN +
+	// re-sync block every ~11 min) rotated the 32 KB NAND log in ~3.5 h and
+	// destroyed the actual failure evidence in the 2026-07-26 field bundle.
+	if c.prevEndedIdle {
+		c.logger.Debug("box websocket phase: connected (after idle reconnect)", "url", c.url)
+	} else {
+		c.logger.Warn("box websocket phase: connected", "url", c.url)
+	}
+
+	// After a deep/overnight standby the box wakes and emits its first
+	// preset/now-selection frame BEFORE this reconnect lands (the backoff had
+	// grown while the box was unreachable), so that first hardware press is lost
+	// and nothing plays until a second press. Give the handler a chance to
+	// recover a stuck wake on every (re)connect. Optional interface so handlers
+	// that do not need it (tests) are unaffected; run in a goroutine so the probe
+	// never blocks the reader loop.
+	if oc, ok := c.handler.(interface{ OnConnected(context.Context) }); ok {
+		go oc.OnConnected(ctx)
+	}
+
+	// Application-level keepalive: the box never sends keepalive frames and its
+	// WS server drops an idle connection after ~10 min, which forced a stuck
+	// ~10.5 min reconnect cadence that lost preset frames in every gap.
+	// Ping it every wsKeepaliveInterval so the socket stays alive. WriteControl
+	// is the only writer and is safe to call concurrently with the reader. The
+	// goroutine exits when this runOnce returns (conn.Close unblocks the read
+	// and closeKeepalive is closed) or when ctx is cancelled.
+	// The box answers our keepalive pings with pongs, but gorilla/websocket
+	// consumes pongs INSIDE ReadMessage without returning from it: without a
+	// pong handler the per-iteration read deadline below was never refreshed
+	// while the reader blocked on an idle socket, so the client tore down its
+	// own healthy connection like clockwork (live: 18 reconnects at
+	// 674.5 s +-0.2 s in the 2026-07-26 ST10 bundle = 660 s deadline + capped
+	// backoff + re-sync tail). The June keepalive fix only moved the old
+	// ~10.5 min firmware-drop cadence to this ~11.2 min self-timeout. With
+	// each pong pushing the deadline, it now fires only on a genuinely dead
+	// peer.
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+	})
+
+	closeKeepalive := make(chan struct{})
+	defer close(closeKeepalive)
+	go func() {
+		t := time.NewTicker(wsKeepaliveInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-closeKeepalive:
+				return
+			case <-t.C:
+				if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteTimeout)); err != nil {
+					// A failed ping means the socket is gone; close it so the
+					// reader returns and Run reconnects. Debug, not Warn: an idle
+					// reconnect is routine and must not spam the NAND log.
+					c.logger.Debug("box websocket keepalive ping failed, reconnecting", "err", err)
+					_ = conn.Close()
+					return
+				}
+				c.logger.Debug("box websocket keepalive ping sent")
+			}
+		}
+	}()
+
+	// Reader Loop
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Read deadline sits above two keepalive intervals; the pong handler
+		// above refreshes it on every keepalive answer, so it only fires on a
+		// genuinely dead peer (no pong, no data). Reconnect stays clean:
+		// OnConnected resyncs box state on every reconnect.
+		_ = conn.SetReadDeadline(time.Now().Add(wsReadDeadline))
+		mt, data, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("read: %w", err)
+		}
+		if mt != websocket.TextMessage && mt != websocket.BinaryMessage {
+			continue
+		}
+		c.handleMessage(ctx, data)
+	}
+}

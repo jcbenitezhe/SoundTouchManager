@@ -1,0 +1,88 @@
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+    <dict>
+        <key>CFBundlePackageType</key>
+        <string>APPL</string>
+        <key>CFBundleName</key>
+        <string>{{.Info.ProductName}}</string>
+        <key>CFBundleExecutable</key>
+        <string>{{.OutputFilename}}</string>
+        <!-- A real reverse-DNS identifier, not the Wails template default. That
+             default expands to "com.wails.ST Manager", WITH A SPACE, which is not
+             a valid bundle identifier: Apple specifies alphanumerics, hyphens
+             and periods. macOS keys a lot on this string, including the
+             local-network permission below and the Gatekeeper decision, so it
+             has to be well formed before the app is signed and notarized.
+
+             Changing it makes macOS treat this as a different app, so an
+             existing install is asked for local-network access once more. That
+             happens anyway the moment the signing identity changes from ad-hoc
+             to a real certificate, so it costs nothing extra to fix it here. -->
+        <key>CFBundleIdentifier</key>
+        <string>io.github.jcbenitezhe.soundtouchmanager</string>
+        <key>CFBundleVersion</key>
+        <string>{{.Info.ProductVersion}}</string>
+        <key>CFBundleGetInfoString</key>
+        <string>{{.Info.Comments}}</string>
+        <key>CFBundleShortVersionString</key>
+        <string>{{.Info.ProductVersion}}</string>
+        <key>CFBundleIconFile</key>
+        <string>iconfile</string>
+        <!-- macOS 12 is a HARD floor, not a preference. The Go toolchain STM is
+             built with resolves Security.framework symbols lazily, and one of
+             them, SecTrustCopyCertificateChain, only exists from macOS 12. On an
+             older system the app launches, shows its window, and then dies the
+             instant it makes its first HTTPS call, which is the moment Wi-Fi
+             comes up and the radio catalogue is queried:
+
+               dyld: lazy symbol binding failed: Symbol not found:
+                     _SecTrustCopyCertificateChain
+               Service exited with abnormal code: 2
+
+             Reported as "the app closes as soon as Wi-Fi is on" (2026-07-28,
+             Intel Broadwell Mac). This key used to say 10.13, so macOS launched
+             it and let it crash with no explanation. Declaring the real floor
+             makes macOS refuse the launch and say why. -->
+        <key>LSMinimumSystemVersion</key>
+        <string>12.0</string>
+        <key>NSHighResolutionCapable</key>
+        <string>true</string>
+        <key>NSHumanReadableCopyright</key>
+        <string>{{.Info.Copyright}}</string>
+        <!-- Local-network privacy (macOS 15+/26): the app discovers speakers via
+             mDNS/Bonjour and talks to them over HTTP on the LAN. Without these
+             keys the permission prompt can silently misbehave and every probe
+             fails while curl works from Terminal (#420). Template base is the
+             Wails CLI v2.12.0 default (the version release.yml pins); do not use
+             template funcs that version lacks, e.g. safeBundleID (v2.13+). -->
+        <key>NSLocalNetworkUsageDescription</key>
+        <string>ST Manager discovers and controls your SoundTouch speakers on your local network.</string>
+        <!-- ALL FOUR types discovery/discovery.go browses, not just two. macOS
+             only permits the service types listed here, so the two that were
+             missing simply never resolved: speakers still running the pre-rename
+             agent (_soundtouchstick._tcp) and stock speakers that announce under
+             the alternate spelling (_bose-soundtouch._tcp) were invisible on a
+             Mac while they showed up fine on Windows. Keep this list in step
+             with ServiceType / LegacyServiceType / StockServiceType and
+             StockServiceTypeAliases. -->
+        <key>NSBonjourServices</key>
+        <array>
+            <string>_stmanager._tcp</string>
+            <string>_soundtouchstick._tcp</string>
+            <string>_soundtouch._tcp</string>
+            <string>_bose-soundtouch._tcp</string>
+        </array>
+        <!-- The app writes the installer onto a USB stick under /Volumes, which
+             macOS 13+ gates behind a removable-volumes permission. Without this
+             key the prompt appears with no explanation of what is being asked. -->
+        <key>NSRemovableVolumesUsageDescription</key>
+        <string>ST Manager writes the speaker installer onto your USB stick.</string>
+        <!-- Station previews play radio streams in the web view, and many
+             stations still serve plain http. -->
+        <key>NSAppTransportSecurity</key>
+        <dict>
+            <key>NSAllowsArbitraryLoadsForMedia</key>
+            <true/>
+        </dict>
+    </dict>
+</plist>
