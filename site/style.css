@@ -84,9 +84,22 @@ a:hover { color: var(--brand-dark); }
 #android p { color: var(--muted); max-width: 720px; }
 .phones {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
   margin: 8px 0 28px;
+  max-width: 560px;
+}
+@media (min-width: 900px) {
+  .phones {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    max-width: 720px;
+  }
+}
+@media (max-width: 520px) {
+  .phones {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    max-width: none;
+  }
 }
 .phones figure { margin: 0; }
 .phones img {
