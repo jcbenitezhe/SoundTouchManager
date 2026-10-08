@@ -12,6 +12,19 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SoundTouchManager-1.0.0-Windows.exe"><img alt="Download for Windows" src="https://img.shields.io/badge/Windows-download-1668d9?style=for-the-badge"></a>
+  <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SoundTouchManager-1.0.0-macOS.dmg"><img alt="Download for macOS" src="https://img.shields.io/badge/macOS-download-1668d9?style=for-the-badge"></a>
+  <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SoundTouchManager-1.0.0-Linux-x64.tar.gz"><img alt="Download for Linux" src="https://img.shields.io/badge/Linux-download-1668d9?style=for-the-badge"></a>
+  <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SoundTouchManager-1.0.0.apk"><img alt="Download for Android" src="https://img.shields.io/badge/Android-download-1668d9?style=for-the-badge"></a>
+</p>
+
+<p align="center">
+  macOS is Apple Silicon (M1 or newer).
+  If a browser blocks the Windows file, use the <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SoundTouchManager-1.0.0-Windows.zip">zip</a>.
+  Check the download against <a href="https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/SHA256SUMS">SHA256SUMS</a>.
+</p>
+
+<p align="center">
   <img src="docs/screenshots/en/app-listen.png" alt="SoundTouch Manager desktop app" width="820">
 </p>
 
@@ -23,11 +36,12 @@ The desktop app finds the speaker on the network, reaches it on its setup port a
 
 ## Opening the desktop app the first time
 
-Download the macOS, Windows, or Linux build from the [latest release](https://github.com/jcbenitezhe/SoundTouchManager/releases/latest). The desktop app keeps the PayPal and Ko-fi support links. A first launch often shows a warning because the download is a new file from the internet. The warning does not mean the file is damaged.
+Use the download buttons above. The desktop app keeps the PayPal and Ko-fi support links. A first launch often shows a warning because the download is a new file from the internet. The warning does not mean the file is damaged.
 
-- **Windows (SmartScreen):** click **More info**, then **Run anyway**.
-- **macOS (Gatekeeper):** right-click the app, choose **Open**, then **Open** again. Or open **System Settings, Privacy & Security** and click **Open Anyway**.
-- **Linux:** mark the AppImage as executable (`chmod +x`) and open it. A dialog that the file is untrusted is the same kind of first-run check; allow it if the download came from the release above.
+- **Windows (SmartScreen):** click **More info**, then **Run anyway**. If the browser blocks the .exe, download the zip and open the file inside.
+- **macOS (Gatekeeper):** open the disk image and drag SoundTouch Manager to Applications. Right-click the app, choose **Open**, then **Open** again. Or open **System Settings, Privacy & Security** and click **Open Anyway**.
+- **Linux:** extract the archive, run `chmod +x SoundTouchManager-1.0.0-Linux-x64`, and open it. It needs GTK 3 and WebKitGTK 4.1.
+- **Android:** open the APK. Allow the install from your browser or the Files app, and if Play Protect blocks it choose **More details**, then **Install anyway**. Support purchases inside this copy do not go through; those work in the Play Store version.
 
 Compare the file with the `SHA256SUMS` attached to that same release before you open it.
 
