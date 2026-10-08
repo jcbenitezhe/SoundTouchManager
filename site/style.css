@@ -82,6 +82,21 @@ a:hover { color: var(--brand-dark); }
   border-radius: var(--radius); border: 1px solid var(--border); box-shadow: var(--shadow);
 }
 #android p { color: var(--muted); max-width: 720px; }
+.phones {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+  margin: 8px 0 28px;
+}
+.phones figure { margin: 0; }
+.phones img {
+  width: 100%; height: auto; display: block;
+  border-radius: 18px; border: 1px solid var(--border); box-shadow: var(--shadow);
+}
+.phones figcaption {
+  margin-top: 8px; text-align: center;
+  font-size: 14px; font-weight: 700;
+}
 
 /* Sections */
 section { padding: 48px 0 8px; }
