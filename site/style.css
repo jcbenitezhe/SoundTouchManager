@@ -78,9 +78,10 @@ a:hover { color: var(--brand-dark); }
 .hero small { display: block; margin-top: 12px; color: var(--muted); }
 
 .shot {
-  display: block; width: 100%; height: auto; margin: 36px auto 0;
+  display: block; width: 100%; height: auto; margin: 28px auto 0;
   border-radius: var(--radius); border: 1px solid var(--border); box-shadow: var(--shadow);
 }
+#android p { color: var(--muted); max-width: 720px; }
 
 /* Sections */
 section { padding: 48px 0 8px; }
