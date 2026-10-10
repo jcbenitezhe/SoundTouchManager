@@ -257,7 +257,7 @@ html.stm-mobile:not(.a11y-light):not(.a11y-contrast) .m-bar {
     overflow: hidden;
   }
   #presets .preset-bitrate { font-size: 10.5px; }
-  /* "Hold to save" is a mouse hint; the long-press itself still works. */
+  /* "Hold to save" is a mouse hint. On a phone a held finger does nothing. */
   #presets .preset-hint { display: none; }
 
   /* Rows that were laid out for a window: let them wrap instead of
@@ -273,6 +273,16 @@ html.stm-mobile:not(.a11y-light):not(.a11y-contrast) .m-bar {
   .actions-grid { grid-template-columns: minmax(0, 1fr); gap: 6px; }
   .actions-grid > .btn { white-space: normal; }
   .actions-grid > p { margin-bottom: 8px; }
+}
+
+/* A finger that starts on a preset or the volume row and moves down is a
+   page scroll. pan-y tells the browser to keep that gesture, so the control
+   does not also treat it as a tap or a slider drag. A sideways move on the
+   slider is still the volume. */
+html.stm-mobile .preset,
+html.stm-mobile input[type="range"],
+html.stm-mobile .vol-step {
+  touch-action: pan-y;
 }
 
 html.stm-mobile #addStationTopBtn {

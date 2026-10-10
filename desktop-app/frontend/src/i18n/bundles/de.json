@@ -1030,6 +1030,11 @@
   "settingsView.wlanNotVisibleBody": "Der Lautsprecher findet <b>{{ssid}}</b> bei seiner eigenen Suche nicht, er kann sich also möglicherweise nicht damit verbinden. Netzwerke, die der Lautsprecher sieht: {{visible}}. Trotzdem wechseln?",
   "settingsView.wlanForceBtn": "Trotzdem wechseln",
   "settingsView.wlanSsidEmpty": "SSID darf nicht leer sein",
+  "settingsView.wlanErrUnreachable": "Das Telefon konnte das Gespräch mit dem Lautsprecher nicht zu Ende führen, deshalb hat sich das WLAN nicht geändert. Telefon und Lautsprecher im selben WLAN lassen, prüfen dass der Lautsprecher an ist, und erneut versuchen.",
+  "settingsView.wlanErrPassShort": "Das Passwort ist zu kurz. Ein geschütztes WLAN braucht mindestens 8 Zeichen.",
+  "settingsView.wlanErrPassEmpty": "Das Passwort fehlt. Vor dem Wechsel eintragen. Ohne Passwort wechselt der Lautsprecher nicht in ein geschütztes Netz.",
+  "settingsView.wlanErrSave": "Der Lautsprecher konnte das neue WLAN nicht speichern und bleibt im bisherigen Netz.",
+  "settingsView.wlanErrGeneric": "Der WLAN-Wechsel ist nicht durchgegangen. Der Lautsprecher bleibt im bisherigen Netz.",
   "settingsView.wlanSwitchedToast": "WLAN umgeschaltet. Lautsprecher bekommt eine neue IP, gleich Liste neu suchen.",
   "settingsView.wlanRebootingToast": "Neues WLAN wird angewendet. Der Portable startet dafür neu und ist in ein paar Minuten zurück, dann die Liste erneut durchsuchen.",
   "settingsView.sourcesHeading": "Quellen",
@@ -1674,5 +1679,7 @@
   "tunein.openEpisodes": "Folgen",
   "tunein.episodeNoPreset": "Folgen laufen einmal und lassen sich nicht auf eine Taste legen. Speichere stattdessen den Sender.",
   "tunein.sharedTitle": "Aus TuneIn geteilt",
-  "tunein.saveToKey": "Auf Taste speichern"
+  "tunein.saveToKey": "Auf Taste speichern",
+  "tunein.starred": "Favoriten",
+  "tunein.starredEmpty": "Noch keine Favoriten. Tippe bei einem Sender auf den Stern, um ihn hier abzulegen."
 }

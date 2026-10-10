@@ -25,6 +25,7 @@ let deps = {
   currentBox: () => null,
   toggleFav: () => false,
   isFav: () => false,
+  favStations: () => [],
   isPlaying: () => false,
   pause: async () => {},
 };
@@ -38,6 +39,8 @@ const ui = {
   shared: null,
   loading: false,
   rendered: false,
+  // Search is the tab the view always opens on. Starred is a second pane.
+  pane: 'search',
 };
 
 export function initTuneInView(injected) {
@@ -50,6 +53,17 @@ export function looksLikeTuneInLink(text) {
   const s = String(text || '').trim();
   if (/^[spt]\d{1,12}$/i.test(s)) return true;
   return /(^|\s|\/\/)(www\.)?(tunein\.com|tun\.in)\//i.test(s);
+}
+
+// guideIdOf returns the TuneIn id stored on a favorite ("tunein:s345726" -> "s345726").
+export function guideIdOf(station) {
+  const ref = String((station && (station.stationuuid || station.url)) || '');
+  return ref.startsWith('tunein:') ? ref.slice('tunein:'.length) : '';
+}
+
+// tuneInFavorites keeps only TuneIn stations out of the shared favorites list.
+export function tuneInFavorites(stations) {
+  return (stations || []).filter(s => guideIdOf(s));
 }
 
 // stationFromInfo turns a TuneInStationInfo reply into the station object the
@@ -90,6 +104,10 @@ export function renderTuneIn() {
           <h2 class="tunein-title">TuneIn</h2>
           <p class="muted">${escapeHtml(t('tunein.lead'))}</p>
         </div>
+        <div class="tunein-tabs" role="tablist">
+          <button type="button" class="btn tunein-tab is-on" id="tuneinTabSearch" role="tab">${escapeHtml(t('tunein.search'))}</button>
+          <button type="button" class="btn tunein-tab" id="tuneinTabStarred" role="tab">${escapeHtml(t('tunein.starred'))}</button>
+        </div>
         <form class="tunein-search" id="tuneinSearchForm" role="search">
           <input type="search" id="tuneinQuery" class="input" autocomplete="off"
             placeholder="${escapeAttr(t('tunein.searchPlaceholder'))}" aria-label="${escapeAttr(t('tunein.searchPlaceholder'))}"/>
@@ -105,8 +123,14 @@ export function renderTuneIn() {
       e.preventDefault();
       submitQuery($('tuneinQuery').value);
     };
+    $('tuneinTabSearch').onclick = () => showSearch();
+    $('tuneinTabStarred').onclick = () => showStarred();
     ui.rendered = true;
   }
+  // Opening the view always lands on Search. Starred stays one tap away.
+  ui.pane = 'search';
+  showSearchChrome(true);
+  markTabs();
   renderShared();
   if (!ui.page && !ui.loading) openRef('', t('tunein.home'), true);
   else renderPage();
@@ -129,6 +153,9 @@ export async function openTuneInShare(text) {
 async function submitQuery(raw) {
   const q = String(raw || '').trim();
   if (!q) return;
+  ui.pane = 'search';
+  showSearchChrome(true);
+  markTabs();
   if (looksLikeTuneInLink(q)) {
     await openTuneInShare(q);
     return;
@@ -168,6 +195,7 @@ function goBack() {
 function renderPage() {
   const nav = $('tuneinNav');
   const list = $('tuneinList');
+  if (ui.pane === 'starred') return;
   if (!nav || !list || !ui.page) return;
   nav.innerHTML = `
     ${ui.stack.length ? `<button class="btn btn-secondary btn-mini" id="tuneinBack">&larr; ${escapeHtml(t('tunein.back'))}</button>` : ''}
@@ -215,7 +243,7 @@ function itemHtml(it, flat) {
     <div class="result-actions">
       ${playButtonHtml('tunein:' + it.guideId, `data-i="${i}"`)}
       ${it.kind === 'station' ? `
-      <button class="btn btn-mini tunein-pick" data-i="${i}" title="${escapeAttr(t('search.assignToKey'))}">&#10133;</button>
+      <button class="btn btn-mini tunein-pick" data-i="${i}" title="${escapeAttr(t('search.assignToKey'))}">+</button>
       <button class="btn btn-mini tunein-fav${fav ? ' is-fav' : ''}" data-i="${i}" title="${escapeAttr(fav ? t('search.removeFav') : t('search.addFav'))}">${fav ? '&#9733;' : '&#9734;'}</button>` : ''}
     </div>
   </div>`;
@@ -236,12 +264,77 @@ function wireItems(root, flat) {
   });
   root.querySelectorAll('.tunein-fav').forEach(b => {
     b.onclick = () => withInfo(flat[+b.dataset.i], (info) => {
-      const now = deps.toggleFav(stationFromInfo(info));
-      b.classList.toggle('is-fav', now);
-      b.innerHTML = now ? '&#9733;' : '&#9734;';
-      b.title = now ? t('search.removeFav') : t('search.addFav');
+      deps.toggleFav(stationFromInfo(info));
+      if (ui.pane === 'starred') renderStarred();
+      else {
+        const now = deps.isFav(stationFromInfo(info));
+        b.classList.toggle('is-fav', now);
+        b.innerHTML = now ? '&#9733;' : '&#9734;';
+        b.title = now ? t('search.removeFav') : t('search.addFav');
+      }
     });
   });
+}
+
+function showSearchChrome(on) {
+  const form = $('tuneinSearchForm');
+  const hint = document.querySelector('#view-tunein .tunein-share-hint');
+  const nav = $('tuneinNav');
+  if (form) form.classList.toggle('hidden', !on);
+  if (hint) hint.classList.toggle('hidden', !on);
+  if (nav) nav.classList.toggle('hidden', !on);
+}
+
+function markTabs() {
+  const search = $('tuneinTabSearch');
+  const starred = $('tuneinTabStarred');
+  if (search) {
+    search.classList.toggle('is-on', ui.pane !== 'starred');
+    search.setAttribute('aria-selected', ui.pane !== 'starred' ? 'true' : 'false');
+  }
+  if (starred) {
+    starred.classList.toggle('is-on', ui.pane === 'starred');
+    starred.setAttribute('aria-selected', ui.pane === 'starred' ? 'true' : 'false');
+  }
+}
+
+function showSearch() {
+  ui.pane = 'search';
+  showSearchChrome(true);
+  markTabs();
+  if (ui.page) renderPage();
+  else if (!ui.loading) openRef('', t('tunein.home'), true);
+}
+
+function showStarred() {
+  ui.pane = 'starred';
+  showSearchChrome(false);
+  markTabs();
+  renderStarred();
+}
+
+function favToItem(s) {
+  return {
+    kind: 'station',
+    guideId: guideIdOf(s),
+    text: s.name || guideIdOf(s),
+    image: s.favicon || '',
+    subtext: s.country || s.tags || '',
+    bitrate: s.bitrate || 0,
+  };
+}
+
+function renderStarred() {
+  const list = $('tuneinList');
+  if (!list) return;
+  const favs = tuneInFavorites(deps.favStations());
+  if (!favs.length) {
+    list.innerHTML = `<div class="muted">${escapeHtml(t('tunein.starredEmpty'))}</div>`;
+    return;
+  }
+  const flat = [];
+  list.innerHTML = favs.map(s => itemHtml(favToItem(s), flat)).join('');
+  wireItems(list, flat);
 }
 
 // withInfo checks an item with the backend (is there a stream the speaker can

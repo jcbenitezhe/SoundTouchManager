@@ -193,6 +193,9 @@ import {
   showToast,
   hideToast,
   compareVerBuild,
+  gestureScrolled,
+  verticalScrollGesture,
+  quickTap,
   getBoxLabel,
   savePresetCase,
   dismissNotice,
@@ -393,6 +396,7 @@ initTuneInView({
   currentBox: () => state.currentBox,
   toggleFav: (s) => toggleFav(s),
   isFav: (s) => isFav(s),
+  favStations: () => loadFavStore(),
   isPlaying: (ref) => searchRowIsPlaying({ stationuuid: ref, url: ref }),
   pause: async () => {
     // Show play again right away; the status poll confirms the pause.
@@ -1775,7 +1779,17 @@ if (musicVolEl) {
   // speaker WHILE they wipe, not only on release. The throttle
   // collapses bursts so the box's tiny HTTP server never has more
   // than one volume PUT in flight at a time.
+  // A downward finger on the slider is the page scrolling. Remember the level
+  // at touch and put it back if the gesture goes vertical, so a scroll does
+  // not blast the speaker. A sideways drag still changes the volume.
+  let volAnchor = null;
+  const revertVolScroll = () => {
+    if (!volAnchor || !volAnchor.scroll) return;
+    musicVolEl.value = volAnchor.value;
+    if (musicVolValEl) musicVolValEl.textContent = volAnchor.value;
+  };
   musicVolEl.oninput = () => {
+    if (volAnchor && volAnchor.scroll) { revertVolScroll(); return; }
     if (musicVolValEl) musicVolValEl.textContent = musicVolEl.value;
     const box = state.currentBox;
     if (!box) return;
@@ -1786,6 +1800,7 @@ if (musicVolEl) {
   // Keyboard arrows fire only `change`, not `input`, so we still
   // dispatch on change as a safety net for that path.
   musicVolEl.onchange = () => {
+    if (volAnchor && volAnchor.scroll) { revertVolScroll(); return; }
     musicVolBox = state.currentBox;
     if (!musicVolBox) return;
     state.desiredVolume = parseInt(musicVolEl.value, 10);
@@ -1796,12 +1811,26 @@ if (musicVolEl) {
   // wired above, so the busy flag is unnecessary there. Add a
   // ~1.2 s grace period after release so the network round-trip
   // to the box (and its own state update) does not race with us.
-  const beginBusy = () => { state.musicVolBusy = true; };
+  const beginBusy = (e) => {
+    state.musicVolBusy = true;
+    if (e && e.clientX != null) {
+      volAnchor = { x: e.clientX, y: e.clientY, value: musicVolEl.value, scroll: false };
+    }
+  };
   const endBusy = () => {
+    revertVolScroll();
+    volAnchor = null;
     state.musicVolBusy = false;
     state.musicVolUntil = Date.now() + 1200;
   };
   musicVolEl.addEventListener('pointerdown', beginBusy);
+  musicVolEl.addEventListener('pointermove', (e) => {
+    if (!volAnchor || volAnchor.scroll) return;
+    if (verticalScrollGesture(volAnchor.x, volAnchor.y, e.clientX, e.clientY)) {
+      volAnchor.scroll = true;
+      revertVolScroll();
+    }
+  });
   musicVolEl.addEventListener('pointerup', endBusy);
   musicVolEl.addEventListener('pointercancel', endBusy);
   musicVolEl.addEventListener('pointerleave', () => {
@@ -1831,8 +1860,36 @@ if (musicVolEl) {
   const volUp = $('volUp');
   // Focusing the slider on a button press also arms the wheel gesture below, so
   // a user can click "+" once and then keep scrolling to fine-tune.
-  if (volDown) volDown.onclick = () => { musicVolEl.focus(); stepVolume(-1); };
-  if (volUp) volUp.onclick = () => { musicVolEl.focus(); stepVolume(1); };
+  // A tap steps the volume. A finger that moves was scrolling past the button.
+  const bindVolTap = (el, delta) => {
+    let origin = null;
+    let dragged = false;
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== undefined && e.button !== 0) return;
+      origin = { x: e.clientX, y: e.clientY };
+      dragged = false;
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!origin || dragged) return;
+      if (gestureScrolled(origin.x, origin.y, e.clientX, e.clientY)) dragged = true;
+    });
+    el.addEventListener('pointerup', () => {
+      const skip = dragged;
+      origin = null;
+      if (skip) return;
+      musicVolEl.focus();
+      stepVolume(delta);
+    });
+    el.addEventListener('pointercancel', () => { origin = null; dragged = true; });
+    el.addEventListener('click', (e) => {
+      if (!dragged) return;
+      e.preventDefault();
+      e.stopPropagation();
+      dragged = false;
+    });
+  };
+  if (volDown) bindVolTap(volDown, -1);
+  if (volUp) bindVolTap(volUp, 1);
 
   // Mouse wheel over the slider adjusts the volume, but ONLY while the slider is
   // focused (the user clicked it or used the +/- buttons). Passively scrolling
@@ -6969,6 +7026,13 @@ function attachPresetHandlers(el, slot, preset, opts = {}) {
   let armed = false;
   let firedLong = false;
   let startedAt = 0;
+  // A finger that moves is scrolling the page, not pressing the key. Android
+  // also synthesizes a mouse click after the touch, so a touch gesture has to
+  // swallow that follow-up or the preset plays when the user only scrolled.
+  let originX = 0;
+  let originY = 0;
+  let dragged = false;
+  let touchGesture = false;
   const bar = el.querySelector('.long-press-bar');
   const animateBar = () => {
     if (!armed) return;
@@ -6982,13 +7046,20 @@ function attachPresetHandlers(el, slot, preset, opts = {}) {
     if (bar) bar.style.width = pct + '%';
     if (armed) requestAnimationFrame(animateBar);
   };
-  const start = (e) => {
+  const start = (e, fromTouch) => {
     if (e.button !== undefined && e.button !== 0) return; // left click only
     // A press on one of the icons in the key's header is not a press on the key.
     if (isKeyChrome(e.target)) return;
+    const pt = e.touches ? e.touches[0] : e;
+    originX = pt.clientX;
+    originY = pt.clientY;
+    dragged = false;
     armed = true; // we start the hold
     firedLong = false; // true once long press fires
     startedAt = Date.now();
+    // A finger held on a preset is a rest or the start of a scroll, not a
+    // command. The desktop mouse hold still saves the station onto the key.
+    if (fromTouch) return;
     visualTimer = setTimeout(() => {
       if (!armed) return;
       el.classList.add('long-press');
@@ -7015,20 +7086,47 @@ function attachPresetHandlers(el, slot, preset, opts = {}) {
     el.classList.remove('long-press');
     if (bar) bar.style.width = '0%';
   };
-  const finish = (e) => {
+  const noteDrag = (e) => {
+    if (!armed || dragged) return;
+    const pt = e.touches ? e.touches[0] : e;
+    if (!pt) return;
+    if (gestureScrolled(originX, originY, pt.clientX, pt.clientY)) {
+      dragged = true;
+      cancel();
+    }
+  };
+  const finish = (e, fromTouch) => {
     if (isKeyChrome(e.target)) return;
+    const heldFor = Date.now() - startedAt;
+    const moved = dragged;
+    if (dragged) {
+      dragged = false;
+      cancel();
+      return;
+    }
     const wasArmed = armed;
     cancel();
     if (!wasArmed) return;
     if (firedLong) return;
+    // Releasing a held finger must not play. Only a quick tap does.
+    if (fromTouch && !quickTap(heldFor, moved)) return;
     if (preset) onPlay();
   };
-  el.addEventListener('mousedown', start);
-  el.addEventListener('mouseup', finish);
+  el.addEventListener('mousedown', (e) => { if (touchGesture) return; start(e, false); });
+  el.addEventListener('mouseup', (e) => {
+    if (touchGesture) { touchGesture = false; return; }
+    finish(e, false);
+  });
+  el.addEventListener('mousemove', (e) => { if (e.buttons === 1) noteDrag(e); });
   el.addEventListener('mouseleave', cancel);
-  el.addEventListener('touchstart', (e) => { start(e); }, { passive: true });
-  el.addEventListener('touchend', (e) => { finish(e); });
-  el.addEventListener('touchcancel', cancel);
+  el.addEventListener('touchstart', (e) => { touchGesture = true; start(e, true); }, { passive: true });
+  el.addEventListener('touchmove', noteDrag, { passive: true });
+  el.addEventListener('touchend', (e) => {
+    finish(e, true);
+    // The synthetic mouseup follows the touch. Keep swallowing it briefly.
+    setTimeout(() => { touchGesture = false; }, 700);
+  });
+  el.addEventListener('touchcancel', () => { dragged = true; cancel(); });
 }
 
 // APP_PLAY_FRESH_MS is how long the app trusts its own record of an ad-hoc

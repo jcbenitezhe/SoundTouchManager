@@ -610,6 +610,10 @@ export function SuggestBoxLanguage(arg1, arg2) {
   return window['go']['main']['App']['SuggestBoxLanguage'](arg1, arg2);
 }
 
+export function SwitchBoxWLAN(arg1, arg2, arg3, arg4, arg5, arg6) {
+  return window['go']['main']['App']['SwitchBoxWLAN'](arg1, arg2, arg3, arg4, arg5, arg6);
+}
+
 export function SyncBoxPresets(arg1, arg2) {
   return window['go']['main']['App']['SyncBoxPresets'](arg1, arg2);
 }

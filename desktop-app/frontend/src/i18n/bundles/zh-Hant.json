@@ -1024,6 +1024,11 @@
   "settingsView.wlanNotVisibleBody": "喇叭在自己的掃描中找不到 <b>{{ssid}}</b>，因此可能無法連上。喇叭看得到的網路：{{visible}}。還是要切換嗎？",
   "settingsView.wlanForceBtn": "還是要切換",
   "settingsView.wlanSsidEmpty": "SSID 不能空白",
+  "settingsView.wlanErrUnreachable": "手機沒能跟喇叭講完，所以 Wi-Fi 沒有更換。請讓手機和喇叭留在同一個 Wi-Fi，確認喇叭還開著，再試一次。",
+  "settingsView.wlanErrPassShort": "密碼太短。有密碼的 Wi-Fi 至少要 8 個字元。",
+  "settingsView.wlanErrPassEmpty": "還沒有密碼。更換前請先輸入。沒有密碼的話，喇叭不會切到有保護的網路。",
+  "settingsView.wlanErrSave": "喇叭無法儲存新的 Wi-Fi，所以仍停在目前的網路。",
+  "settingsView.wlanErrGeneric": "Wi-Fi 沒有換成新的。喇叭仍停在目前的網路。",
   "settingsView.wlanSwitchedToast": "Wi-Fi 已切換。喇叭正在取得新的 IP，過一會兒再重新搜尋清單。",
   "settingsView.wlanRebootingToast": "正在套用新的 Wi-Fi。Portable 會為此重新開機，幾分鐘後就回來，然後再重新搜尋清單。",
   "settingsView.sourcesHeading": "音源",
@@ -1668,5 +1673,7 @@
   "tunein.openEpisodes": "單集",
   "tunein.episodeNoPreset": "單集只播放一次，無法儲存到按鍵。請改為儲存電台。",
   "tunein.sharedTitle": "從 TuneIn 分享",
-  "tunein.saveToKey": "儲存到按鍵"
+  "tunein.saveToKey": "儲存到按鍵",
+  "tunein.starred": "收藏",
+  "tunein.starredEmpty": "還沒有收藏。點電台上的星星就能加到這裡。"
 }

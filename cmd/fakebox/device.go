@@ -45,6 +45,7 @@ type Snapshot struct {
 type Device struct {
 	mu       sync.Mutex
 	name     string
+	id       string // SoundTouch device ID; defaults to fakeDeviceID
 	model    string
 	account  string
 	presets  [6]*Preset
@@ -54,6 +55,10 @@ type Device struct {
 	pendName string
 	log      []string
 
+	zone      zoneState
+	zoneGen   int
+	zonePolls map[string]zonePoll
+
 	bus *Bus // gabbo frames to the agent
 	ui  *Bus // JSON snapshots to the control page
 }
@@ -61,6 +66,7 @@ type Device struct {
 func newDevice(name, model string) *Device {
 	return &Device{
 		name:   name,
+		id:     fakeDeviceID,
 		model:  model,
 		volume: 30,
 		play:   Playback{Source: "INVALID_SOURCE", State: "STOP_STATE"},
@@ -154,7 +160,7 @@ func (d *Device) PressPreset(slot int) bool {
 	d.play = Playback{Source: p.Source, Location: p.Location, Name: p.Name, State: "BUFFERING_STATE", Slot: slot}
 	d.note("key %d pressed: %s", slot, p.Name)
 	d.bus.Publish([]byte(fmt.Sprintf(`<updates deviceID="%s"><nowSelectionUpdated>%s</nowSelectionUpdated></updates>`,
-		fakeDeviceID, presetXML(p))))
+		d.id, presetXML(p))))
 	d.bus.Publish([]byte(d.nowPlayingUpdatedLocked()))
 	d.changedLocked()
 	return true
@@ -255,7 +261,7 @@ func (d *Device) SetVolume(v int) {
 	defer d.mu.Unlock()
 	d.volume = v
 	d.bus.Publish([]byte(fmt.Sprintf(`<updates deviceID="%s"><volumeUpdated><volume><targetvolume>%d</targetvolume><actualvolume>%d</actualvolume><muteenabled>false</muteenabled></volume></volumeUpdated></updates>`,
-		fakeDeviceID, v, v)))
+		d.id, v, v)))
 	d.changedLocked()
 }
 
@@ -295,17 +301,17 @@ func (d *Device) PresetsXML() string {
 }
 
 func (d *Device) presetsUpdatedLocked() string {
-	return fmt.Sprintf(`<updates deviceID="%s"><presetsUpdated>%s</presetsUpdated></updates>`, fakeDeviceID, d.presetsLocked())
+	return fmt.Sprintf(`<updates deviceID="%s"><presetsUpdated>%s</presetsUpdated></updates>`, d.id, d.presetsLocked())
 }
 
 func (d *Device) nowPlayingLocked() string {
 	p := d.play
 	if p.Source == "STANDBY" || p.Source == "INVALID_SOURCE" {
 		return fmt.Sprintf(`<nowPlaying deviceID="%s" source="%s"><ContentItem source="%s" isPresetable="false" /></nowPlaying>`,
-			fakeDeviceID, p.Source, p.Source)
+			d.id, p.Source, p.Source)
 	}
 	return fmt.Sprintf(`<nowPlaying deviceID="%s" source="%s" sourceAccount="UPnPUserName"><ContentItem source="%s" location="%s" sourceAccount="UPnPUserName" isPresetable="true"><itemName>%s</itemName></ContentItem><track>%s</track><stationName>%s</stationName><playStatus>%s</playStatus></nowPlaying>`,
-		fakeDeviceID, esc(p.Source), esc(p.Source), esc(p.Location), esc(p.Name), esc(p.Name), esc(p.Name), p.State)
+		d.id, esc(p.Source), esc(p.Source), esc(p.Location), esc(p.Name), esc(p.Name), esc(p.Name), p.State)
 }
 
 // NowPlayingXML is GET /now_playing.
@@ -316,7 +322,7 @@ func (d *Device) NowPlayingXML() string {
 }
 
 func (d *Device) nowPlayingUpdatedLocked() string {
-	return fmt.Sprintf(`<updates deviceID="%s"><nowPlayingUpdated>%s</nowPlayingUpdated></updates>`, fakeDeviceID, d.nowPlayingLocked())
+	return fmt.Sprintf(`<updates deviceID="%s"><nowPlayingUpdated>%s</nowPlayingUpdated></updates>`, d.id, d.nowPlayingLocked())
 }
 
 // InfoXML is GET /info. The software version is the firmware STM targets.
@@ -324,7 +330,7 @@ func (d *Device) InfoXML(ip string) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" ?><info deviceID="%s"><name>%s</name><type>%s</type><margeAccountUUID>%s</margeAccountUUID><components><component><componentCategory>SCM</componentCategory><softwareVersion>27.0.6.46330.5043500 fakebox</softwareVersion><serialNumber>FAKE0000000000000000000</serialNumber></component></components><margeURL>https://streaming.bose.com</margeURL><networkInfo type="SCM"><macAddress>%s</macAddress><ipAddress>%s</ipAddress></networkInfo><moduleType>sm2</moduleType><variant>rhino</variant><variantMode>normal</variantMode><countryCode>US</countryCode><regionCode>US</regionCode></info>`,
-		fakeDeviceID, esc(d.name), esc(d.model), esc(d.account), fakeDeviceID, esc(ip))
+		d.id, esc(d.name), esc(d.model), esc(d.account), d.id, esc(ip))
 }
 
 // VolumeXML is GET /volume.
@@ -332,7 +338,7 @@ func (d *Device) VolumeXML() string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8" ?><volume deviceID="%s"><targetvolume>%d</targetvolume><actualvolume>%d</actualvolume><muteenabled>false</muteenabled></volume>`,
-		fakeDeviceID, d.volume, d.volume)
+		d.id, d.volume, d.volume)
 }
 
 // TransportState is UPnP GetTransportInfo's CurrentTransportState.

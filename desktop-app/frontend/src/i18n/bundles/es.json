@@ -955,6 +955,11 @@
   "settingsView.wlanNotVisibleBody": "El altavoz no encuentra <b>{{ssid}}</b> en su propia búsqueda, por lo que quizá no pueda conectarse. Redes que el altavoz ve: {{visible}}. ¿Cambiar de todos modos?",
   "settingsView.wlanForceBtn": "Cambiar de todos modos",
   "settingsView.wlanSsidEmpty": "El SSID no puede estar vacío",
+  "settingsView.wlanErrUnreachable": "El teléfono no pudo terminar de hablar con el altavoz, así que el Wi-Fi no cambió. Deja el teléfono y el altavoz en la misma red, comprueba que sigue encendido y vuelve a intentarlo.",
+  "settingsView.wlanErrPassShort": "La contraseña es demasiado corta. Una red protegida necesita al menos 8 caracteres.",
+  "settingsView.wlanErrPassEmpty": "Falta la contraseña. Escríbela antes de cambiar. Sin ella el altavoz no se mueve a una red protegida.",
+  "settingsView.wlanErrSave": "El altavoz no pudo guardar el Wi-Fi nuevo, así que sigue en la red de ahora.",
+  "settingsView.wlanErrGeneric": "No se pudo cambiar el Wi-Fi. El altavoz sigue en la red de ahora.",
   "settingsView.wlanSwitchedToast": "Wi-Fi cambiado. El altavoz está obteniendo una nueva IP, busca la lista de nuevo en un momento.",
   "settingsView.wlanRebootingToast": "Aplicando el nuevo Wi-Fi. El Portable se reinicia para esto y vuelve en unos minutos, luego busca la lista de nuevo.",
   "settingsView.sourcesHeading": "Fuentes",
@@ -1674,5 +1679,7 @@
   "tunein.openEpisodes": "Episodios",
   "tunein.episodeNoPreset": "Los episodios se reproducen una vez y no se pueden guardar en un botón. Guarda la estación en su lugar.",
   "tunein.sharedTitle": "Compartido desde TuneIn",
-  "tunein.saveToKey": "Guardar en botón"
+  "tunein.saveToKey": "Guardar en botón",
+  "tunein.starred": "Favoritas",
+  "tunein.starredEmpty": "Aún no tienes favoritas. Toca la estrella de una estación para añadirla aquí."
 }

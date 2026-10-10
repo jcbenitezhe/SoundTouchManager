@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jcbenitezhe/SoundTouchManager/netif"
 	qrcode "github.com/skip2/go-qrcode"
@@ -390,4 +391,80 @@ func (a *App) BoxWifiScan(host string, port int) ([]string, error) {
 		return nil, err
 	}
 	return out.SSIDs, nil
+}
+
+// BoxWLANResult is what the speaker answered to a Wi-Fi change.
+//
+// Ok is true when the speaker accepted the change and is leaving the current
+// network. A refusal the user can answer (the speaker cannot see that name)
+// comes back with Ok false and Code "ssid-not-visible", not as an error: the
+// caller offers "switch anyway". Anything else the speaker refuses, and any
+// failure to reach it, is an error.
+type BoxWLANResult struct {
+	OK        bool     `json:"ok"`
+	Status    string   `json:"status,omitempty"`
+	Mechanism string   `json:"mechanism,omitempty"`
+	SSID      string   `json:"ssid,omitempty"`
+	Code      string   `json:"code,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Visible   []string `json:"visible,omitempty"`
+}
+
+// SwitchBoxWLAN asks the speaker to join ssid.
+//
+// The page used to PUT /api/box/wlan itself. That request is cross-origin:
+// the phone app is served from 127.0.0.1 and the speaker only permits the
+// desktop app's origin, so the browser blocks the call and the UI shows
+// "TypeError: Failed to fetch" before the speaker ever sees it. Going through
+// here sends no Origin, which is the same path the volume and name changes
+// already use.
+//
+// The deadline is longer than the usual box call. The speaker surveys its
+// radio for up to about twelve seconds before it answers, and a client that
+// gives up earlier both shows a failure and can cancel the survey.
+func (a *App) SwitchBoxWLAN(host string, port int, ssid, password string, hidden, force bool) (BoxWLANResult, error) {
+	ssid = strings.TrimSpace(ssid)
+	if strings.TrimSpace(host) == "" || ssid == "" {
+		return BoxWLANResult{}, fmt.Errorf("ssid must not be empty")
+	}
+	body, err := json.Marshal(map[string]any{
+		"ssid":     ssid,
+		"password": password,
+		"hidden":   hidden,
+		"force":    force,
+	})
+	if err != nil {
+		return BoxWLANResult{}, err
+	}
+	resp, err := a.boxDoTimeout(host, port, http.MethodPut, "/api/box/wlan", "application/json", string(body), 20*time.Second)
+	if err != nil {
+		return BoxWLANResult{}, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+	if err != nil {
+		return BoxWLANResult{}, err
+	}
+	var out BoxWLANResult
+	if len(strings.TrimSpace(string(raw))) > 0 {
+		if jerr := json.Unmarshal(raw, &out); jerr != nil && resp.StatusCode == http.StatusOK {
+			return BoxWLANResult{}, jerr
+		}
+	}
+	if resp.StatusCode == http.StatusOK {
+		out.OK = true
+		return out, nil
+	}
+	if resp.StatusCode == http.StatusUnprocessableEntity && out.Code == "ssid-not-visible" {
+		out.OK = false
+		return out, nil
+	}
+	msg := strings.TrimSpace(out.Error)
+	if msg == "" {
+		msg = strings.TrimSpace(string(raw))
+	}
+	if msg == "" {
+		msg = resp.Status
+	}
+	return BoxWLANResult{}, fmt.Errorf("%s", msg)
 }

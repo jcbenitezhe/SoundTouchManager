@@ -11,9 +11,11 @@ name: release
 # Every artifact is attested via Sigstore (actions/attest-build-provenance).
 # Desktop app filenames carry the version so users can tell builds apart; the
 # website + in-app update resolve them through manifest.json's per-version
-# `url`. The stick agent binaries keep stable names, so
+# `url`. The same bytes are also published under the fixed names the website
+# and the wiki already link, so
 # https://github.com/jcbenitezhe/SoundTouchManager/releases/latest/download/<name>
-# still works for them.
+# does not change when the version does. The stick agent binaries keep stable
+# names the same way.
 on:
   # NOTE: there is deliberately NO tag-push trigger. The publish step creates
   # the tag itself, and it does so with a PAT, which (unlike GITHUB_TOKEN) DOES
@@ -1445,19 +1447,33 @@ jobs:
         working-directory: dist
         env:
           VERSION: ${{ needs.build-agent.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Put the version in the desktop app filenames so users can tell
           # builds apart in their Downloads folder. Done here, after the build
           # jobs attested the files: attestation binds to the file's digest,
           # not its name, so the rename does not affect `gh attestation verify`.
-          # The agent binaries keep fixed names. The desktop apps therefore no
-          # longer have stable /releases/latest/download/<name> URLs; the
-          # website + the in-app update read manifest.json's per-version `url`.
+          # The agent binaries keep fixed names. The versioned STM-* names feed
+          # manifest.json, which the website and the in-app update read. The
+          # SoundTouchManager-1.0.0-* copies are the same bytes under the names
+          # the website and the wiki already link, so those links survive a
+          # version bump. The "1.0.0" in that name is the permanent public
+          # filename, not the release being cut.
           mv "STM-Windows.exe"      "STM-Windows-${VERSION}.exe"
           mv "STM-Windows.zip"      "STM-Windows-${VERSION}.zip"
           mv "STM-macOS.dmg"        "STM-macOS-${VERSION}.dmg"
           mv "STM-macOS.zip"        "STM-macOS-${VERSION}.zip"
           mv "STM-Linux-x64.tar.gz" "STM-Linux-x64-${VERSION}.tar.gz"
+          cp "STM-Windows-${VERSION}.exe" "SoundTouchManager-1.0.0-Windows.exe"
+          cp "STM-Windows-${VERSION}.zip" "SoundTouchManager-1.0.0-Windows.zip"
+          cp "STM-macOS-${VERSION}.dmg" "SoundTouchManager-1.0.0-macOS.dmg"
+          cp "STM-Linux-x64-${VERSION}.tar.gz" "SoundTouchManager-1.0.0-Linux-x64.tar.gz"
+          # The phone app is not built here. Carry the published sideload APK
+          # onto this release so its stable link still resolves. Leave the
+          # Play-billing APK and the old SoundTouch Reborn package alone.
+          if [ ! -f SoundTouchManager-1.0.0-Android.apk ]; then
+            gh release download --repo "$GITHUB_REPOSITORY" --pattern 'SoundTouchManager-1.0.0-Android.apk' --clobber
+          fi
           ls -la
 
       - name: Combined SHA256SUMS
@@ -1467,7 +1483,7 @@ jobs:
           # final binaries — replace with one SHA256SUMS in the
           # standard format used by the verification instructions.
           rm -f ./*.sha256
-          sha256sum stmanager-* STM-* stm-shim.so go-librespot-armv7l > SHA256SUMS
+          sha256sum stmanager-* STM-* SoundTouchManager-* stm-shim.so go-librespot-armv7l > SHA256SUMS
           cat SHA256SUMS
 
       - name: Generate change notes
@@ -1875,6 +1891,11 @@ jobs:
             dist/STM-macOS-*.dmg
             dist/STM-macOS-*.zip
             dist/STM-Linux-x64-*.tar.gz
+            dist/SoundTouchManager-1.0.0-Windows.exe
+            dist/SoundTouchManager-1.0.0-Windows.zip
+            dist/SoundTouchManager-1.0.0-macOS.dmg
+            dist/SoundTouchManager-1.0.0-Linux-x64.tar.gz
+            dist/SoundTouchManager-1.0.0-Android.apk
             dist/stmanager-armv7l
             dist/stmanager-arm64
             dist/stmanager-amd64

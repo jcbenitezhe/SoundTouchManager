@@ -1030,6 +1030,11 @@
   "settingsView.wlanNotVisibleBody": "The speaker cannot find <b>{{ssid}}</b> in its own scan, so it may not be able to join it. Networks the speaker can see: {{visible}}. Switch anyway?",
   "settingsView.wlanForceBtn": "Switch anyway",
   "settingsView.wlanSsidEmpty": "SSID must not be empty",
+  "settingsView.wlanErrUnreachable": "The phone could not finish talking to the speaker, so its Wi-Fi was not changed. Keep this phone and the speaker on the same Wi-Fi, make sure the speaker is on, and try again.",
+  "settingsView.wlanErrPassShort": "That password is too short. A protected Wi-Fi needs at least 8 characters.",
+  "settingsView.wlanErrPassEmpty": "The password is missing. Type it before switching. The speaker will not move to a protected network without one.",
+  "settingsView.wlanErrSave": "The speaker could not store the new Wi-Fi, so it stayed on the current network.",
+  "settingsView.wlanErrGeneric": "The Wi-Fi change did not go through. The speaker is still on its current network.",
   "settingsView.wlanSwitchedToast": "Wi-Fi switched. The speaker is getting a new IP, search the list again in a moment.",
   "settingsView.wlanRebootingToast": "Applying the new Wi-Fi. The Portable reboots for this and is back in a few minutes, then search the list again.",
   "settingsView.sourcesHeading": "Sources",
@@ -1674,5 +1679,7 @@
   "tunein.openEpisodes": "Episodes",
   "tunein.episodeNoPreset": "Episodes play once and cannot be saved to a key. Save the show's station instead.",
   "tunein.sharedTitle": "Shared from TuneIn",
-  "tunein.saveToKey": "Save to key"
+  "tunein.saveToKey": "Save to key",
+  "tunein.starred": "Favorites",
+  "tunein.starredEmpty": "No favorites yet. Tap the star on a station to add it here."
 }

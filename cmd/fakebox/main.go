@@ -41,6 +41,7 @@ func main() {
 	uiAddr := flag.String("ui", "127.0.0.1:8095", "address for the control page")
 	name := flag.String("name", "Fake SoundTouch", "speaker name")
 	model := flag.String("model", "SoundTouch 10", "speaker model, as /info reports it")
+	deviceID := flag.String("id", fakeDeviceID, "device ID reported by /info; change it to run a second fakebox")
 	logLevel := flag.String("log-level", "info", "debug, info, warn, error")
 	flag.Parse()
 
@@ -55,6 +56,9 @@ func main() {
 	defer stop()
 
 	d := newDevice(*name, *model)
+	if *deviceID != "" {
+		d.id = *deviceID
+	}
 	servers := []struct {
 		label string
 		addr  string

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { looksLikeTuneInLink, stationFromInfo, formatDuration } from './tunein.js';
+import { looksLikeTuneInLink, stationFromInfo, formatDuration, guideIdOf, tuneInFavorites } from './tunein.js';
 
 describe('looksLikeTuneInLink', () => {
   it('spots shared links and bare ids', () => {
@@ -25,6 +25,19 @@ describe('stationFromInfo', () => {
       name: 'Apple Music Club', codec: 'AAC', bitrate: 64, favicon: 'https://cdn/x.png',
     });
     expect(JSON.stringify(s)).not.toMatch(/accessKey|m3u8/);
+  });
+});
+
+describe('tuneInFavorites', () => {
+  it('keeps only TuneIn stations and reads the id after the prefix', () => {
+    const list = tuneInFavorites([
+      { stationuuid: 'tunein:s345726', name: 'Apple Music Club' },
+      { stationuuid: 'rb-1', name: 'A radio-browser station' },
+      { url: 'http://example.com/stream' },
+    ]);
+    expect(list.map(s => s.name)).toEqual(['Apple Music Club']);
+    expect(guideIdOf(list[0])).toBe('s345726');
+    expect(guideIdOf({ stationuuid: 'rb-1' })).toBe('');
   });
 });
 

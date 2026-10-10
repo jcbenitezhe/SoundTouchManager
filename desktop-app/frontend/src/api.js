@@ -343,6 +343,15 @@ export function MovePreset(host, port, from, to) {
   return callOptionalBinding('MovePreset', [host, port, from, to]);
 }
 
+// SwitchBoxWLAN asks the speaker to join another Wi-Fi. It goes through the
+// app, not a browser fetch to the speaker: the phone page is a different
+// origin from the speaker, and the speaker refuses that read, which surfaced
+// as "TypeError: Failed to fetch" with the speaker left on its old network.
+// Optional for the same reason as the wrappers above.
+export function SwitchBoxWLAN(host, port, ssid, password, hidden, force) {
+  return callOptionalBinding('SwitchBoxWLAN', [host, port, ssid, password, hidden, force]);
+}
+
 // boxURL builds an absolute URL for an agent endpoint on a given box.
 // Centralised so the host/port pattern is in one place and switching
 // to HTTPS later only takes touching this helper.

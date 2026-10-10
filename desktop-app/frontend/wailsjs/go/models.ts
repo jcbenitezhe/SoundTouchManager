@@ -168,6 +168,30 @@ export namespace main {
 	        this.supported = source["supported"];
 	    }
 	}
+	export class BoxWLANResult {
+	    ok: boolean;
+	    status?: string;
+	    mechanism?: string;
+	    ssid?: string;
+	    code?: string;
+	    error?: string;
+	    visible?: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new BoxWLANResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.ok = source["ok"];
+	        this.status = source["status"];
+	        this.mechanism = source["mechanism"];
+	        this.ssid = source["ssid"];
+	        this.code = source["code"];
+	        this.error = source["error"];
+	        this.visible = source["visible"];
+	    }
+	}
 	export class CloudRestoreResult {
 	    host: string;
 	    name: string;

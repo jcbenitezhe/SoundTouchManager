@@ -948,7 +948,18 @@ html.a11y-contrast .speaker-update-card .suc-ver { color: #fff; }
 /* ---------- TuneIn directory ---------- */
 .tunein-view { max-width: 760px; margin: 0 auto; padding: 16px; }
 .tunein-title { margin: 0 0 6px; }
-.tunein-search { display: flex; gap: 8px; margin: 12px 0 4px; }
+.tunein-tabs { display: flex; gap: 8px; margin: 12px 0 6px; }
+.tunein-tabs .tunein-tab {
+  padding: 9px 16px;
+  font-size: 15px;
+  font-weight: 600;
+  min-height: 40px;
+  border-radius: 8px;
+}
+.tunein-tab.is-on { background: var(--brand); color: var(--on-brand, #fff); border-color: var(--brand); }
+.tunein-search { display: flex; gap: 8px; margin: 8px 0 4px; }
+.tunein-pick { color: var(--c-text); font-weight: 700; font-size: 18px; line-height: 1; font-family: inherit; }
+.tunein-fav.is-fav { color: #f5c518; }
 .tunein-search input {
   flex: 1;
   min-width: 0;

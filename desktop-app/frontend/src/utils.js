@@ -18,6 +18,37 @@ export function escapeHtml(s) {
 
 export function escapeAttr(s) { return escapeHtml(s); }
 
+// TAP_MOVE_PX is how far a finger may wander and still count as a tap.
+// Past this the gesture is a scroll: the control under the finger must not
+// fire. 12px clears a shaky press and is shorter than a deliberate drag.
+export const TAP_MOVE_PX = 12;
+
+// gestureScrolled reports whether a press that started at (x0, y0) and is
+// now at (x1, y1) has moved far enough to be a scroll rather than a tap.
+export function gestureScrolled(x0, y0, x1, y1, slop = TAP_MOVE_PX) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  return dx * dx + dy * dy > slop * slop;
+}
+
+// TAP_MAX_MS is how long a finger may stay down and still count as a tap.
+// A phone hold is not a press: it must not play the preset and must not save
+// over it. A mouse hold on the desktop still saves; this limit is for touch.
+export const TAP_MAX_MS = 400;
+
+// quickTap is a finger that came up before TAP_MAX_MS without scrolling.
+export function quickTap(durationMs, moved, maxMs = TAP_MAX_MS) {
+  return !moved && durationMs >= 0 && durationMs <= maxMs;
+}
+
+// verticalScrollGesture is the same test for a horizontal slider: a downward
+// finger is the page scrolling, a sideways finger is the slider itself.
+export function verticalScrollGesture(x0, y0, x1, y1, slop = TAP_MOVE_PX) {
+  const dx = Math.abs(x1 - x0);
+  const dy = Math.abs(y1 - y0);
+  return dy > slop && dy > dx;
+}
+
 // Group marks shared by the Multi-Room view and the music-tab group frames, so
 // both screens label a stereo pair the same way. (shorty310): the
 // Multi-Room frame used to prepend the word "Stereo" to a user's pair name
@@ -324,6 +355,35 @@ function wireError() {
       document.execCommand('copy');
     }
   };
+}
+
+// wlanSwitchErrorText turns a failed Wi-Fi change into a sentence the user
+// can act on. The raw failure ("TypeError: Failed to fetch", a dial error)
+// stays on the following line so it can still be copied.
+export function wlanSwitchErrorText(err, translate) {
+  const msg = String((err && err.message) || err || '').trim();
+  const low = msg.toLowerCase();
+  let key = 'settingsView.wlanErrGeneric';
+  let withDetail = true;
+  if (/failed to fetch|load failed|networkerror|origin not allowed|the operation was aborted|aborted a request|timeout|timed out|deadline exceeded|connection refused|no route|unreachable|i\/o timeout|connection reset|econnrefused|econnreset/.test(low)) {
+    key = 'settingsView.wlanErrUnreachable';
+  } else if (/password too short|at least 8/.test(low)) {
+    key = 'settingsView.wlanErrPassShort';
+    withDetail = false;
+  } else if (/password is empty|open-network profile/.test(low)) {
+    key = 'settingsView.wlanErrPassEmpty';
+    withDetail = false;
+  } else if (/ssid must not be empty/.test(low)) {
+    key = 'settingsView.wlanSsidEmpty';
+    withDetail = false;
+  } else if (/persist wlan/.test(low)) {
+    key = 'settingsView.wlanErrSave';
+  }
+  const friendly = translate(key);
+  if (!withDetail) return friendly;
+  const detail = (msg.split('\n').map(s => s.trim()).filter(Boolean)[0] || '').slice(0, 400);
+  if (!detail || friendly.includes(detail)) return friendly;
+  return friendly + '\n\n' + detail;
 }
 
 export function showError(msg) {

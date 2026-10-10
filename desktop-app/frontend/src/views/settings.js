@@ -21,6 +21,7 @@ import {
   confirmWarn,
   showError,
   showToast,
+  wlanSwitchErrorText,
   compareVerBuild,
   getBoxLabel,
   balanceLabel,
@@ -100,6 +101,8 @@ import {
   UndoForeignFinding,
   ListWiFiProfiles,
   BoxWifiScan,
+  SwitchBoxWLAN,
+  isMissingBinding,
   TryWiFiPassword,
   ListBoxMediaServers,
   EnableBoxMediaServer,
@@ -3251,44 +3254,58 @@ function wireWlanSwitch(box) {
       t('settingsView.wlanConfirmBody', { ssid: escapeHtml(ssid) })
     );
     if (!ok) return;
-    const putWlan = (force) => boxFetch(box, '/api/box/wlan', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ssid, password: pass, hidden, force: hidden || force }),
-    });
-    try {
-      let r = await putWlan(false);
+    // The phone page cannot PUT the speaker directly: that fetch is
+    // cross-origin and the speaker rejects it, which is the
+    // "TypeError: Failed to fetch" dialog. SwitchBoxWLAN sends the same
+    // body from the app. An older app without the method falls back to
+    // the direct fetch, which is what the desktop window has always used.
+    const putWlan = async (force) => {
+      const useForce = hidden || force;
+      try {
+        return await SwitchBoxWLAN(box.host, box.port, ssid, pass, hidden, useForce);
+      } catch (e) {
+        if (!isMissingBinding(e)) throw e;
+      }
+      const r = await boxFetch(box, '/api/box/wlan', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid, password: pass, hidden, force: useForce }),
+      }, 20000);
       if (!r.ok) {
         const body = await r.text();
-        // The agent's visibility preflight (422 ssid-not-visible) refused the
-        // switch because the speaker's own scan cannot see the target SSID.
-        // Surface it and offer a localized "switch anyway" that re-PUTs with
-        // force:true instead of surfacing the raw JSON error.
         let refuse = null;
         if (r.status === 422) { try { refuse = JSON.parse(body); } catch {} }
         if (refuse && refuse.code === 'ssid-not-visible') {
-          const visible = (Array.isArray(refuse.visible) ? refuse.visible : []).filter(Boolean);
-          const goAnyway = await confirmWarn(
-            t('settingsView.wlanNotVisibleTitle'),
-            t('settingsView.wlanNotVisibleBody', {
-              ssid: escapeHtml(ssid),
-              visible: escapeHtml(visible.join(', ') || '-'),
-            }),
-            { confirmLabel: t('settingsView.wlanForceBtn') },
-          );
-          if (!goAnyway) return;
-          r = await putWlan(true);
-          if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
-        } else {
-          throw new Error('HTTP ' + r.status + ': ' + body);
+          return { ok: false, code: refuse.code, error: refuse.error, visible: refuse.visible || [] };
         }
+        throw new Error('HTTP ' + r.status + ': ' + body);
+      }
+      let parsed = {};
+      try { parsed = await r.json(); } catch {}
+      return { ok: true, ...parsed };
+    };
+    try {
+      let info = await putWlan(false);
+      if (info && info.ok === false && info.code === 'ssid-not-visible') {
+        const visible = (Array.isArray(info.visible) ? info.visible : []).filter(Boolean);
+        const goAnyway = await confirmWarn(
+          t('settingsView.wlanNotVisibleTitle'),
+          t('settingsView.wlanNotVisibleBody', {
+            ssid: escapeHtml(ssid),
+            visible: escapeHtml(visible.join(', ') || '-'),
+          }),
+          { confirmLabel: t('settingsView.wlanForceBtn') },
+        );
+        if (!goAnyway) return;
+        info = await putWlan(true);
+        if (!info || info.ok === false) throw new Error((info && info.error) || 'WLAN switch failed');
+      } else if (!info || info.ok === false) {
+        throw new Error((info && info.error) || 'WLAN switch failed');
       }
       // The agent applies the switch in the background and the box leaves the
       // current network, so we rediscover it rather than wait. BCO speakers
       // (Portable) reboot to apply, which takes a few minutes; wpa speakers
       // switch live and fall back to their old network if the new one fails.
-      let info = {};
-      try { info = await r.json(); } catch {}
       $('boxWlanPass').value = '';
       form.classList.add('hidden');
       showToast(
@@ -3300,7 +3317,7 @@ function wireWlanSwitch(box) {
       // The speaker gets a new IP (or reboots). Retrigger discovery; a longer
       // delay for the BCO reboot so the rediscover lands after it is back up.
       setTimeout(deps.discoverBoxes, info.mechanism === 'bco' ? 90000 : 12000);
-    } catch (e) { showError(e); }
+    } catch (e) { showError(wlanSwitchErrorText(e, t)); }
   });
 }
 

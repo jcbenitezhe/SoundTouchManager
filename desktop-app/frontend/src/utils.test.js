@@ -1,7 +1,7 @@
 // Tests for the pure decision helpers in utils.js.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { savePresetCase, bassControlsDisabled, bassSliderProps } from './utils.js';
+import { savePresetCase, bassControlsDisabled, bassSliderProps, gestureScrolled, verticalScrollGesture, quickTap, wlanSwitchErrorText } from './utils.js';
 
 const FRESH_MS = 2 * 60 * 1000;
 const NOW = 1_000_000_000;
@@ -155,5 +155,41 @@ describe('settingsView.bassUnavailable', () => {
     for (const loc of bundles.filter((l) => l !== 'en')) {
       expect(read(loc)['settingsView.bassUnavailable'], `${loc}.json`).not.toBe(en);
     }
+  });
+});
+
+describe('a moving finger is a scroll, not a tap', () => {
+  it('treats a short press as a tap', () => {
+    expect(gestureScrolled(10, 20, 14, 24)).toBe(false);
+  });
+  it('treats a downward drag as a scroll', () => {
+    expect(gestureScrolled(10, 20, 12, 80)).toBe(true);
+  });
+  it('treats a mostly vertical drag on a slider as page scroll', () => {
+    expect(verticalScrollGesture(40, 100, 48, 160)).toBe(true);
+    expect(verticalScrollGesture(40, 100, 90, 108)).toBe(false);
+  });
+  it('plays a preset only on a quick tap', () => {
+    expect(quickTap(120, false)).toBe(true);
+    expect(quickTap(900, false)).toBe(false);
+    expect(quickTap(80, true)).toBe(false);
+  });
+});
+
+describe('wlanSwitchErrorText', () => {
+  const t = (key) => key;
+  it('explains a browser fetch failure and keeps the technical line', () => {
+    const text = wlanSwitchErrorText(new TypeError('Failed to fetch'), t);
+    expect(text.startsWith('settingsView.wlanErrUnreachable')).toBe(true);
+    expect(text).toContain('Failed to fetch');
+  });
+  it('explains a speaker that did not answer', () => {
+    const text = wlanSwitchErrorText('dial tcp 192.0.2.8:8888: i/o timeout\n\nThe app could not reach the speaker.', t);
+    expect(text.startsWith('settingsView.wlanErrUnreachable')).toBe(true);
+    expect(text).toContain('i/o timeout');
+    expect(text).not.toContain('firewall');
+  });
+  it('explains a short password without the raw agent text', () => {
+    expect(wlanSwitchErrorText('password too short (at least 8 characters)', t)).toBe('settingsView.wlanErrPassShort');
   });
 });

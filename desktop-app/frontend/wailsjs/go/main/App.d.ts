@@ -311,6 +311,8 @@ export function StreamTitle(arg1:string,arg2:number):Promise<string>;
 
 export function SuggestBoxLanguage(arg1:string,arg2:string):Promise<number>;
 
+export function SwitchBoxWLAN(arg1:string,arg2:number,arg3:string,arg4:string,arg5:boolean,arg6:boolean):Promise<main.BoxWLANResult>;
+
 export function SyncBoxPresets(arg1:string,arg2:number):Promise<Record<string, any>>;
 
 export function SyncSpotifyLogin(arg1:Array<main.SpotifySyncTarget>):Promise<Record<string, any>>;

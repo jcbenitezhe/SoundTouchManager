@@ -81,6 +81,8 @@ import {
   BrowserOpenURL,
   PhoneQR,
   boxFetch,
+  SwitchBoxWLAN,
+  isMissingBinding,
 } from '../api.js';
 
 // Official Bose SoundTouch app store listings (verified live 2026-07-09). The
@@ -2688,11 +2690,18 @@ async function verifyInstalledState(box, onState) {
             // "WLAN switch refused ... visible=[]"), silently breaking the
             // Wi-Fi save; on a first install the cable stays in anyway, so the
             // strand-protection the preflight exists for does not apply.
+            try {
+              const info = await SwitchBoxWLAN(agentBox.host, agentBox.port, wifiForBox.ssid, wifiForBox.pass, !!wifiForBox.hidden, true);
+              if (!info || info.ok === false) throw new Error((info && info.error) || t('setup.provisionNoAnswer'));
+              return info;
+            } catch (e) {
+              if (!isMissingBinding(e)) throw e;
+            }
             const wr = await boxFetch(agentBox, '/api/box/wlan', {
               method: 'PUT',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ ssid: wifiForBox.ssid, password: wifiForBox.pass, hidden: !!wifiForBox.hidden, force: true }),
-            });
+            }, 20000);
             if (!wr || !wr.ok) {
               let reason = wr ? 'HTTP ' + wr.status : t('setup.provisionNoAnswer');
               try {
