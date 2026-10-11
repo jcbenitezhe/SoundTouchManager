@@ -125,27 +125,48 @@ func (a *App) SetClockDisplay(host string, enable bool, timezone string, offsetM
 	if format24 {
 		tf = "TIME_FORMAT_24HOUR_ID"
 	}
-	// timezoneInfo is the real IANA zone (e.g. "Europe/Berlin"), the same
-	// thing the Bose iOS app sets (live-verified 2026-06-01); with it the
-	// speaker handles DST itself from its own tz database. We also send
-	// the current userOffsetMinute as a correct-now fallback. timezone ""
-	// leaves it unset.
-	tz := timezone
-	off := offsetMinutes
-	if tz == "" {
-		tz = "NOT_SET" // no zone: fall back to the raw offset shift
+	body := clockDisplayBody(enable, timezone, offsetMinutes, tf)
+	return a.bosePostXML(host, "/clockDisplay", body)
+}
+
+// fixedOffsetZones are places whose civil time no longer moves, but whose
+// name still makes the speaker move it. The speaker applies daylight saving
+// from the timezone list in its firmware, and that list stopped when Bose
+// stopped shipping firmware. Mexico dropped the April/October change in
+// October 2022, so America/Mexico_City on that list is an hour ahead from
+// April through October. Sending no zone name and a fixed offset leaves the
+// clock where it is. userOffsetMinute is minutes east of UTC.
+//
+// Baja California and the northern border towns still change with the US, so
+// they stay out of this map and keep the zone name.
+var fixedOffsetZones = map[string]int{
+	"America/Mexico_City":    -360,
+	"America/Bahia_Banderas": -360,
+	"America/Merida":         -360,
+	"America/Monterrey":      -360,
+	"America/Chihuahua":      -360,
+	"America/Cancun":         -300,
+	"America/Mazatlan":       -420,
+	"America/Hermosillo":     -420,
+}
+
+// clockDisplayBody is the /clockDisplay document. A named zone makes the
+// speaker derive the offset, including daylight saving, so the offset sent
+// with it must be 0: live 2026-06-01, Europe/Berlin plus 120 minutes showed
+// 06:00 instead of 04:00. A zone in fixedOffsetZones is sent as NOT_SET with
+// that zone's permanent offset instead.
+func clockDisplayBody(enable bool, timezone string, offsetMinutes int, timeFormat string) string {
+	tz, off := timezone, offsetMinutes
+	if fixed, ok := fixedOffsetZones[timezone]; ok {
+		tz, off = "NOT_SET", fixed
+	} else if tz == "" {
+		tz = "NOT_SET"
 	} else {
-		// With a real IANA zone the box derives the offset (incl DST)
-		// itself. Sending userOffsetMinute on TOP would DOUBLE-shift the
-		// clock: live 2026-06-01, timezoneInfo=Europe/Berlin (+2) plus
-		// userOffsetMinute=120 (+2) showed 06:00 instead of 04:00. So
-		// whenever a zone is set, the offset must be 0.
 		off = 0
 	}
-	body := fmt.Sprintf(
+	return fmt.Sprintf(
 		`<clockDisplay><clockConfig userEnable="%t" timezoneInfo="%s" userOffsetMinute="%d" timeFormat="%s" /></clockDisplay>`,
-		enable, tz, off, tf)
-	return a.bosePostXML(host, "/clockDisplay", body)
+		enable, tz, off, timeFormat)
 }
 
 // GetClockFormat24 reports whether the box clock is currently in 24h
