@@ -57,10 +57,20 @@ a:hover { color: var(--brand-dark); }
   background: var(--brand); color: #fff; font-size: 12px; font-weight: 800; letter-spacing: .5px;
 }
 .brand em { font-style: italic; color: var(--brand); }
-.top nav { margin-left: auto; display: flex; gap: 18px; font-size: 14px; }
+.top nav { margin-inline-start: auto; display: flex; align-items: center; gap: 18px; font-size: 14px; }
 .top nav a { color: var(--muted); text-decoration: none; }
 .top nav a:hover { color: var(--text); }
-.top nav .lang { font-weight: 700; color: var(--text); }
+.top nav select.lang {
+  font: inherit;
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px;
+  max-width: 11rem;
+}
 
 /* Hero */
 .hero { padding: 56px 0 24px; text-align: center; }
