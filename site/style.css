@@ -52,9 +52,8 @@ a:hover { color: var(--brand-dark); }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 18px; color: var(--text); text-decoration: none; }
 .brand:hover { color: var(--text); }
 .logo {
-  display: inline-grid; place-items: center;
   width: 36px; height: 36px; border-radius: 9px;
-  background: var(--brand); color: #fff; font-size: 12px; font-weight: 800; letter-spacing: .5px;
+  object-fit: cover; flex: none; display: block;
 }
 .brand em { font-style: italic; color: var(--brand); }
 .top nav { margin-inline-start: auto; display: flex; align-items: center; gap: 18px; font-size: 14px; }
@@ -176,5 +175,5 @@ footer p { margin: 6px 0; }
   .wrap { padding: 0 14px; }
   .top .wrap { gap: 10px; }
   .brand { font-size: 15px; gap: 8px; white-space: nowrap; }
-  .logo { width: 30px; height: 30px; font-size: 11px; }
+  .logo { width: 30px; height: 30px; }
 }
