@@ -104,6 +104,8 @@ const (
 // than b. Both may carry a leading "v" and a git-describe suffix
 // ("-3-gabc123-dirty"); only the leading numeric segments are compared,
 // so a dev build off tag v0.6.5 compares equal to the v0.6.5 release.
+// A bare git hash ("57c7bfe-dirty") is not a release: its leading digits
+// are not a version number.
 func versionLess(a, b string) bool {
 	pa, pb := parseVersionParts(a), parseVersionParts(b)
 	for i := 0; i < len(pa) || i < len(pb); i++ {
@@ -125,17 +127,27 @@ func parseVersionParts(v string) []int {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
 	var parts []int
 	for _, seg := range strings.Split(v, ".") {
-		n, ok := 0, false
+		n, i, ok := 0, 0, false
 		for _, r := range seg { // stop at the first non-numeric rune (git suffix)
 			if r < '0' || r > '9' {
 				break
 			}
 			n, ok = n*10+int(r-'0'), true
+			i++
 		}
 		if !ok {
 			break
 		}
+		rest := seg[i:]
+		// "0.7.21-3-gabc" ends a segment with '-'. "57c7bfe-dirty" does not:
+		// the leading digits are part of a git hash, not a release number.
+		if rest != "" && !strings.HasPrefix(rest, "-") {
+			return nil
+		}
 		parts = append(parts, n)
+		if rest != "" {
+			break
+		}
 	}
 	return parts
 }

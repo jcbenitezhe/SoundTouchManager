@@ -71,12 +71,31 @@ export function getBoxLabel(b) { return (b && (b.friendlyName || b.name || b.hos
 // behind the speaker (app older -> an OTA would DOWNGRADE the box, so offer an
 // app update instead). The old logic only checked "differs" and so offered a
 // downgrade when the speaker was newer than the app (update-banner UX).
+//
+// A bare git stamp such as "57c7bfe-dirty" is not a release. parseInt would
+// keep the leading digits and call it version 57, which then looks newer than
+// 1.0.0 and paints "the speaker is newer than the app". A hash is not ordered
+// against a release number in either direction.
 export function compareVerBuild(aVer, aBuild, bVer, bBuild) {
-  const parse = (v) => String(v || '').replace(/^v/, '').split('-')[0].split('.').map(n => parseInt(n, 10) || 0);
-  const pa = parse(aVer), pb = parse(bVer);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const da = pa[i] || 0, db = pb[i] || 0;
-    if (da !== db) return da < db ? -1 : 1;
+  const parts = (v) => {
+    const core = String(v || '').trim().replace(/^v/i, '').split('-')[0];
+    if (!/^\d+(\.\d+)*$/.test(core)) return null;
+    return core.split('.').map(n => parseInt(n, 10));
+  };
+  const pa = parts(aVer), pb = parts(bVer);
+  if (pa && pb) {
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const da = pa[i] || 0, db = pb[i] || 0;
+      if (da !== db) return da < db ? -1 : 1;
+    }
+  } else if (String(aVer || '') !== String(bVer || '')) {
+    const hashish = (v) => /^[0-9a-f]{7,}(-dirty)?$/i.test(String(v || '').trim().replace(/^v/i, ''));
+    if (hashish(aVer) || hashish(bVer)) return 0;
+    // A missing or placeholder version stays older than a real release, so an
+    // agent that reports nothing still gets an update offer.
+    if (!pa && pb) return -1;
+    if (pa && !pb) return 1;
+    return 0;
   }
   const sa = String(aBuild || ''), sb = String(bBuild || '');
   if (sa === sb) return 0;
@@ -384,6 +403,15 @@ export function wlanSwitchErrorText(err, translate) {
   const detail = (msg.split('\n').map(s => s.trim()).filter(Boolean)[0] || '').slice(0, 400);
   if (!detail || friendly.includes(detail)) return friendly;
   return friendly + '\n\n' + detail;
+}
+
+// radioOutageText is the sentence for a radio-browser directory that none of
+// the mirrors answered. The raw failure names a last-resort address, which
+// reads as something broken in the app. Empty when this is some other error.
+export function radioOutageText(err, translate) {
+  const raw = String((err && err.message) || err || '');
+  if (!/radio directory unreachable/i.test(raw)) return '';
+  return translate('radio.mirrorsDown');
 }
 
 export function showError(msg) {

@@ -1,7 +1,7 @@
 // Tests for the pure decision helpers in utils.js.
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { savePresetCase, bassControlsDisabled, bassSliderProps, gestureScrolled, verticalScrollGesture, quickTap, wlanSwitchErrorText } from './utils.js';
+import { savePresetCase, bassControlsDisabled, bassSliderProps, gestureScrolled, verticalScrollGesture, quickTap, wlanSwitchErrorText, radioOutageText, compareVerBuild } from './utils.js';
 
 const FRESH_MS = 2 * 60 * 1000;
 const NOW = 1_000_000_000;
@@ -191,5 +191,33 @@ describe('wlanSwitchErrorText', () => {
   });
   it('explains a short password without the raw agent text', () => {
     expect(wlanSwitchErrorText('password too short (at least 8 characters)', t)).toBe('settingsView.wlanErrPassShort');
+  });
+});
+
+describe('radioOutageText', () => {
+  const t = (key) => key;
+  it('hides the mirror address when the directory is down', () => {
+    const text = radioOutageText('radio directory unreachable: mirror https://192.0.2.1/json: 503', t);
+    expect(text).toBe('radio.mirrorsDown');
+  });
+  it('leaves other failures alone', () => {
+    expect(radioOutageText('something else', t)).toBe('');
+  });
+});
+
+describe('compareVerBuild', () => {
+  it('orders real releases and ignores a git-describe suffix', () => {
+    expect(compareVerBuild('1.0.0', '', '1.0.1', '')).toBe(-1);
+    expect(compareVerBuild('v0.9.0', '', 'v0.10.0', '')).toBe(-1);
+    expect(compareVerBuild('v0.7.21-3-gabc', '', 'v0.7.21', '')).toBe(0);
+  });
+  it('does not read a git hash as a version number', () => {
+    // 57c7bfe-dirty used to parse as version 57 and look newer than 1.0.0.
+    expect(compareVerBuild('1.0.0', '', '57c7bfe-dirty', '')).toBe(0);
+    expect(compareVerBuild('57c7bfe-dirty', '', '1.0.0', '')).toBe(0);
+    expect(compareVerBuild('5b4badb-dirty', '', '57c7bfe-dirty', '')).toBe(0);
+  });
+  it('still breaks a tie on the build stamp', () => {
+    expect(compareVerBuild('1.0.0', '2026-10-11-1307', '1.0.0', '2026-10-01-0900')).toBe(1);
   });
 });

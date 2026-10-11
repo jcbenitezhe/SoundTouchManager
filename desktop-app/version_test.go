@@ -14,6 +14,8 @@ func TestParseVersionParts(t *testing.T) {
 		"v0.7":                    {0, 7},
 		"":                        nil,
 		"vdev":                    nil, // no leading digits
+		"57c7bfe-dirty":           nil, // git hash, not version 57
+		"5b4badb":                 nil,
 	}
 	for in, want := range cases {
 		if got := parseVersionParts(in); !reflect.DeepEqual(got, want) {
@@ -37,6 +39,8 @@ func TestVersionLess(t *testing.T) {
 		{"v0.7.0", "v0.7", false},            // explicit trailing zero equals shorter
 		{"v0.9.0", "v0.10.0", true},          // numeric, not lexical, compare
 		{"v0.7.21-3-gabc", "v0.7.21", false}, // git suffix ignored -> equal
+		{"1.0.0", "57c7bfe-dirty", false},    // a hash is not a newer release
+		{"57c7bfe-dirty", "1.0.0", true},     // a hash is not itself a release
 	} {
 		if got := versionLess(tc.a, tc.b); got != tc.want {
 			t.Errorf("versionLess(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
